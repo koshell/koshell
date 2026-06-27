@@ -17,10 +17,12 @@ Performed at: 2026-06-27 18:29:44 CST +0800.
 - Connected `TerminalSession` to an optional `TimelineRecorder` interface so terminal orchestration can record `human_input` and `pty_output` without depending on a concrete store implementation.
 - Serialized asynchronous mirror writes through an internal Promise queue so PTY output reaches the headless mirror in order.
 - Added mirror write error reporting so asynchronous mirror failures are not silently ignored.
+- Added automatic `screen_snapshot` events after ordered mirror writes and resize operations when a timeline is attached.
+- Added alternate-screen awareness to terminal snapshots through xterm's active buffer type.
 
 ## Validation
 
-Public unit tests cover timeline recording, recent text queries, screen snapshot lookup, reset behavior, terminal-session timeline recording, mirror write ordering, and mirror write failure reporting.
+Public unit tests cover timeline recording, recent text queries, screen snapshot lookup, reset behavior, terminal-session timeline recording, mirror write ordering, mirror write failure reporting, snapshot recording, and alternate-screen detection.
 
 ## Open Issues
 
@@ -29,7 +31,7 @@ Public unit tests cover timeline recording, recent text queries, screen snapshot
 - No retention policy is defined.
 - No redaction policy is defined.
 - Shell command span detection is not implemented.
-- Automatic screen snapshot cadence is not implemented.
+- Snapshot cadence, retention, and redaction policies are not implemented.
 - AI request and response events are defined but not produced by runtime code yet.
 
 ## Resolution Conditions
@@ -37,5 +39,5 @@ Public unit tests cover timeline recording, recent text queries, screen snapshot
 - Define persistence after in-memory timeline behavior stabilizes.
 - Define retention and redaction before any persistent storage ships.
 - Add command span detection when shell integration work begins.
-- Add automatic screen snapshot production after PTY and TUI behavior has been dogfooded.
+- Add snapshot cadence, retention, and redaction after PTY and TUI behavior has been dogfooded.
 - Produce AI request and response events when the `#?` trigger and agent runtime adapter are implemented.

@@ -2,11 +2,13 @@ import process from "node:process";
 import pty from "node-pty";
 import { assertNotNestedKoshell, createPtyEnv, resolveShell } from "./shell.ts";
 import { TerminalMirror } from "./terminal-mirror.ts";
+import type { TerminalSnapshot } from "./terminal-mirror.ts";
 import type { TimelineRecorder } from "./timeline.ts";
 
 export interface TerminalMirrorLike {
   write(data: string): Promise<void>;
   resize(columns: number, rows: number): void;
+  getSnapshot(): TerminalSnapshot;
   dispose(): void;
 }
 
@@ -63,6 +65,7 @@ export class TerminalSession {
   private readonly onOutputError: ((error: unknown) => void) | undefined;
   private readonly disposables: Disposable[] = [];
   private outputQueue = Promise.resolve();
+  private nextSnapshotId = 1;
   private running = false;
 
   constructor(options: TerminalSessionOptions) {
@@ -101,6 +104,7 @@ export class TerminalSession {
   resize(columns: number, rows: number): void {
     this.ptyProcess.resize(columns, rows);
     this.mirror.resize(columns, rows);
+    this.recordScreenSnapshot();
   }
 
   kill(signal?: string): void {
@@ -120,10 +124,32 @@ export class TerminalSession {
     this.timeline?.record({ type: "pty_output", data });
     this.output.write(data);
     this.outputQueue = this.outputQueue
-      .then(() => this.mirror.write(data))
+      .then(async () => {
+        await this.mirror.write(data);
+        this.recordScreenSnapshot();
+      })
       .catch((error: unknown) => {
         this.reportOutputError(error);
       });
+  }
+
+  private recordScreenSnapshot(): void {
+    if (!this.timeline) {
+      return;
+    }
+
+    const snapshot = this.mirror.getSnapshot();
+    const snapshotId = `snapshot-${String(this.nextSnapshotId)}`;
+    this.nextSnapshotId += 1;
+
+    this.timeline.record({
+      type: "screen_snapshot",
+      snapshotId,
+      rows: snapshot.rows,
+      columns: snapshot.columns,
+      altScreen: snapshot.altScreen,
+      screen: snapshot.screen,
+    });
   }
 
   private reportOutputError(error: unknown): void {

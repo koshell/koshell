@@ -14,6 +14,7 @@ export interface TerminalSnapshot {
   columns: number;
   cursorX: number;
   cursorY: number;
+  altScreen: boolean;
   screen: string;
 }
 
@@ -61,6 +62,7 @@ export class TerminalMirror {
       columns: this.terminal.cols,
       cursorX: buffer.cursorX,
       cursorY: buffer.cursorY,
+      altScreen: buffer.type === "alternate",
       screen: lines.join("\n").trimEnd(),
     };
   }

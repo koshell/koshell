@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { TerminalSnapshot } from "../src/terminal-mirror.ts";
 import type {
   Disposable,
   PtyExitEvent,
@@ -63,6 +64,8 @@ class FakePtyProcess implements PtyProcess {
 class FakeTerminalMirror implements TerminalMirrorLike {
   readonly writes: string[] = [];
   readonly resizes: { columns: number; rows: number }[] = [];
+  private columns = 80;
+  private rows = 24;
   disposed = false;
 
   write(data: string): Promise<void> {
@@ -71,7 +74,21 @@ class FakeTerminalMirror implements TerminalMirrorLike {
   }
 
   resize(columns: number, rows: number): void {
+    this.columns = columns;
+    this.rows = rows;
     this.resizes.push({ columns, rows });
+  }
+
+  getSnapshot(): TerminalSnapshot {
+    return {
+      timestamp: "2026-06-27T12:55:50.000Z",
+      rows: this.rows,
+      columns: this.columns,
+      cursorX: 0,
+      cursorY: 0,
+      altScreen: false,
+      screen: this.writes.join(""),
+    };
   }
 
   dispose(): void {
@@ -100,6 +117,18 @@ class SequencedTerminalMirror implements TerminalMirrorLike {
 
   resize(): void {
     return;
+  }
+
+  getSnapshot(): TerminalSnapshot {
+    return {
+      timestamp: "2026-06-27T12:55:50.000Z",
+      rows: 24,
+      columns: 80,
+      cursorX: 0,
+      cursorY: 0,
+      altScreen: false,
+      screen: this.writes.join(""),
+    };
   }
 
   dispose(): void {
@@ -211,6 +240,15 @@ describe("TerminalSession", () => {
     expect(timeline.listEvents()).toEqual([
       { type: "human_input", ts: 123, data: "pwd\r" },
       { type: "pty_output", ts: 123, data: "/tmp\r\n" },
+      {
+        type: "screen_snapshot",
+        ts: 123,
+        snapshotId: "snapshot-1",
+        rows: 24,
+        columns: 80,
+        altScreen: false,
+        screen: "/tmp\r\n",
+      },
     ]);
   });
 
