@@ -1,6 +1,6 @@
 # koshell
 
-A Node.js and TypeScript project initialized for direct `.ts` execution with Node.js, Vitest, ESLint, Prettier, Husky, and lint-staged.
+A Node.js and TypeScript terminal shell wrapper. It starts a real shell through `node-pty` and mirrors PTY output into a headless xterm instance so the program keeps a usable terminal-state copy while forwarding the shell to the user's terminal.
 
 ## Requirements
 
@@ -8,6 +8,22 @@ A Node.js and TypeScript project initialized for direct `.ts` execution with Nod
 - pnpm 11 or newer
 
 The repository uses `.node-version`, `package.json` engines, and `.npmrc` `engine-strict=true` to enforce the minimum runtime and package-manager versions.
+
+## Usage
+
+Install dependencies:
+
+```bash
+pnpm install
+```
+
+Start an interactive shell wrapper:
+
+```bash
+pnpm start
+```
+
+`koshell` must be started from an interactive TTY. It forwards stdin to the child shell, writes child-shell output to stdout, and keeps the same output mirrored in headless xterm state.
 
 ## Scripts
 

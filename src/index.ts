@@ -1,11 +1,11 @@
-import { add } from "./math.ts";
+#!/usr/bin/env node
+import process from "node:process";
+import { runInteractiveTerminalShell } from "./terminal-session.ts";
 
-export function main(): void {
-  const result = add(2, 3);
-
-  console.log(`2 + 3 = ${result.toString()}`);
-}
-
-if (import.meta.main) {
-  main();
+try {
+  runInteractiveTerminalShell();
+} catch (error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  process.stderr.write(`koshell failed: ${message}\n`);
+  process.exitCode = 1;
 }
