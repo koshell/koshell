@@ -1,9 +1,10 @@
 import process from "node:process";
 import pty from "node-pty";
+import { summarizeScreenDiff } from "./screen-diff.ts";
 import { assertNotNestedKoshell, createPtyEnv, resolveShell } from "./shell.ts";
 import { TerminalMirror } from "./terminal-mirror.ts";
 import type { TerminalSnapshot } from "./terminal-mirror.ts";
-import type { TimelineRecorder } from "./timeline.ts";
+import type { UntimedTerminalEvent, TimelineRecorder } from "./timeline.ts";
 
 export interface TerminalMirrorLike {
   write(data: string): Promise<void>;
@@ -66,6 +67,7 @@ export class TerminalSession {
   private readonly disposables: Disposable[] = [];
   private outputQueue = Promise.resolve();
   private nextSnapshotId = 1;
+  private previousSnapshot: { snapshotId: string; screen: string } | undefined;
   private running = false;
 
   constructor(options: TerminalSessionOptions) {
@@ -142,14 +144,25 @@ export class TerminalSession {
     const snapshotId = `snapshot-${String(this.nextSnapshotId)}`;
     this.nextSnapshotId += 1;
 
-    this.timeline.record({
+    const event: UntimedTerminalEvent = {
       type: "screen_snapshot",
       snapshotId,
       rows: snapshot.rows,
       columns: snapshot.columns,
       altScreen: snapshot.altScreen,
       screen: snapshot.screen,
-    });
+    };
+
+    if (this.previousSnapshot) {
+      event.previousSnapshotId = this.previousSnapshot.snapshotId;
+      event.diff = summarizeScreenDiff(
+        this.previousSnapshot.screen,
+        snapshot.screen,
+      );
+    }
+
+    this.timeline.record(event);
+    this.previousSnapshot = { snapshotId, screen: snapshot.screen };
   }
 
   private reportOutputError(error: unknown): void {

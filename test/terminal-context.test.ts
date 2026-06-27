@@ -21,6 +21,7 @@ describe("buildTerminalContext", () => {
       recentInput: "echo hello\r",
       recentPtyOutput: "hello\r\n",
       recentVisibleOutput: "",
+      recentScreenChanges: [],
       currentScreen: "hello",
       altScreen: false,
       primaryText: "hello\r\n",
@@ -68,6 +69,43 @@ describe("buildTerminalContext", () => {
       primaryText: "file contents",
       primarySource: "screen_snapshot",
     });
+  });
+
+  it("exposes recent screen change summaries", () => {
+    const timeline = new InMemoryTimelineStore({ now: () => 1 });
+
+    timeline.record({
+      type: "screen_snapshot",
+      snapshotId: "snapshot-1",
+      rows: 4,
+      columns: 80,
+      altScreen: false,
+      screen: "one",
+    });
+    timeline.record({
+      type: "screen_snapshot",
+      snapshotId: "snapshot-2",
+      rows: 4,
+      columns: 80,
+      altScreen: true,
+      screen: "one\ntwo\nthree",
+      previousSnapshotId: "snapshot-1",
+      diff: { addedLines: 2, removedLines: 0, changedLines: 2 },
+    });
+
+    expect(buildTerminalContext(timeline).recentScreenChanges).toEqual([
+      {
+        snapshotId: "snapshot-2",
+        previousSnapshotId: "snapshot-1",
+        altScreen: true,
+        rows: 4,
+        addedLines: 2,
+        removedLines: 0,
+        changedLines: 2,
+        largeChange: true,
+        summary: "+2, -0",
+      },
+    ]);
   });
 
   it("does not expose hidden human input in recent input", () => {

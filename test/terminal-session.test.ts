@@ -252,6 +252,46 @@ describe("TerminalSession", () => {
     ]);
   });
 
+  it("records screen snapshot diff summaries", async () => {
+    const ptyProcess = new FakePtyProcess();
+    const mirror = new FakeTerminalMirror();
+    const timeline = new InMemoryTimelineStore({ now: () => 123 });
+    const session = new TerminalSession({
+      ptyProcess,
+      mirror,
+      output: { write: () => undefined },
+      timeline,
+    });
+
+    session.start();
+    ptyProcess.emitData("one");
+    ptyProcess.emitData("\ntwo");
+    await session.flushOutput();
+
+    expect(timeline.listScreenSnapshots().map((entry) => entry.event)).toEqual([
+      {
+        type: "screen_snapshot",
+        ts: 123,
+        snapshotId: "snapshot-1",
+        rows: 24,
+        columns: 80,
+        altScreen: false,
+        screen: "one",
+      },
+      {
+        type: "screen_snapshot",
+        ts: 123,
+        snapshotId: "snapshot-2",
+        rows: 24,
+        columns: 80,
+        altScreen: false,
+        screen: "one\ntwo",
+        previousSnapshotId: "snapshot-1",
+        diff: { addedLines: 1, removedLines: 0, changedLines: 1 },
+      },
+    ]);
+  });
+
   it("serializes mirror writes and reports mirror failures", async () => {
     const ptyProcess = new FakePtyProcess();
     const mirror = new SequencedTerminalMirror();

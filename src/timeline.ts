@@ -1,3 +1,6 @@
+import { diffScreenText } from "./screen-diff.ts";
+import type { ScreenDiffSummary, ScreenTextDiff } from "./screen-diff.ts";
+
 export type ControlMode = "human" | "shared" | "ai";
 
 export type TerminalEvent =
@@ -27,6 +30,8 @@ export type TerminalEvent =
       columns: number;
       altScreen: boolean;
       screen?: string;
+      previousSnapshotId?: string;
+      diff?: ScreenDiffSummary;
     }
   | {
       type: "ai_request";
@@ -61,6 +66,11 @@ export type ScreenSnapshotEntry = TimelineEntry & {
 
 export interface TimelineRecorder {
   record(event: UntimedTerminalEvent): TimelineEntry;
+}
+
+export interface ScreenSnapshotDiff extends ScreenTextDiff {
+  fromSnapshotId: string;
+  toSnapshotId: string;
 }
 
 export interface TimelineStoreOptions {
@@ -125,21 +135,74 @@ export class InMemoryTimelineStore implements TimelineRecorder {
     return trimStartToMaxCharacters(text, maxCharacters);
   }
 
+  listScreenSnapshots(): ScreenSnapshotEntry[] {
+    return this.entries.filter(isScreenSnapshotEntry);
+  }
+
+  getScreenSnapshot(snapshotId: string): ScreenSnapshotEntry | undefined {
+    return this.listScreenSnapshots().find(
+      (entry) => entry.event.snapshotId === snapshotId,
+    );
+  }
+
   getLatestScreenSnapshot(): ScreenSnapshotEntry | undefined {
-    for (let index = this.entries.length - 1; index >= 0; index -= 1) {
-      const entry = this.entries[index];
+    return findLatestScreenSnapshot(this.entries, () => true);
+  }
 
-      if (entry && isScreenSnapshotEntry(entry)) {
-        return entry;
-      }
-    }
+  getLatestAlternateScreenSnapshot(): ScreenSnapshotEntry | undefined {
+    return findLatestScreenSnapshot(
+      this.entries,
+      (entry) => entry.event.altScreen,
+    );
+  }
 
-    return undefined;
+  diffScreenSnapshots(
+    fromSnapshotId: string,
+    toSnapshotId: string,
+  ): ScreenSnapshotDiff {
+    const fromSnapshot = this.getRequiredScreenSnapshot(fromSnapshotId);
+    const toSnapshot = this.getRequiredScreenSnapshot(toSnapshotId);
+
+    return {
+      fromSnapshotId,
+      toSnapshotId,
+      ...diffScreenText(
+        fromSnapshot.event.screen ?? "",
+        toSnapshot.event.screen ?? "",
+      ),
+    };
   }
 
   reset(): void {
     this.entries.length = 0;
   }
+
+  private getRequiredScreenSnapshot(snapshotId: string): ScreenSnapshotEntry {
+    const snapshot = this.getScreenSnapshot(snapshotId);
+
+    if (!snapshot) {
+      throw new Error(
+        `Screen snapshot ${JSON.stringify(snapshotId)} was not found.`,
+      );
+    }
+
+    return snapshot;
+  }
+}
+
+function findLatestScreenSnapshot(
+  entries: TimelineEntry[],
+  predicate: (entry: ScreenSnapshotEntry) => boolean,
+): ScreenSnapshotEntry | undefined {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+
+    if (entry && isScreenSnapshotEntry(entry) && predicate(entry)) {
+      return entry;
+    }
+  }
+
+  return undefined;
 }
 
 function eventToText(event: TerminalEvent): string {
