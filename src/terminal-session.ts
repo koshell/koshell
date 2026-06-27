@@ -2,6 +2,7 @@ import process from "node:process";
 import pty from "node-pty";
 import { assertNotNestedKoshell, createPtyEnv, resolveShell } from "./shell.ts";
 import { TerminalMirror } from "./terminal-mirror.ts";
+import type { TimelineRecorder } from "./timeline.ts";
 
 export interface TerminalMirrorLike {
   write(data: string): Promise<void>;
@@ -37,6 +38,8 @@ export interface TerminalSessionOptions {
   ptyProcess: PtyProcess;
   mirror: TerminalMirrorLike;
   output: OutputWriter;
+  timeline?: TimelineRecorder;
+  onOutputError?: (error: unknown) => void;
 }
 
 export interface SpawnTerminalShellOptions {
@@ -56,13 +59,18 @@ export class TerminalSession {
   private readonly ptyProcess: PtyProcess;
   private readonly mirror: TerminalMirrorLike;
   private readonly output: OutputWriter;
+  private readonly timeline: TimelineRecorder | undefined;
+  private readonly onOutputError: ((error: unknown) => void) | undefined;
   private readonly disposables: Disposable[] = [];
+  private outputQueue = Promise.resolve();
   private running = false;
 
   constructor(options: TerminalSessionOptions) {
     this.ptyProcess = options.ptyProcess;
     this.mirror = options.mirror;
     this.output = options.output;
+    this.timeline = options.timeline;
+    this.onOutputError = options.onOutputError;
   }
 
   start(onExit?: (event: PtyExitEvent) => void): void {
@@ -73,8 +81,7 @@ export class TerminalSession {
     this.running = true;
     this.disposables.push(
       this.ptyProcess.onData((data) => {
-        void this.mirror.write(data);
-        this.output.write(data);
+        this.handleOutput(data);
       }),
       this.ptyProcess.onExit((event) => {
         onExit?.(event);
@@ -83,7 +90,12 @@ export class TerminalSession {
   }
 
   writeInput(data: string): void {
+    this.timeline?.record({ type: "human_input", data });
     this.ptyProcess.write(data);
+  }
+
+  async flushOutput(): Promise<void> {
+    await this.outputQueue;
   }
 
   resize(columns: number, rows: number): void {
@@ -102,6 +114,26 @@ export class TerminalSession {
 
     this.mirror.dispose();
     this.running = false;
+  }
+
+  private handleOutput(data: string): void {
+    this.timeline?.record({ type: "pty_output", data });
+    this.output.write(data);
+    this.outputQueue = this.outputQueue
+      .then(() => this.mirror.write(data))
+      .catch((error: unknown) => {
+        this.reportOutputError(error);
+      });
+  }
+
+  private reportOutputError(error: unknown): void {
+    if (this.onOutputError) {
+      this.onOutputError(error);
+      return;
+    }
+
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`koshell mirror write failed: ${message}\n`);
   }
 }
 

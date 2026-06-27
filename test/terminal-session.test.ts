@@ -6,6 +6,7 @@ import type {
   TerminalMirrorLike,
 } from "../src/terminal-session.ts";
 import { TerminalSession } from "../src/terminal-session.ts";
+import { InMemoryTimelineStore } from "../src/timeline.ts";
 
 class FakePtyProcess implements PtyProcess {
   readonly writes: string[] = [];
@@ -78,8 +79,71 @@ class FakeTerminalMirror implements TerminalMirrorLike {
   }
 }
 
+class SequencedTerminalMirror implements TerminalMirrorLike {
+  readonly writes: string[] = [];
+  private readonly pendingWrites: {
+    resolve: () => void;
+    reject: (error: unknown) => void;
+  }[] = [];
+
+  get pendingWriteCount(): number {
+    return this.pendingWrites.length;
+  }
+
+  write(data: string): Promise<void> {
+    this.writes.push(data);
+
+    return new Promise((resolve, reject) => {
+      this.pendingWrites.push({ resolve, reject });
+    });
+  }
+
+  resize(): void {
+    return;
+  }
+
+  dispose(): void {
+    return;
+  }
+
+  resolveNextWrite(): void {
+    const pendingWrite = this.pendingWrites.shift();
+
+    if (!pendingWrite) {
+      throw new Error("No pending write to resolve.");
+    }
+
+    pendingWrite.resolve();
+  }
+
+  rejectNextWrite(error: unknown): void {
+    const pendingWrite = this.pendingWrites.shift();
+
+    if (!pendingWrite) {
+      throw new Error("No pending write to reject.");
+    }
+
+    pendingWrite.reject(error);
+  }
+}
+
+async function waitForPendingWrites(
+  mirror: SequencedTerminalMirror,
+  expectedCount: number,
+): Promise<void> {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    if (mirror.pendingWriteCount === expectedCount) {
+      return;
+    }
+
+    await Promise.resolve();
+  }
+
+  expect(mirror.pendingWriteCount).toBe(expectedCount);
+}
+
 describe("TerminalSession", () => {
-  it("mirrors PTY output while forwarding it to the real output writer", () => {
+  it("mirrors PTY output while forwarding it to the real output writer", async () => {
     const ptyProcess = new FakePtyProcess();
     const mirror = new FakeTerminalMirror();
     const outputChunks: string[] = [];
@@ -95,6 +159,7 @@ describe("TerminalSession", () => {
 
     session.start();
     ptyProcess.emitData("hello");
+    await session.flushOutput();
 
     expect(mirror.writes).toEqual(["hello"]);
     expect(outputChunks).toEqual(["hello"]);
@@ -127,7 +192,65 @@ describe("TerminalSession", () => {
     expect(mirror.disposed).toBe(true);
   });
 
-  it("removes PTY listeners when disposed", () => {
+  it("records human input and PTY output in the timeline", async () => {
+    const ptyProcess = new FakePtyProcess();
+    const mirror = new FakeTerminalMirror();
+    const timeline = new InMemoryTimelineStore({ now: () => 123 });
+    const session = new TerminalSession({
+      ptyProcess,
+      mirror,
+      output: { write: () => undefined },
+      timeline,
+    });
+
+    session.start();
+    session.writeInput("pwd\r");
+    ptyProcess.emitData("/tmp\r\n");
+    await session.flushOutput();
+
+    expect(timeline.listEvents()).toEqual([
+      { type: "human_input", ts: 123, data: "pwd\r" },
+      { type: "pty_output", ts: 123, data: "/tmp\r\n" },
+    ]);
+  });
+
+  it("serializes mirror writes and reports mirror failures", async () => {
+    const ptyProcess = new FakePtyProcess();
+    const mirror = new SequencedTerminalMirror();
+    const outputChunks: string[] = [];
+    const outputErrors: unknown[] = [];
+    const session = new TerminalSession({
+      ptyProcess,
+      mirror,
+      output: {
+        write: (data) => {
+          outputChunks.push(data);
+        },
+      },
+      onOutputError: (error) => {
+        outputErrors.push(error);
+      },
+    });
+
+    session.start();
+    ptyProcess.emitData("first");
+    ptyProcess.emitData("second");
+    await waitForPendingWrites(mirror, 1);
+
+    expect(outputChunks).toEqual(["first", "second"]);
+
+    mirror.resolveNextWrite();
+    await waitForPendingWrites(mirror, 1);
+
+    const failure = new Error("mirror failed");
+    mirror.rejectNextWrite(failure);
+    await session.flushOutput();
+
+    expect(mirror.writes).toEqual(["first", "second"]);
+    expect(outputErrors).toEqual([failure]);
+  });
+
+  it("removes PTY listeners when disposed", async () => {
     const ptyProcess = new FakePtyProcess();
     const mirror = new FakeTerminalMirror();
     const outputChunks: string[] = [];
@@ -144,6 +267,7 @@ describe("TerminalSession", () => {
     session.start();
     session.dispose();
     ptyProcess.emitData("late");
+    await session.flushOutput();
 
     expect(outputChunks).toEqual([]);
     expect(mirror.writes).toEqual([]);
