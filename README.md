@@ -1,6 +1,10 @@
 # koshell
 
-A Node.js and TypeScript terminal shell wrapper. It starts a real shell through `node-pty` and mirrors PTY output into a headless xterm instance so the program keeps a usable terminal-state copy while forwarding the shell to the user's terminal.
+Koshell is a human-centric shared terminal: AI beside your terminal, not above it.
+
+The project aims to keep the human as the primary terminal operator while giving AI enough shared terminal context to explain, diagnose, and assist without turning the terminal into a separate chat room or an agent-owned execution loop.
+
+This repository currently contains the early local runtime foundation: a Node.js and TypeScript shell wrapper that starts a real shell through `node-pty` and mirrors PTY output into a headless xterm instance. That mirrored terminal state is the basis for future context-aware assistance.
 
 ## Requirements
 
