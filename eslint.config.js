@@ -1,11 +1,15 @@
 import js from "@eslint/js";
+import { defineConfig, globalIgnores } from "eslint/config";
 import prettierConfig from "eslint-config-prettier";
 import tseslint from "typescript-eslint";
 
-export default tseslint.config(
-  {
-    ignores: ["coverage/**", "dist/**", "node_modules/**", "pnpm-lock.yaml"],
-  },
+export default defineConfig([
+  globalIgnores([
+    "coverage/**",
+    "dist/**",
+    "node_modules/**",
+    "pnpm-lock.yaml",
+  ]),
   js.configs.recommended,
   {
     languageOptions: {
@@ -14,12 +18,10 @@ export default tseslint.config(
       },
     },
   },
+  ...tseslint.configs.strictTypeChecked,
+  ...tseslint.configs.stylisticTypeChecked,
   {
     files: ["**/*.ts"],
-    extends: [
-      ...tseslint.configs.strictTypeChecked,
-      ...tseslint.configs.stylisticTypeChecked,
-    ],
     languageOptions: {
       parserOptions: {
         projectService: true,
@@ -28,8 +30,8 @@ export default tseslint.config(
     },
   },
   {
+    ...tseslint.configs.disableTypeChecked,
     files: ["**/*.js"],
-    extends: [tseslint.configs.disableTypeChecked],
   },
   prettierConfig,
-);
+]);
