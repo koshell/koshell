@@ -24,6 +24,12 @@ Updated at: 2026-06-27 21:22:02 CST +0800.
 
 Terminal context now exposes `recentScreenChanges`. This gives future AI assistance a lightweight sense of when the terminal screen changed significantly without requiring full screen contents for every snapshot. Detailed snapshot diffs remain on-demand timeline operations rather than default context payload.
 
+## AI Context Contract Update
+
+Updated at: 2026-06-27 22:58:25 CST +0800.
+
+Added `src/ai-context.ts` as an agent-runtime-facing cache-aware context contract. Terminal context itself remains provider-independent; the AI context module consumes it through explicit interfaces and exposes stable `AgentTool` definitions for future LLM tool calls.
+
 ## Context Sources
 
 - Raw PTY output is the fact stream for replay and low-level debugging.
@@ -34,7 +40,7 @@ Terminal context now exposes `recentScreenChanges`. This gives future AI assista
 
 ## Validation
 
-Public unit tests cover normal-screen context selection, visible-output preference, alternate-screen snapshot preference, recent screen-change summaries, hidden input filtering, character limits, xterm alternate-buffer detection, and session snapshot recording.
+Public unit tests cover normal-screen context selection, visible-output preference, alternate-screen snapshot preference, recent screen-change summaries, hidden input filtering, character limits, zero screen-change limits, xterm alternate-buffer detection, session snapshot recording, and cache-aware AI context packaging.
 
 ## Open Issues
 
@@ -43,6 +49,7 @@ Public unit tests cover normal-screen context selection, visible-output preferen
 - Alternate-screen support is screen-level, not semantic TUI understanding.
 - Large-change detection uses a simple changed-lines threshold and may need tuning after dogfooding.
 - No redaction policy is applied to screen snapshots yet.
+- AI context packages consume terminal context but do not yet connect to an LLM provider or `#?` trigger.
 
 ## Resolution Conditions
 
@@ -50,3 +57,4 @@ Public unit tests cover normal-screen context selection, visible-output preferen
 - Add snapshot cadence, ring retention, and redaction before using snapshots for persistent storage or long-lived AI context.
 - Tune large-change thresholds after real terminal sessions are reviewed.
 - Add TUI-specific interpretation only after screen-level behavior has been dogfooded.
+- Connect AI context packages to provider prompt building only after stable-prefix and dynamic-suffix behavior is dogfooded.

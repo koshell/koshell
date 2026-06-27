@@ -145,6 +145,10 @@ function getRecentScreenChanges(
     );
   }
 
+  if (limit === 0) {
+    return [];
+  }
+
   return snapshots
     .filter((snapshot) => snapshot.event.diff !== undefined)
     .slice(-limit)

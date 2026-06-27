@@ -36,6 +36,8 @@
     "vitest": "^4.1.9"
   },
   "dependencies": {
+    "@earendil-works/pi-agent-core": "^0.80.2",
+    "@earendil-works/pi-ai": "^0.80.2",
     "@xterm/addon-serialize": "^0.14.0",
     "@xterm/headless": "^6.0.0",
     "diff": "^9.0.0",
