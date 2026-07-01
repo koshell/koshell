@@ -14,11 +14,21 @@ use std::sync::mpsc;
 use std::thread;
 
 use anyhow::{Context, Result};
+use koshell_proto::ClientMessage;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
+use crate::ipc::{self, IpcClient};
 use crate::shell;
 use crate::shell_integration::{MarkerScanner, Segment, create_shell_launch_config};
 use crate::trigger::{SessionState, Trigger};
+
+/// Immutable per-session metadata used for the IPC handshake.
+struct SessionMeta {
+    cwd: String,
+    shell: String,
+    cols: u16,
+    rows: u16,
+}
 
 const DEFAULT_COLUMNS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
@@ -103,11 +113,23 @@ pub fn run_interactive_shell() -> Result<i32> {
 
     let (tx, rx) = mpsc::channel::<Msg>();
 
-    // Processor thread owns the terminal-core state.
+    let meta = SessionMeta {
+        cwd: std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        shell: shell_path,
+        cols,
+        rows,
+    };
+    let socket_path = ipc::default_socket_path();
+
+    // Processor thread owns the terminal-core state and the (lazy) IPC connection.
     let processor = thread::spawn(move || {
         let mut state = SessionState::new(cols, rows);
         let mut scanner = MarkerScanner::new();
         let mut stdout = std::io::stdout();
+        let mut ipc_client: Option<IpcClient> = None;
+        let mut request_seq: u64 = 0;
         while let Ok(msg) = rx.recv() {
             match msg {
                 Msg::Pty(bytes) => {
@@ -120,7 +142,15 @@ pub fn run_interactive_shell() -> Result<i32> {
                             }
                             Segment::Marker(marker) => {
                                 if let Some(trigger) = state.handle_marker(marker) {
-                                    emit_trigger_placeholder(&mut stdout, &trigger);
+                                    request_seq += 1;
+                                    dispatch_trigger(
+                                        &mut stdout,
+                                        &mut ipc_client,
+                                        &socket_path,
+                                        &meta,
+                                        request_seq,
+                                        &trigger,
+                                    );
                                 }
                             }
                         }
@@ -196,13 +226,59 @@ pub fn run_interactive_shell() -> Result<i32> {
     Ok(status.exit_code() as i32)
 }
 
-/// Phase 3 placeholder: acknowledge a `#?` inline. Replaced by streamed AI output once the
-/// daemon and pi are connected.
-fn emit_trigger_placeholder(stdout: &mut std::io::Stdout, trigger: &Trigger) {
-    let _ = write!(
-        stdout,
-        "\r\n[koshell] #? received (AI not connected): {}\r\n",
-        trigger.question
-    );
+/// Sends a `#?` request to the AI daemon (connecting lazily), and acknowledges it inline.
+/// If the daemon is unavailable the terminal degrades gracefully. AI response streaming
+/// replaces the inline acknowledgement once pi is connected.
+fn dispatch_trigger(
+    stdout: &mut std::io::Stdout,
+    ipc_client: &mut Option<IpcClient>,
+    socket_path: &std::path::PathBuf,
+    meta: &SessionMeta,
+    request_seq: u64,
+    trigger: &Trigger,
+) {
+    if ipc_client.is_none()
+        && let Ok(mut client) = IpcClient::connect(socket_path)
+    {
+        let _ = client.send(&ipc::hello(
+            meta.cwd.clone(),
+            meta.shell.clone(),
+            meta.rows,
+            meta.cols,
+        ));
+        *ipc_client = Some(client);
+    }
+
+    let sent = if let Some(client) = ipc_client.as_mut() {
+        let request = ClientMessage::AiRequest {
+            request_id: format!("koshell-req-{request_seq}"),
+            question: trigger.question.clone(),
+            trigger: "#?".to_string(),
+            context_package: trigger.context_package.clone(),
+        };
+        match client.send(&request) {
+            Ok(()) => true,
+            Err(_) => {
+                *ipc_client = None;
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    if sent {
+        let _ = write!(
+            stdout,
+            "\r\n[koshell] #? sent to AI daemon: {}\r\n",
+            trigger.question
+        );
+    } else {
+        let _ = write!(
+            stdout,
+            "\r\n[koshell] #? received (AI daemon unavailable): {}\r\n",
+            trigger.question
+        );
+    }
     let _ = stdout.flush();
 }
