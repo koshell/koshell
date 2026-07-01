@@ -1,0 +1,24 @@
+[package]
+name = "koshell-rs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "koshell"
+path = "src/main.rs"
+
+[dependencies]
+koshell-proto = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+portable-pty = "0.9"
+crossterm = "0.29"
+signal-hook = "0.3"
+libc = "0.2"
+similar = "2"
+alacritty_terminal = "0.25"
+base64 = "0.22"
+tempfile = "3"

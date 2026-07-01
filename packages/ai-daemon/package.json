@@ -1,0 +1,26 @@
+{
+  "name": "@koshell/ai-daemon",
+  "version": "0.1.0",
+  "description": "Koshell AI daemon: receives terminal #? requests over IPC (pi integration lands next stage).",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "bin": {
+    "koshell-ai-daemon": "src/index.ts"
+  },
+  "scripts": {
+    "start": "node src/index.ts",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.0.1",
+    "eslint": "^10.5.0",
+    "eslint-config-prettier": "^10.1.8",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.62.0",
+    "vitest": "^4.1.9"
+  }
+}
