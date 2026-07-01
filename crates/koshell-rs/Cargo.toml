@@ -1,0 +1,11 @@
+[package]
+name = "koshell-rs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "koshell"
+path = "src/main.rs"
+
+[dependencies]

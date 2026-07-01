@@ -1,4 +1,2 @@
-allowBuilds:
-  "@google/genai": false
-  node-pty: true
-  protobufjs: false
+packages:
+  - "packages/*"
