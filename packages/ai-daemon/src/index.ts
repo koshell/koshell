@@ -1,14 +1,39 @@
 #!/usr/bin/env node
 // koshell AI daemon entry point.
 //
-// Scaffolding stage: the JSONL-over-Unix-socket receiver that accepts terminal
-// #? requests lands in Phase 5-min. pi-backed AI arrives the stage after.
+// Current stage: a minimal JSONL Unix-socket receiver that logs terminal `#?` requests
+// and acknowledges them. pi-backed AI, provider configuration, and the tool loop arrive
+// in the next stage.
+import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { dirname } from "node:path";
 import process from "node:process";
 
+import { startDaemon } from "./server.ts";
+import { resolveSocketPath } from "./socket-path.ts";
+
 function main(): void {
-  process.stderr.write(
-    "koshell-ai-daemon: scaffolding. IPC receiver lands in Phase 5-min.\n",
-  );
+  const socketPath = resolveSocketPath();
+  mkdirSync(dirname(socketPath), { recursive: true });
+  if (existsSync(socketPath)) {
+    rmSync(socketPath);
+  }
+
+  const log = (message: string): void => {
+    process.stdout.write(`[koshell-ai-daemon] ${message}\n`);
+  };
+
+  const server = startDaemon(socketPath, log);
+
+  const shutdown = (): void => {
+    server.close();
+    if (existsSync(socketPath)) {
+      rmSync(socketPath);
+    }
+    process.exit(0);
+  };
+
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 }
 
 main();
