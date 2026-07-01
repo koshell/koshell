@@ -130,7 +130,33 @@ pub fn run_interactive_shell() -> Result<i32> {
         let mut stdout = std::io::stdout();
         let mut ipc_client: Option<IpcClient> = None;
         let mut request_seq: u64 = 0;
-        while let Ok(msg) = rx.recv() {
+        loop {
+            // When an in-program `#?` awaits the S3 (quiescence) signal, bound the wait so an
+            // idle output stream fires it; otherwise block until the next message.
+            let msg = match state.repl_quiescence_debounce() {
+                Some(debounce) => match rx.recv_timeout(debounce) {
+                    Ok(msg) => msg,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if let Some(trigger) = state.on_quiescence() {
+                            request_seq += 1;
+                            dispatch_trigger(
+                                &mut stdout,
+                                &mut ipc_client,
+                                &socket_path,
+                                &meta,
+                                request_seq,
+                                &trigger,
+                            );
+                        }
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                },
+                None => match rx.recv() {
+                    Ok(msg) => msg,
+                    Err(_) => break,
+                },
+            };
             match msg {
                 Msg::Pty(bytes) => {
                     for segment in scanner.feed(&bytes) {
@@ -138,7 +164,17 @@ pub fn run_interactive_shell() -> Result<i32> {
                             Segment::Visible(visible) => {
                                 let _ = stdout.write_all(&visible);
                                 let _ = stdout.flush();
-                                state.record_output(&visible);
+                                if let Some(trigger) = state.record_output(&visible) {
+                                    request_seq += 1;
+                                    dispatch_trigger(
+                                        &mut stdout,
+                                        &mut ipc_client,
+                                        &socket_path,
+                                        &meta,
+                                        request_seq,
+                                        &trigger,
+                                    );
+                                }
                             }
                             Segment::Marker(marker) => {
                                 if let Some(trigger) = state.handle_marker(marker) {

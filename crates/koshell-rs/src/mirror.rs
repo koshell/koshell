@@ -94,6 +94,12 @@ impl TerminalMirror {
         self.rows = rows;
     }
 
+    /// Whether the terminal is currently on the alternate screen (a full-screen TUI).
+    /// Cheap enough to call per keystroke, unlike [`Self::snapshot`].
+    pub fn is_alt_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
     /// Captures the current visible screen as a plain-text snapshot.
     pub fn snapshot(&self) -> TerminalSnapshot {
         let grid = self.term.grid();

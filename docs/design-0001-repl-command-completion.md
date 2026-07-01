@@ -2,7 +2,8 @@
 
 Date: 2026-07-01 16:55:37 CST
 
-Status: Design (not yet implemented). MVP scope decided; see "Decision & MVP scope".
+Status: MVP prototype implemented (S1 + S3). See "Prototype status" for what landed and how
+it deviates from this design.
 
 ## Context
 
@@ -246,3 +247,36 @@ PTY, launch a program, drive input, and assert on `[koshell] #?` feedback and ti
   node and dumb prompts; S2's marginal coverage did not justify its ioctl/polling and
   portability cost.
 - Keep S0/S2 and per-program integration as documented future enhancements.
+
+## Prototype status (implemented)
+
+Landed in `crates/koshell-rs`:
+
+- `ReplDetector` and `BracketedPasteScanner` in `trigger.rs`, owned by `SessionState`. Gated
+  by `repl_gated()` (`command_active && !mirror.is_alt_screen()`), so the shell OSC path and
+  the in-program path never overlap. The detector resets at every `command_start` /
+  `command_end`.
+- S1: `on_output` scans visible bytes for bracketed-paste `ESC[?2004h`/`ESC[?2004l` edges
+  (with cross-chunk carry) and completes a pending `#?` on the `?2004h` edge.
+- S3: `session.rs` uses `recv_timeout(REPL_QUIESCENCE_DEBOUNCE)` (150 ms) while a pending
+  `#?` is armed and no bracketed-paste edge has been seen (node-style programs); an idle tick
+  then fires via `on_quiescence`.
+- Deferred fire reuses `build_context_package`, so the AI context is the post-completion
+  screen — identical downstream path to the shell trigger.
+- Tests: `tests/repl_completion_pty.rs` drives real python (S1) and node (S3) REPLs under a
+  PTY and asserts the `#?` fires _after_ the command's output sentinel. They skip when the
+  interpreter is absent.
+
+Deviations from the design above, deliberately deferred:
+
+- **`#?` capture uses keystrokes, not the mirror.** The prototype reconstructs the submitted
+  line from input bytes (with minimal backspace handling) rather than reading the rendered
+  logical line from the mirror at the submit instant. This is simpler and avoids an
+  echo-vs-input timing race, but is not robust to in-line editing (history recall, arrow
+  edits, paste). The mirror-read described in "`#?` detection inside the program" is the
+  intended productionization.
+- **No prompt learning yet.** S3 uses pure output quiescence without the learned-prompt
+  template, so a node command that pauses mid-output could fire early. Acceptable for the
+  prototype; the template match is the documented hardening step.
+- **No nested-prompt pairing, no max-wait timeout.** Both remain as designed-but-unbuilt
+  safety/robustness items.
