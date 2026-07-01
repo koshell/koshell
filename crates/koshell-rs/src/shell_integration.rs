@@ -311,7 +311,7 @@ __koshell_emit_end() {
 "#;
 
 const BASH_HOOKS: &str = r#"__koshell_last_started_command=""
-__koshell_last_history_command=""
+__koshell_last_history_number=""
 __koshell_command_active=""
 __koshell_in_prompt_command=""
 __koshell_debug_trap() {
@@ -331,10 +331,16 @@ __koshell_debug_trap() {
 __koshell_prompt_command() {
   local exit_status=$?
   __koshell_in_prompt_command=1
-  local history_command
-  history_command=$(HISTTIMEFORMAT= builtin history 1 2>/dev/null | sed 's/^ *[0-9][0-9]* *//')
-  if [ -n "$history_command" ] && [ "$history_command" != "$__koshell_last_history_command" ]; then
-    __koshell_last_history_command="$history_command"
+  # Dedup by the history entry NUMBER, not its text: re-running an identical
+  # command (e.g. asking the same `#?` question twice) advances the number and
+  # is detected each time, while an empty Enter or prompt redraw adds no history
+  # entry and is correctly suppressed.
+  local history_line history_number history_command
+  history_line=$(HISTTIMEFORMAT= builtin history 1 2>/dev/null)
+  history_number=$(printf '%s' "$history_line" | sed 's/^ *\([0-9][0-9]*\).*/\1/')
+  history_command=$(printf '%s' "$history_line" | sed 's/^ *[0-9][0-9]* *//')
+  if [ -n "$history_number" ] && [ "$history_number" != "$__koshell_last_history_number" ]; then
+    __koshell_last_history_number="$history_number"
     if [ -n "$__koshell_command_active" ]; then
       __koshell_emit_end "$exit_status" "$history_command"
     else
@@ -358,30 +364,52 @@ trap '__koshell_debug_trap' DEBUG
 "#;
 
 const ZSH_HOOKS: &str = r#"autoload -Uz add-zsh-hook
-__koshell_zsh_last_history_command=""
 __koshell_zsh_command_active=""
+__koshell_zsh_current_command=""
+__koshell_zsh_pending_line=""
+__koshell_zsh_has_orig_accept_line=""
+# Capture the exact submitted line at Enter time via an accept-line wrapper. This is the
+# only signal that fires for a comment-only `#?` line, and it never consults history, so it
+# is immune to hist_ignore_dups / hist_ignore_space / hist_save_no_dups collapsing repeats.
+# Delegate to any pre-existing accept-line widget so plugin wrappers still run.
+case "${widgets[accept-line]}" in
+  user:*)
+    zle -A accept-line __koshell_zsh_orig_accept_line
+    __koshell_zsh_has_orig_accept_line=1
+    ;;
+esac
+__koshell_zsh_accept_line() {
+  __koshell_zsh_pending_line="$BUFFER"
+  if [ -n "$__koshell_zsh_has_orig_accept_line" ]; then
+    zle __koshell_zsh_orig_accept_line
+  else
+    zle .accept-line
+  fi
+}
+zle -N accept-line __koshell_zsh_accept_line
 __koshell_zsh_preexec() {
   __koshell_zsh_command_active=1
+  __koshell_zsh_current_command="$1"
+  # A real command ran for this line; the comment fallback must not fire for it too.
+  __koshell_zsh_pending_line=""
   __koshell_emit_start "$1"
 }
 __koshell_zsh_precmd() {
   local exit_status=$?
-  local history_command
-  history_command=$(fc -ln -1 2>/dev/null | sed 's/^\t//')
-  if [ -n "$history_command" ] && [ "$history_command" != "$__koshell_zsh_last_history_command" ]; then
-    __koshell_zsh_last_history_command="$history_command"
-    if [ -n "$__koshell_zsh_command_active" ]; then
-      __koshell_emit_end "$exit_status" "$history_command"
-    else
-      case "$history_command" in
-        *'#?'*)
-          __koshell_emit_start "$history_command"
-          __koshell_emit_end "$exit_status" "$history_command"
-          ;;
-      esac
-    fi
+  if [ -n "$__koshell_zsh_command_active" ]; then
+    __koshell_emit_end "$exit_status" "$__koshell_zsh_current_command"
+  else
+    case "$__koshell_zsh_pending_line" in
+      *'#?'*)
+        __koshell_emit_start "$__koshell_zsh_pending_line"
+        __koshell_emit_end "$exit_status" "$__koshell_zsh_pending_line"
+        ;;
+    esac
   fi
+  # Clear per-line state so a prompt redraw (e.g. resize) without a new Enter never re-fires.
   __koshell_zsh_command_active=""
+  __koshell_zsh_current_command=""
+  __koshell_zsh_pending_line=""
 }
 add-zsh-hook preexec __koshell_zsh_preexec
 add-zsh-hook precmd __koshell_zsh_precmd
