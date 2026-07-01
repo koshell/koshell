@@ -9,3 +9,8 @@ name = "koshell"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = { workspace = true }
+portable-pty = "0.9"
+crossterm = "0.29"
+signal-hook = "0.3"
+libc = "0.2"
