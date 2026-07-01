@@ -4,6 +4,7 @@
   "description": "Koshell AI daemon: receives terminal #? requests over IPC (pi integration lands next stage).",
   "private": true,
   "type": "module",
+  "license": "Apache-2.0",
   "bin": {
     "koshell-ai-daemon": "src/index.ts"
   },

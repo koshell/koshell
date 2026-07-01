@@ -5,6 +5,7 @@ members = ["crates/koshell-rs", "crates/koshell-proto"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.96"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 koshell-proto = { path = "crates/koshell-proto" }

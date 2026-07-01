@@ -4,6 +4,11 @@
   "description": "Human-centric shared terminal: Rust terminal-core beside a Node AI daemon.",
   "private": true,
   "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/koshell/koshell.git"
+  },
   "engines": {
     "node": ">=24",
     "pnpm": ">=11"
