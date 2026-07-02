@@ -28,12 +28,37 @@ export interface ByeMessage {
 
 export type ClientMessage = HelloMessage | AiRequestMessage | ByeMessage;
 
+// Per request, the daemon sends `ack` first (parsed and enqueued), then zero or
+// more `ai_delta` chunks, then exactly one of `ai_response_end` or `ai_error`.
 export interface AckMessage {
   type: "ack";
   request_id: string;
 }
 
-export type ServerMessage = AckMessage;
+export interface AiDeltaMessage {
+  type: "ai_delta";
+  request_id: string;
+  delta: string;
+}
+
+export interface AiResponseEndMessage {
+  type: "ai_response_end";
+  request_id: string;
+}
+
+export interface AiErrorMessage {
+  type: "ai_error";
+  request_id: string;
+  message: string;
+}
+
+export type ServerMessage =
+  AckMessage | AiDeltaMessage | AiResponseEndMessage | AiErrorMessage;
+
+// Encodes one server message as a newline-terminated JSONL line.
+export function serializeServerMessage(message: ServerMessage): string {
+  return `${JSON.stringify(message)}\n`;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -99,12 +124,4 @@ export function parseClientMessage(line: string): ClientMessage | null {
     default:
       return null;
   }
-}
-
-// Produces the server's reply to a client message, or null when none is warranted.
-export function respondTo(message: ClientMessage): ServerMessage | null {
-  if (message.type === "ai_request") {
-    return { type: "ack", request_id: message.request_id };
-  }
-  return null;
 }

@@ -48,13 +48,23 @@ pub enum ClientMessage {
 }
 
 /// A message sent from the AI daemon back to the terminal process.
+///
+/// Per request, the daemon sends `ack` first (the request was parsed and
+/// enqueued), then zero or more `ai_delta` chunks, then exactly one of
+/// `ai_response_end` or `ai_error`. `ai_tool_call` is reserved for the tool
+/// round-trip stage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
-    /// Acknowledges receipt of an [`ClientMessage::AiRequest`]. This is the only
-    /// server message implemented in the current stage; `ai_delta`,
-    /// `ai_tool_call`, `ai_response_end`, and `ai_error` arrive with pi.
+    /// Acknowledges receipt of an [`ClientMessage::AiRequest`], before any
+    /// streaming output.
     Ack { request_id: String },
+    /// One streamed chunk of assistant text for an in-flight request.
+    AiDelta { request_id: String, delta: String },
+    /// Terminal success marker: no further messages follow for this request.
+    AiResponseEnd { request_id: String },
+    /// Terminal failure marker: no further messages follow for this request.
+    AiError { request_id: String, message: String },
 }
 
 #[cfg(test)]
@@ -85,5 +95,43 @@ mod tests {
         })
         .unwrap();
         assert_eq!(line, r#"{"type":"ack","request_id":"req-1"}"#);
+    }
+
+    #[test]
+    fn streaming_messages_round_trip_as_tagged_json() {
+        let delta = serde_json::to_string(&ServerMessage::AiDelta {
+            request_id: "req-1".into(),
+            delta: "Hello".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            delta,
+            r#"{"type":"ai_delta","request_id":"req-1","delta":"Hello"}"#
+        );
+
+        let end = serde_json::to_string(&ServerMessage::AiResponseEnd {
+            request_id: "req-1".into(),
+        })
+        .unwrap();
+        assert_eq!(end, r#"{"type":"ai_response_end","request_id":"req-1"}"#);
+
+        let error = serde_json::to_string(&ServerMessage::AiError {
+            request_id: "req-1".into(),
+            message: "no provider configured".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            error,
+            r#"{"type":"ai_error","request_id":"req-1","message":"no provider configured"}"#
+        );
+
+        let back: ServerMessage = serde_json::from_str(&delta).unwrap();
+        match back {
+            ServerMessage::AiDelta { request_id, delta } => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(delta, "Hello");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 }

@@ -9,18 +9,16 @@ use std::path::PathBuf;
 
 use koshell_proto::{ClientMessage, PROTOCOL_VERSION, ServerMessage};
 
-/// A connected client to the AI daemon.
+/// A connected client to the AI daemon (the write half).
 pub struct IpcClient {
     stream: UnixStream,
-    reader: BufReader<UnixStream>,
 }
 
 impl IpcClient {
     /// Connects to the daemon socket at `path`.
     pub fn connect(path: &PathBuf) -> anyhow::Result<Self> {
         let stream = UnixStream::connect(path)?;
-        let reader = BufReader::new(stream.try_clone()?);
-        Ok(Self { stream, reader })
+        Ok(Self { stream })
     }
 
     /// Sends one message as a JSONL line.
@@ -32,6 +30,20 @@ impl IpcClient {
         Ok(())
     }
 
+    /// Clones the read half of the connection for a dedicated reader thread.
+    pub fn reader(&self) -> anyhow::Result<IpcReader> {
+        Ok(IpcReader {
+            reader: BufReader::new(self.stream.try_clone()?),
+        })
+    }
+}
+
+/// The read half of a daemon connection, owned by a dedicated reader thread.
+pub struct IpcReader {
+    reader: BufReader<UnixStream>,
+}
+
+impl IpcReader {
     /// Reads one server message (blocking). Returns `None` on clean EOF.
     pub fn recv(&mut self) -> anyhow::Result<Option<ServerMessage>> {
         let mut line = String::new();

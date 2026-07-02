@@ -2,9 +2,19 @@
 
 Date: 2026-07-02 12:28 CST
 
-Status: designed, not yet implemented. These decisions govern the next stage (pi-backed
-AI daemon, streaming responses, presentation); nothing in the current codebase implements
-them yet.
+Status: partially implemented as of 2026-07-02 16:01 CST. The pi-backed daemon prototype
+implements the mirror-feed invariant, the push-anchor context package (question, trigger
+metadata, primary text, current screen, session facts rendered into the prompt), the
+per-terminal conversation scope, and a prototype simplification of bounded-side
+buffering (`crates/koshell-rs/src/presentation.rs`): command ended → PTY output (the
+returning prompt) is held from dispatch time, the AI response streams first, and the
+held output flushes after it, bounded by a size fuse and a max-hold deadline (a hung
+daemon can never freeze the terminal), with one dim waiting notice if nothing has
+rendered shortly after dispatch; still running → the response accumulates and inserts
+as one block at response end, without quiescence-gap detection or its max-wait.
+Still open: the pull-side tool catalog and inventory (push-only for now), the final AI
+output style (a dim `[koshell ai]` header is the placeholder), gap insertion, and the
+pushed-package size budgets.
 
 ## Context
 

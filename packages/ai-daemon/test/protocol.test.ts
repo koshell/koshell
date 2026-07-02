@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { handleMessage } from "../src/server.ts";
-import { parseClientMessage, respondTo } from "../src/protocol.ts";
+import { parseClientMessage, serializeServerMessage } from "../src/protocol.ts";
 
 describe("parseClientMessage", () => {
   it("parses an ai_request with its context package", () => {
@@ -44,40 +43,34 @@ describe("parseClientMessage", () => {
   });
 });
 
-describe("respondTo", () => {
-  it("acks an ai_request and nothing else", () => {
+describe("serializeServerMessage", () => {
+  // Exact wire lines, locked in step with the Rust proto tests
+  // (crates/koshell-proto/src/lib.rs).
+  it("produces the exact JSONL wire lines", () => {
+    expect(serializeServerMessage({ type: "ack", request_id: "req-1" })).toBe(
+      '{"type":"ack","request_id":"req-1"}\n',
+    );
     expect(
-      respondTo({
-        type: "ai_request",
-        request_id: "r1",
-        question: "q",
-        trigger: "#?",
-        context_package: null,
+      serializeServerMessage({
+        type: "ai_delta",
+        request_id: "req-1",
+        delta: "Hello",
       }),
-    ).toEqual({ type: "ack", request_id: "r1" });
-
+    ).toBe('{"type":"ai_delta","request_id":"req-1","delta":"Hello"}\n');
     expect(
-      respondTo({ type: "bye", terminal_session_id: "koshell-42" }),
-    ).toBeNull();
-  });
-});
-
-describe("handleMessage", () => {
-  it("returns an ack line for an ai_request and logs the question", () => {
-    const logs: string[] = [];
-    const reply = handleMessage(
-      {
-        type: "ai_request",
-        request_id: "r1",
-        question: "why did this fail",
-        trigger: "#?",
-        context_package: null,
-      },
-      (message) => logs.push(message),
+      serializeServerMessage({
+        type: "ai_response_end",
+        request_id: "req-1",
+      }),
+    ).toBe('{"type":"ai_response_end","request_id":"req-1"}\n');
+    expect(
+      serializeServerMessage({
+        type: "ai_error",
+        request_id: "req-1",
+        message: "no provider configured",
+      }),
+    ).toBe(
+      '{"type":"ai_error","request_id":"req-1","message":"no provider configured"}\n',
     );
-    expect(reply).toBe(
-      `${JSON.stringify({ type: "ack", request_id: "r1" })}\n`,
-    );
-    expect(logs.some((line) => line.includes("why did this fail"))).toBe(true);
   });
 });

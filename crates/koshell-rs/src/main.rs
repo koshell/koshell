@@ -8,6 +8,7 @@ use clap::Parser;
 
 fn main() {
     let cli = koshell_rs::cli::Cli::parse();
+    koshell_rs::logging::init(cli.log_level.as_deref());
     match koshell_rs::session::run_interactive_shell(&cli.command) {
         Ok(code) => std::process::exit(code),
         Err(error) => {

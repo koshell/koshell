@@ -4,9 +4,9 @@
 //! bash/zsh). A trailing positional command launches that program directly instead —
 //! `koshell python3 -i` runs `python3 -i` in the PTY with `#?` armed through the
 //! non-integrated capture path. Everything after the first positional belongs to the
-//! child program, and `--` allows a command whose name starts with a dash. No real
-//! options exist yet; unknown dashed arguments before the command are rejected so the
-//! option namespace stays reserved for future flags.
+//! child program, and `--` allows a command whose name starts with a dash. Unknown
+//! dashed arguments before the command are rejected so the option namespace stays
+//! reserved for future flags.
 
 use clap::Parser;
 
@@ -14,6 +14,12 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(name = "koshell", version, about, max_term_width = 100)]
 pub struct Cli {
+    /// Log level filter (error, warn, info, debug, trace, off; env_logger module
+    /// filters also work). Overrides the KOSHELL_LOG environment variable. Logs are
+    /// written to a file under the XDG state directory, never to the terminal.
+    #[arg(long, value_name = "LEVEL")]
+    pub log_level: Option<String>,
+
     /// Program to launch instead of the default shell, with its arguments
     /// (for example `koshell python3 -i`). Omit to launch the default shell.
     #[arg(value_name = "COMMAND", trailing_var_arg = true)]
@@ -38,6 +44,17 @@ mod tests {
     fn positional_command_with_dashed_arguments_passes_through() {
         let cli = parse(&["python3", "-i", "--version"]).unwrap();
         assert_eq!(cli.command, ["python3", "-i", "--version"]);
+    }
+
+    #[test]
+    fn log_level_before_command_is_koshell_s_and_after_belongs_to_the_program() {
+        let cli = parse(&["--log-level", "debug", "python3", "-i"]).unwrap();
+        assert_eq!(cli.log_level.as_deref(), Some("debug"));
+        assert_eq!(cli.command, ["python3", "-i"]);
+
+        let cli = parse(&["python3", "--log-level", "debug"]).unwrap();
+        assert_eq!(cli.log_level, None);
+        assert_eq!(cli.command, ["python3", "--log-level", "debug"]);
     }
 
     #[test]

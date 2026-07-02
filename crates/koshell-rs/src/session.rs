@@ -18,10 +18,11 @@ use std::thread;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use koshell_proto::ClientMessage;
+use koshell_proto::{ClientMessage, ServerMessage};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 use crate::ipc::{self, IpcClient};
+use crate::presentation::Presentation;
 use crate::shell;
 use crate::shell_integration::{MarkerScanner, Segment, create_shell_launch_config};
 use crate::trigger::{Action, CompletionKind, SessionState, Trigger};
@@ -47,6 +48,8 @@ enum Msg {
     Pty(Vec<u8>),
     Input(Vec<u8>),
     Resize(u16, u16),
+    /// A reply from the AI daemon, forwarded by the IPC reader thread.
+    Daemon(ServerMessage),
     /// A bare Esc was swallowed while the cancel window was armed.
     CancelPending,
     Exit,
@@ -163,19 +166,32 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
     let esc_window = Arc::new(AtomicBool::new(false));
 
     // Processor thread owns the terminal-core state and the (lazy) IPC connection.
+    // It keeps a channel sender so daemon replies (read by a dedicated IPC reader
+    // thread) flow through the same single-consumer loop as PTY output.
     let esc_window_proc = esc_window.clone();
     let writer_proc = writer.clone();
+    let tx_daemon = tx.clone();
     let processor = thread::spawn(move || {
         let mut state = SessionState::new(cols, rows, shell_integrated);
         let mut scanner = MarkerScanner::new();
         let mut stdout = std::io::stdout();
         let mut ipc_client: Option<IpcClient> = None;
+        let mut presentation = Presentation::new();
         let mut request_seq: u64 = 0;
         loop {
-            // Pending `#?` deadlines (receipt notice, stabilization tier, max-wait) bound
+            // Trigger deadlines (receipt notice, stabilization tier, max-wait) and
+            // presentation deadlines (waiting notice, buffered-output max hold) bound
             // the channel wait; with nothing pending, block until the next message.
-            let msg = match state.next_deadline(Instant::now()) {
-                Some(deadline) => match rx.recv_timeout(deadline) {
+            let wait_from = Instant::now();
+            let timeout = [
+                state.next_deadline(wait_from),
+                presentation.next_deadline(wait_from),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
+            let msg = match timeout {
+                Some(timeout) => match rx.recv_timeout(timeout) {
                     Ok(msg) => Some(msg),
                     Err(mpsc::RecvTimeoutError::Timeout) => None,
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -193,15 +209,16 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
                     for segment in scanner.feed(&bytes) {
                         match segment {
                             Segment::Visible(visible) => {
-                                let _ = stdout.write_all(&visible);
-                                let _ = stdout.flush();
-                                state.record_output(&visible, now);
+                                presentation.pty_output(&visible, &mut stdout, &mut state, now);
                             }
                             Segment::Marker(marker) => {
                                 actions.extend(state.handle_marker(marker, now));
                             }
                         }
                     }
+                }
+                Some(Msg::Daemon(message)) => {
+                    presentation.handle_server_message(&message, &mut stdout, &mut state, now);
                 }
                 Some(Msg::Input(bytes)) => actions.extend(state.record_input(&bytes, now)),
                 Some(Msg::Resize(columns, lines)) => state.resize(columns, lines),
@@ -220,6 +237,7 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
                 None => {}
             }
             actions.extend(state.poll(now));
+            presentation.poll(now, &mut stdout, &mut state);
 
             for action in actions {
                 match action {
@@ -230,6 +248,8 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
                             &mut stdout,
                             &mut state,
                             &mut ipc_client,
+                            &mut presentation,
+                            &tx_daemon,
                             &socket_path,
                             &meta,
                             request_seq,
@@ -348,12 +368,16 @@ fn present_notice(stdout: &mut std::io::Stdout, state: &mut SessionState, text: 
 }
 
 /// Sends a `#?` request to the AI daemon (connecting lazily), and acknowledges it inline.
-/// If the daemon is unavailable the terminal degrades gracefully. AI response streaming
-/// replaces the inline acknowledgement once pi is connected.
+/// If the daemon is unavailable the terminal degrades gracefully. On a fresh connection
+/// a dedicated reader thread is spawned that forwards streamed daemon replies into the
+/// processor channel; it exits on EOF or a broken socket.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_trigger(
     stdout: &mut std::io::Stdout,
     state: &mut SessionState,
     ipc_client: &mut Option<IpcClient>,
+    presentation: &mut Presentation,
+    tx: &mpsc::Sender<Msg>,
     socket_path: &std::path::PathBuf,
     meta: &SessionMeta,
     request_seq: u64,
@@ -368,12 +392,23 @@ fn dispatch_trigger(
             meta.rows,
             meta.cols,
         ));
-        *ipc_client = Some(client);
+        if let Ok(mut reader) = client.reader() {
+            let tx_reader = tx.clone();
+            thread::spawn(move || {
+                while let Ok(Some(message)) = reader.recv() {
+                    if tx_reader.send(Msg::Daemon(message)).is_err() {
+                        break;
+                    }
+                }
+            });
+            *ipc_client = Some(client);
+        }
     }
 
+    let request_id = format!("koshell-req-{request_seq}");
     let sent = if let Some(client) = ipc_client.as_mut() {
         let request = ClientMessage::AiRequest {
-            request_id: format!("koshell-req-{request_seq}"),
+            request_id: request_id.clone(),
             question: trigger.question.clone(),
             trigger: "#?".to_string(),
             context_package: trigger.context_package.clone(),
@@ -388,24 +423,36 @@ fn dispatch_trigger(
     } else {
         false
     };
-
-    let status = if sent {
-        "sent to AI daemon"
+    if sent {
+        // The streamed response (or the delayed waiting notice) is the user-facing
+        // receipt; the dispatch itself is only worth a log line.
+        presentation.note_dispatch(&request_id, trigger.still_running, Instant::now());
+        log::info!(
+            "#? [{request_id}] dispatched (completion: {:?}, still running: {}): {}",
+            trigger.completion,
+            trigger.still_running,
+            trigger.question
+        );
     } else {
-        "received (AI daemon unavailable)"
-    };
-    let annotation = match (trigger.completion, trigger.still_running) {
-        (CompletionKind::Stabilized | CompletionKind::MaxWait, true) => {
-            " (command may still be running)"
-        }
-        (CompletionKind::MaxWait, false) => " (output not settled)",
-        _ => "",
-    };
-    let bytes = format!(
-        "\r\n[koshell] #? {status}{annotation}: {}\r\n",
-        trigger.question
-    );
-    let _ = stdout.write_all(bytes.as_bytes());
-    let _ = stdout.flush();
-    state.record_presentation_output(bytes.as_bytes());
+        // Explicit degradation stays on the terminal: the question will get no
+        // answer, and the user must know why (and in what completion state it fired).
+        log::warn!(
+            "#? [{request_id}] AI daemon unavailable: {}",
+            trigger.question
+        );
+        let annotation = match (trigger.completion, trigger.still_running) {
+            (CompletionKind::Stabilized | CompletionKind::MaxWait, true) => {
+                " (command may still be running)"
+            }
+            (CompletionKind::MaxWait, false) => " (output not settled)",
+            _ => "",
+        };
+        let bytes = format!(
+            "\r\n\x1b[2m[koshell] #? received (AI daemon unavailable){annotation}: {}\x1b[0m\r\n",
+            trigger.question
+        );
+        let _ = stdout.write_all(bytes.as_bytes());
+        let _ = stdout.flush();
+        state.record_presentation_output(bytes.as_bytes());
+    }
 }

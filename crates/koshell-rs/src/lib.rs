@@ -4,7 +4,9 @@
 pub mod cli;
 pub mod context;
 pub mod ipc;
+pub mod logging;
 pub mod mirror;
+pub mod presentation;
 pub mod screen_diff;
 pub mod session;
 pub mod shell;

@@ -1,0 +1,257 @@
+import { describe, expect, it } from "vitest";
+
+import type {
+  AgentFactory,
+  AskOptions,
+  KoshellAgent,
+} from "../src/agent-runtime.ts";
+import type { Logger } from "../src/logging.ts";
+import { TerminalConnection, type MessageSink } from "../src/server.ts";
+
+const noop = (): void => undefined;
+
+const NOOP_LOGGER: Logger = {
+  error: noop,
+  warn: noop,
+  info: noop,
+  debug: noop,
+};
+
+const HELLO_LINE = JSON.stringify({
+  type: "hello",
+  protocol_version: 1,
+  terminal_session_id: "koshell-42",
+  cwd: "/tmp",
+  shell: "/bin/zsh",
+  rows: 24,
+  cols: 80,
+});
+
+function aiRequestLine(requestId: string, question = "why"): string {
+  return JSON.stringify({
+    type: "ai_request",
+    request_id: requestId,
+    question,
+    trigger: "#?",
+    context_package: null,
+  });
+}
+
+function collectingSink(): { sink: MessageSink; lines: string[] } {
+  const lines: string[] = [];
+  return {
+    sink: {
+      write(line: string): void {
+        lines.push(line.trimEnd());
+      },
+    },
+    lines,
+  };
+}
+
+function types(lines: string[]): string[] {
+  return lines.map((line) => (JSON.parse(line) as { type: string }).type);
+}
+
+// Resolves once all queued microtasks and the sync continuations behind them ran.
+async function settle(): Promise<void> {
+  for (let i = 0; i < 20; i += 1) {
+    await Promise.resolve();
+  }
+}
+
+describe("TerminalConnection", () => {
+  it("streams ack, deltas, and ai_response_end in order", async () => {
+    const { sink, lines } = collectingSink();
+    const factory: AgentFactory = () =>
+      Promise.resolve<KoshellAgent>({
+        ask({ onDelta }: AskOptions): Promise<void> {
+          onDelta("Hello ");
+          onDelta("world");
+          return Promise.resolve();
+        },
+        dispose: noop,
+      });
+    const connection = new TerminalConnection(sink, {
+      createAgent: factory,
+      log: NOOP_LOGGER,
+    });
+
+    connection.handleLine(HELLO_LINE);
+    connection.handleLine(aiRequestLine("r1"));
+    await settle();
+
+    expect(types(lines)).toEqual([
+      "ack",
+      "ai_delta",
+      "ai_delta",
+      "ai_response_end",
+    ]);
+    expect(lines[1]).toContain('"delta":"Hello "');
+  });
+
+  it("reports a factory failure as ai_error and retries on the next request", async () => {
+    const { sink, lines } = collectingSink();
+    let calls = 0;
+    const factory: AgentFactory = () => {
+      calls += 1;
+      if (calls === 1) {
+        return Promise.reject(new Error("no AI provider configured"));
+      }
+      return Promise.resolve<KoshellAgent>({
+        ask({ onDelta }: AskOptions): Promise<void> {
+          onDelta("ok");
+          return Promise.resolve();
+        },
+        dispose: noop,
+      });
+    };
+    const connection = new TerminalConnection(sink, {
+      createAgent: factory,
+      log: NOOP_LOGGER,
+    });
+
+    connection.handleLine(aiRequestLine("r1"));
+    await settle();
+    connection.handleLine(aiRequestLine("r2"));
+    await settle();
+
+    expect(types(lines)).toEqual([
+      "ack",
+      "ai_error",
+      "ack",
+      "ai_delta",
+      "ai_response_end",
+    ]);
+    expect(calls).toBe(2);
+    expect(lines[1]).toContain("no AI provider configured");
+  });
+
+  it("reports an ask failure after partial deltas as ai_error", async () => {
+    const { sink, lines } = collectingSink();
+    const factory: AgentFactory = () =>
+      Promise.resolve<KoshellAgent>({
+        ask({ onDelta }: AskOptions): Promise<void> {
+          onDelta("partial");
+          return Promise.reject(new Error("provider exploded"));
+        },
+        dispose: noop,
+      });
+    const connection = new TerminalConnection(sink, {
+      createAgent: factory,
+      log: NOOP_LOGGER,
+    });
+
+    connection.handleLine(aiRequestLine("r1"));
+    await settle();
+
+    expect(types(lines)).toEqual(["ack", "ai_delta", "ai_error"]);
+    expect(lines[2]).toContain("provider exploded");
+  });
+
+  it("serializes concurrent requests FIFO on one conversation", async () => {
+    const { sink, lines } = collectingSink();
+    let releaseFirst: (() => void) | undefined;
+    let asks = 0;
+    const factory: AgentFactory = () =>
+      Promise.resolve<KoshellAgent>({
+        ask({ onDelta }: AskOptions): Promise<void> {
+          asks += 1;
+          const id = asks;
+          onDelta(`answer-${String(id)}`);
+          if (id === 1) {
+            return new Promise((resolve) => {
+              releaseFirst = resolve;
+            });
+          }
+          return Promise.resolve();
+        },
+        dispose: noop,
+      });
+    const connection = new TerminalConnection(sink, {
+      createAgent: factory,
+      log: NOOP_LOGGER,
+    });
+
+    connection.handleLine(aiRequestLine("r1"));
+    connection.handleLine(aiRequestLine("r2"));
+    await settle();
+
+    // Both acks are immediate, but request 2 must not start streaming while
+    // request 1 is still in flight.
+    expect(types(lines)).toEqual(["ack", "ack", "ai_delta"]);
+    expect(lines[2]).toContain("answer-1");
+
+    releaseFirst?.();
+    await settle();
+
+    expect(types(lines)).toEqual([
+      "ack",
+      "ack",
+      "ai_delta",
+      "ai_response_end",
+      "ai_delta",
+      "ai_response_end",
+    ]);
+    expect(lines[4]).toContain("answer-2");
+  });
+
+  it("disposes the agent on bye and drops late deltas", async () => {
+    const { sink, lines } = collectingSink();
+    let disposed = 0;
+    let emitLate: (() => void) | undefined;
+    const factory: AgentFactory = () =>
+      Promise.resolve<KoshellAgent>({
+        ask({ onDelta }: AskOptions): Promise<void> {
+          onDelta("early");
+          return new Promise(() => {
+            emitLate = () => {
+              onDelta("late");
+            };
+          });
+        },
+        dispose(): void {
+          disposed += 1;
+        },
+      });
+    const connection = new TerminalConnection(sink, {
+      createAgent: factory,
+      log: NOOP_LOGGER,
+    });
+
+    connection.handleLine(aiRequestLine("r1"));
+    await settle();
+    connection.handleLine(
+      JSON.stringify({ type: "bye", terminal_session_id: "koshell-42" }),
+    );
+    await settle();
+    emitLate?.();
+    connection.dispose();
+    await settle();
+
+    expect(types(lines)).toEqual(["ack", "ai_delta"]);
+    expect(disposed).toBe(1);
+  });
+
+  it("answers an ai_request that arrives before hello", async () => {
+    const { sink, lines } = collectingSink();
+    const factory: AgentFactory = ({ cwd }) => {
+      expect(cwd.length).toBeGreaterThan(0);
+      return Promise.resolve<KoshellAgent>({
+        ask(): Promise<void> {
+          return Promise.resolve();
+        },
+        dispose: noop,
+      });
+    };
+    const connection = new TerminalConnection(sink, {
+      createAgent: factory,
+      log: NOOP_LOGGER,
+    });
+
+    connection.handleLine(aiRequestLine("r1"));
+    await settle();
+
+    expect(types(lines)).toEqual(["ack", "ai_response_end"]);
+  });
+});

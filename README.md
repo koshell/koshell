@@ -22,6 +22,22 @@ question fires when the line's output completes or stabilizes. Directly launched
 programs use the output-stabilization path, since shell integration markers only exist
 inside bash/zsh.
 
+Answers come from the AI daemon, started separately (one per user session):
+
+```bash
+pnpm --filter @koshell/ai-daemon start
+```
+
+Provider, model, and auth currently resolve through pi's own defaults: an existing pi
+setup (`~/.pi/agent/auth.json`) or a provider API key in the environment (for example
+`ANTHROPIC_API_KEY`) is enough. If the daemon is not running or no provider is
+configured, the terminal keeps working and `#?` reports the degradation inline.
+
+Both processes log at a configurable level, set by `--log-level <level>` or the
+`KOSHELL_LOG` environment variable (the argument wins). The terminal owns the screen,
+so its logs go to `$XDG_STATE_HOME/koshell/koshell.log` (default level `warn`,
+`env_logger` filter syntax); the daemon logs to its own stdout (default level `info`).
+
 ## Architecture
 
 Koshell is a hybrid monorepo with two runtimes:

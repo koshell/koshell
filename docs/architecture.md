@@ -26,10 +26,14 @@ terminal operator while AI assists from beside the shell.
     design.
   - It remains usable as a transparent shell wrapper when the AI daemon is absent.
 - **`koshell-ai-daemon` (Node.js, shared)** — one process per user session. Receives
-  `#?` requests over IPC. In a later stage it will own the pi-backed agent conversations
-  (one per terminal session, discarded on disconnect; see
-  `design-0002-ai-output-and-context-boundaries.md`), provider/model/auth configuration,
-  the read-only terminal tool loop, and streaming AI responses.
+  `#?` requests over IPC and answers them through pi-backed agent conversations, one
+  persistent conversation per terminal session, discarded on disconnect (see
+  `design-0002-ai-output-and-context-boundaries.md`). Requests are serialized FIFO per
+  conversation; responses stream back as `ai_delta` messages. Provider/model/auth
+  resolution currently delegates to pi's own default chain (`~/.pi/agent/auth.json`,
+  then provider environment variables such as `ANTHROPIC_API_KEY`); Koshell-owned
+  XDG/TOML provider configuration and the read-only terminal tool loop are later
+  stages.
 
 ## Dependency boundaries
 
@@ -48,17 +52,21 @@ Messages (see `crates/koshell-proto`):
 
 - Terminal → daemon: `hello`, `ai_request` (carries the assembled context package),
   `tool_response` (reserved), `bye`.
-- Daemon → terminal: `ack` (current stage). `ai_delta`, `ai_tool_call`,
-  `ai_response_end`, and `ai_error` arrive with pi integration.
+- Daemon → terminal: `ack`, then per request zero or more `ai_delta` chunks followed by
+  exactly one of `ai_response_end` or `ai_error`. `ai_tool_call` is reserved for the
+  tool round-trip stage.
 
 ## Implementation status
 
-The current stage delivers the full Rust terminal-core (Phases 1–4) plus a minimal Node
-receiver that acknowledges `#?` requests (Phase 5-min). The `#?` detector implements the
-revised stabilization-based design of `design-0001-repl-command-completion.md`, including
-the pending-trigger interaction; the debounce tiers and cancel paths await real-use
-tuning (see that document's implementation notes). pi integration, provider
-configuration, the tool loop, and streaming AI responses are the next stage.
+The current stage delivers the full Rust terminal-core plus the pi-backed AI daemon
+prototype: `#?` requests reach a persistent per-terminal pi conversation and the answer
+streams back into the terminal. The `#?` detector implements the revised
+stabilization-based design of `design-0001-repl-command-completion.md`, including the
+pending-trigger interaction; the debounce tiers and cancel paths await real-use tuning
+(see that document's implementation notes). Response presentation implements the
+prototype simplification of `design-0002-ai-output-and-context-boundaries.md` (see that
+document's status note). Koshell-owned provider configuration and the terminal tool loop
+(pull-side context) are the next stage.
 
 The pre-rewrite TypeScript prototype is frozen under `reference/` as algorithm and
 behavior reference.

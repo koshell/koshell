@@ -22,5 +22,8 @@
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.62.0",
     "vitest": "^4.1.9"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.3"
   }
 }
