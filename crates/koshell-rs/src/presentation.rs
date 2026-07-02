@@ -373,6 +373,27 @@ mod tests {
         }
     }
 
+    fn assert_no_rich_terminal_sequences(output: &[u8]) {
+        let text = String::from_utf8_lossy(output);
+        for sequence in [
+            "\x1b[38;2",
+            "\x1b[48;2",
+            "\x1b[38:2",
+            "\x1b[48:2",
+            "\x1b[38;5",
+            "\x1b[48;5",
+            "\x1b[38:5",
+            "\x1b[48:5",
+            "\x1b]8;",
+        ] {
+            assert!(
+                !text.contains(sequence),
+                "presentation output must stay safe for legacy/no-color terminals; found \
+                 unsupported sequence {sequence:?} in {text:?}"
+            );
+        }
+    }
+
     #[test]
     fn stream_mode_buffers_pty_from_dispatch_until_response_end() {
         let mut presentation = Presentation::new();
@@ -589,6 +610,60 @@ mod tests {
         let text = String::from_utf8_lossy(&out).to_string();
         assert!(text.contains("AI error: no provider configured"));
         assert!(text.ends_with("$ "), "held prompt flushes after the error");
+    }
+
+    #[test]
+    fn koshell_presentation_output_avoids_rich_color_sequences() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        presentation.note_dispatch("stream", false, now);
+        presentation.handle_server_message(
+            &delta("stream", "streamed answer"),
+            &mut out,
+            &mut state,
+            now,
+        );
+        presentation.handle_server_message(
+            &ServerMessage::AiError {
+                request_id: "stream".to_string(),
+                message: "provider failed".to_string(),
+            },
+            &mut out,
+            &mut state,
+            now,
+        );
+
+        presentation.note_dispatch("wait", false, now);
+        presentation.poll(
+            now + RECEIPT_NOTICE_DELAY + Duration::from_millis(10),
+            &mut out,
+            &mut state,
+        );
+        presentation.poll(
+            now + RESPONSE_MAX_HOLD + Duration::from_millis(10),
+            &mut out,
+            &mut state,
+        );
+        presentation.handle_server_message(&end("wait"), &mut out, &mut state, now);
+
+        presentation.note_dispatch("block", true, now);
+        presentation.handle_server_message(
+            &delta("block", "block answer"),
+            &mut out,
+            &mut state,
+            now,
+        );
+        presentation.handle_server_message(&end("block"), &mut out, &mut state, now);
+
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("[koshell ai]"));
+        assert!(text.contains("streamed answer"));
+        assert!(text.contains("waiting for the AI answer"));
+        assert!(text.contains("block answer"));
+        assert_no_rich_terminal_sequences(&out);
     }
 
     #[test]
