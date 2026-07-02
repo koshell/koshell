@@ -85,6 +85,17 @@ pub fn resolve_shell(env: &HashMap<String, String>) -> anyhow::Result<String> {
     anyhow::bail!("No executable shell found. SHELL was {described}.");
 }
 
+/// Resolves an explicitly requested command (`koshell <command> ...`) to an executable
+/// path using the same lookup rules as shell resolution.
+pub fn resolve_command(command: &str, env: &HashMap<String, String>) -> anyhow::Result<String> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Empty command.");
+    }
+    resolve_executable(trimmed, env.get("PATH").map(String::as_str))
+        .ok_or_else(|| anyhow::anyhow!("Command not found: {trimmed}"))
+}
+
 /// Builds the child PTY environment: copies the source env, forces the `KOSHELL`
 /// marker, and normalizes an empty/whitespace `PATH` to [`FALLBACK_PATH`].
 pub fn create_pty_env(source: &HashMap<String, String>) -> HashMap<String, String> {
@@ -169,6 +180,18 @@ mod tests {
             resolve_executable("sh", Some("/bin")).as_deref(),
             Some("/bin/sh")
         );
+    }
+
+    #[test]
+    fn resolve_command_resolves_and_reports_missing() {
+        assert_eq!(resolve_command("/bin/sh", &env_of(&[])).unwrap(), "/bin/sh");
+        assert_eq!(
+            resolve_command("sh", &env_of(&[("PATH", "/bin")])).unwrap(),
+            "/bin/sh"
+        );
+        let error = resolve_command("definitely-not-here", &env_of(&[])).unwrap_err();
+        assert!(error.to_string().contains("definitely-not-here"));
+        assert!(resolve_command("   ", &env_of(&[])).is_err());
     }
 
     #[test]

@@ -22,3 +22,4 @@ similar = "2"
 alacritty_terminal = "0.25"
 base64 = "0.22"
 tempfile = "3"
+clap = { version = "4.6.1", features = ["derive"] }

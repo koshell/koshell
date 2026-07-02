@@ -52,23 +52,30 @@ pub struct ShellLaunchConfig {
     _temp_dir: Option<TempDir>,
 }
 
-/// Builds a launch config for `shell`, installing shell integration for bash/zsh.
-/// Falls back to launching the shell directly for other shells.
+/// Builds a launch config for `command`, installing shell integration when its
+/// basename is bash/zsh and launching every other program directly (no integration,
+/// so `#?` runs through the non-integrated capture path). `extra_args` are the
+/// user-supplied arguments from `koshell <command> [args...]`; for bash/zsh they are
+/// appended after the integration arguments. Accepted residuals of that ordering:
+/// arguments that fight the rc injection (`bash --norc`) may break marker emission,
+/// and a non-interactive `bash -c '...'` never sources the rc file, so `#?` stays
+/// disarmed for that session.
 pub fn create_shell_launch_config(
-    shell: &str,
+    command: &str,
+    extra_args: &[String],
     env: HashMap<String, String>,
 ) -> anyhow::Result<ShellLaunchConfig> {
-    let shell_name = Path::new(shell)
+    let command_name = Path::new(command)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("");
 
-    match shell_name {
-        "bash" => create_bash_launch_config(shell, env),
-        "zsh" => create_zsh_launch_config(shell, env),
+    match command_name {
+        "bash" => create_bash_launch_config(command, extra_args, env),
+        "zsh" => create_zsh_launch_config(command, extra_args, env),
         _ => Ok(ShellLaunchConfig {
-            command: shell.to_string(),
-            args: Vec::new(),
+            command: command.to_string(),
+            args: extra_args.to_vec(),
             env,
             kind: None,
             _temp_dir: None,
@@ -204,6 +211,7 @@ fn partial_prefix_len(buf: &[u8], prefix: &[u8]) -> usize {
 
 fn create_bash_launch_config(
     shell: &str,
+    extra_args: &[String],
     env: HashMap<String, String>,
 ) -> anyhow::Result<ShellLaunchConfig> {
     let temp_dir = tempfile::Builder::new().prefix("koshell-bash-").tempdir()?;
@@ -219,13 +227,16 @@ fn create_bash_launch_config(
     );
     std::fs::write(&rc_file, contents)?;
 
+    let mut args = vec![
+        "--rcfile".to_string(),
+        rc_file.to_string_lossy().to_string(),
+        "-i".to_string(),
+    ];
+    args.extend_from_slice(extra_args);
+
     Ok(ShellLaunchConfig {
         command: shell.to_string(),
-        args: vec![
-            "--rcfile".to_string(),
-            rc_file.to_string_lossy().to_string(),
-            "-i".to_string(),
-        ],
+        args,
         env,
         kind: Some(ShellIntegrationKind::Bash),
         _temp_dir: Some(temp_dir),
@@ -234,6 +245,7 @@ fn create_bash_launch_config(
 
 fn create_zsh_launch_config(
     shell: &str,
+    extra_args: &[String],
     mut env: HashMap<String, String>,
 ) -> anyhow::Result<ShellLaunchConfig> {
     let temp_dir = tempfile::Builder::new().prefix("koshell-zsh-").tempdir()?;
@@ -256,9 +268,12 @@ fn create_zsh_launch_config(
         temp_dir.path().to_string_lossy().to_string(),
     );
 
+    let mut args = vec!["-i".to_string()];
+    args.extend_from_slice(extra_args);
+
     Ok(ShellLaunchConfig {
         command: shell.to_string(),
-        args: vec!["-i".to_string()],
+        args,
         env,
         kind: Some(ShellIntegrationKind::Zsh),
         _temp_dir: Some(temp_dir),
@@ -531,8 +546,25 @@ mod tests {
 
     #[test]
     fn other_shells_get_no_integration() {
-        let config = create_shell_launch_config("/bin/sh", HashMap::new()).unwrap();
+        let config = create_shell_launch_config("/bin/sh", &[], HashMap::new()).unwrap();
         assert_eq!(config.kind, None);
         assert!(config.args.is_empty());
+    }
+
+    #[test]
+    fn direct_command_keeps_user_arguments_verbatim() {
+        let args = vec!["-i".to_string(), "--flag".to_string()];
+        let config = create_shell_launch_config("/usr/bin/python3", &args, HashMap::new()).unwrap();
+        assert_eq!(config.kind, None);
+        assert_eq!(config.command, "/usr/bin/python3");
+        assert_eq!(config.args, args);
+    }
+
+    #[test]
+    fn explicit_shell_appends_user_arguments_after_integration() {
+        let args = vec!["-l".to_string()];
+        let config = create_shell_launch_config("/bin/zsh", &args, HashMap::new()).unwrap();
+        assert_eq!(config.kind, Some(ShellIntegrationKind::Zsh));
+        assert_eq!(config.args, ["-i", "-l"]);
     }
 }

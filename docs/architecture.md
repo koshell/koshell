@@ -7,6 +7,11 @@ terminal operator while AI assists from beside the shell.
 
 - **`koshell-rs` (Rust, foreground)** — one process per terminal window. Owns:
   - PTY spawn, stdin/stdout forwarding, resize, signals, nested-start guard;
+  - CLI launch modes: `koshell` wraps the default shell; `koshell <command> [args...]`
+    launches that program directly (explicit bash/zsh still gets integration, appended
+    before user arguments; any other program runs without integration, so `#?` uses the
+    non-integrated mirror-capture + stabilization path). `--` reserves the option
+    namespace for future flags;
   - the terminal mirror (via `alacritty_terminal`), screen snapshots, alternate-screen
     detection, and line-level screen diffs;
   - the append-only terminal timeline and local terminal context;

@@ -84,8 +84,12 @@ fn stdin_readable_within(timeout_ms: i32) -> bool {
     unsafe { libc::poll(&mut pollfd, 1, timeout_ms) > 0 }
 }
 
-/// Runs an interactive shell wrapped in a PTY. Returns the child's exit code.
-pub fn run_interactive_shell() -> Result<i32> {
+/// Runs an interactive session wrapped in a PTY and returns the child's exit code.
+/// With an empty `command`, launches the default shell (with integration for
+/// bash/zsh); otherwise launches `command[0]` with the remaining elements as its
+/// arguments — explicit bash/zsh still gets integration, anything else runs directly
+/// and `#?` uses the non-integrated capture path.
+pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
     let env: HashMap<String, String> = std::env::vars().collect();
     shell::assert_not_nested_koshell(&env)?;
 
@@ -93,9 +97,12 @@ pub fn run_interactive_shell() -> Result<i32> {
         anyhow::bail!("koshell must be started from an interactive TTY.");
     }
 
-    let shell_path = shell::resolve_shell(&env)?;
+    let (shell_path, extra_args) = match command.split_first() {
+        Some((program, args)) => (shell::resolve_command(program, &env)?, args),
+        None => (shell::resolve_shell(&env)?, &[] as &[String]),
+    };
     let pty_env = shell::create_pty_env(&env);
-    let launch = create_shell_launch_config(&shell_path, pty_env)?;
+    let launch = create_shell_launch_config(&shell_path, extra_args, pty_env)?;
 
     let (cols, rows) =
         sane_size(crossterm::terminal::size().unwrap_or((DEFAULT_COLUMNS, DEFAULT_ROWS)));

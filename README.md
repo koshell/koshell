@@ -7,6 +7,21 @@ shared terminal context to explain, diagnose, and assist — without turning the
 into a separate chat room or an agent-owned execution loop. When the terminal raises a
 question, you type `#?` and ask in place.
 
+## Usage
+
+```bash
+koshell                    # wrap the default shell (bash/zsh get shell integration)
+koshell python3 -i         # launch a program directly instead of a shell; everything
+                           # after the first positional argument goes to the program
+koshell -- some-command    # `--` reserves room for future koshell options and allows
+                           # command names that start with a dash
+```
+
+`#?` works in every form: type `#? <question>` (or `command #? <question>`) and the
+question fires when the line's output completes or stabilizes. Directly launched
+programs use the output-stabilization path, since shell integration markers only exist
+inside bash/zsh.
+
 ## Architecture
 
 Koshell is a hybrid monorepo with two runtimes:
