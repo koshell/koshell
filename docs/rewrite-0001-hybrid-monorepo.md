@@ -14,7 +14,9 @@ Decisions confirmed for the rewrite:
 - Single monorepo (Cargo workspace + pnpm workspace side by side).
 - Rust terminal emulation via `alacritty_terminal` (replacing `@xterm/headless`).
 - `#?` detection via OSC shell-integration markers only (no keystroke reconstruction or
-  prompt-history fallback in the MVP).
+  prompt-history fallback in the MVP). _Superseded 2026-07-02: `#?` is now also detected
+  inside foreground CLI programs via output stabilization; see
+  `design-0001-repl-command-completion.md`._
 
 Scope for the current stage: complete the Rust terminal-core (Phases 1–4) and a minimal
 Node receiver that can accept a `#?` request over IPC (Phase 5-min). pi integration,

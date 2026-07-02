@@ -11,12 +11,16 @@ terminal operator while AI assists from beside the shell.
     detection, and line-level screen diffs;
   - the append-only terminal timeline and local terminal context;
   - shell integration (temporary rc files emitting OSC command-boundary markers) and
-    `#?` trigger detection.
+    `#?` trigger detection — at the shell prompt via OSC markers, and inside foreground
+    CLI programs (REPLs, remote shells) via output-stabilization detection (see
+    `design-0001-repl-command-completion.md` for the trigger semantics and detector
+    design).
   - It remains usable as a transparent shell wrapper when the AI daemon is absent.
 - **`koshell-ai-daemon` (Node.js, shared)** — one process per user session. Receives
-  `#?` requests over IPC. In a later stage it will own the pi-backed agent session,
-  provider/model/auth configuration, the read-only terminal tool loop, and streaming AI
-  responses.
+  `#?` requests over IPC. In a later stage it will own the pi-backed agent conversations
+  (one per terminal session, discarded on disconnect; see
+  `design-0002-ai-output-and-context-boundaries.md`), provider/model/auth configuration,
+  the read-only terminal tool loop, and streaming AI responses.
 
 ## Dependency boundaries
 
@@ -41,8 +45,10 @@ Messages (see `crates/koshell-proto`):
 ## Implementation status
 
 The current stage delivers the full Rust terminal-core (Phases 1–4) plus a minimal Node
-receiver that acknowledges `#?` requests (Phase 5-min). pi integration, provider
-configuration, the tool loop, and streaming AI responses are the next stage.
+receiver that acknowledges `#?` requests (Phase 5-min). The in-program `#?` detector is
+an early prototype; its revision to the stabilization-based design is tracked in
+`design-0001-repl-command-completion.md`. pi integration, provider configuration, the
+tool loop, and streaming AI responses are the next stage.
 
 The pre-rewrite TypeScript prototype is frozen under `reference/` as algorithm and
 behavior reference.
