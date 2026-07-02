@@ -7,7 +7,7 @@
 //! that richer terminal features do not become required for understanding the output.
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,7 +23,7 @@ fn resolve(program: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-fn run_koshell_with_legacy_terminal_env(bash: &PathBuf, script: &[u8]) -> String {
+fn run_koshell_with_legacy_terminal_env(bash: &Path, script: &[u8]) -> String {
     let home = tempfile::tempdir().expect("temp HOME");
     std::fs::write(home.path().join(".bashrc"), "HISTCONTROL=\nPS1='$ '\n").expect("write .bashrc");
     let runtime = tempfile::tempdir().expect("temp XDG_RUNTIME_DIR");
