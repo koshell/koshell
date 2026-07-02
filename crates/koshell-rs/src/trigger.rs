@@ -1,8 +1,29 @@
 //! Terminal-state processing: records PTY facts into the timeline, keeps the mirror and
 //! snapshots up to date, tracks command spans from shell-integration markers, and detects
-//! `#?` questions. On a `#?`, assembles the context package the AI daemon will consume.
+//! `#?` questions. On a fire, assembles the context package the AI daemon will consume.
+//!
+//! Implements the revised `#?` design (`docs/design-0001-repl-command-completion.md`):
+//!
+//! - **Capture** is a mirror read of the cursor's logical line at the submit instant
+//!   (Enter). The same read is the echo-verification arming check: input that is never
+//!   echoed never appears in the mirror, so it can never trigger. The alternate screen
+//!   disarms capture entirely. Capture runs inside command spans and in shells without
+//!   integration; at the integrated shell prompt the marker layer owns `#?` instead,
+//!   because rendered UI text (a fuzzy history finder's list and query line) is
+//!   indistinguishable from typed input in the mirror.
+//! - **Suppression**: a lightweight quote-parity tracker (single quote, double quote,
+//!   backslash) ignores `#?` inside unclosed quotes.
+//! - **Firing** follows the layered authority: a shell `command_end` marker is
+//!   authoritative (including failures); otherwise output stabilization fires — quiescence
+//!   with escalating debounce tiers, a prompt-shape heuristic that only modulates debounce
+//!   speed (never gates), and a bounded max-wait fallback so a pending question is never
+//!   silently lost.
+//! - **Pending-trigger interaction**: a delayed receipt notice (~1 s), user-typed Ctrl+C
+//!   cancels pending questions (autonomous failures still fire via `command_end`), and a
+//!   bare Esc cancels the most recent pending question without killing the command.
 
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use crate::context::{TerminalContextOptions, build_terminal_context};
 use crate::mirror::TerminalMirror;
@@ -16,145 +37,140 @@ const AI_CONTEXT_CONTRACT_VERSION: &str = "koshell_ai_context_v1";
 /// The `#?` trigger token.
 const TRIGGER_TOKEN: &str = "#?";
 
-/// How long the PTY output must stay idle before the S3 (quiescence) path treats a command
-/// as complete, for programs that emit no bracketed-paste edges (e.g. node). See
-/// `docs/design-0001-repl-command-completion.md`.
-const REPL_QUIESCENCE_DEBOUNCE: Duration = Duration::from_millis(150);
+// Stabilization debounce tiers. The prompt-shape heuristic selects the tier; it never
+// gates firing. All values are indicative and dogfooding-tunable (see design 0001).
+//
+// In-program tiers apply to questions submitted inside a foreground child (REPLs, remote
+// shells), where no `command_end` marker will ever arrive.
+const IN_PROGRAM_TIER_PROMPT: Duration = Duration::from_millis(150);
+const IN_PROGRAM_TIER_SHORT: Duration = Duration::from_millis(500);
+const IN_PROGRAM_TIER_OTHER: Duration = Duration::from_secs(3);
+const IN_PROGRAM_MAX_WAIT: Duration = Duration::from_secs(30);
+// Prompt-line tiers apply to questions submitted at the shell prompt. They are
+// conservative so that for terminating commands the authoritative `command_end` marker
+// wins the race, and stabilization only fires for non-terminating commands (`pnpm dev`,
+// `ssh`, watchers) — annotated that the command may still be running.
+const PROMPT_LINE_TIER_PROMPT: Duration = Duration::from_millis(750);
+const PROMPT_LINE_TIER_SHORT: Duration = Duration::from_secs(3);
+const PROMPT_LINE_TIER_OTHER: Duration = Duration::from_secs(10);
+const PROMPT_LINE_MAX_WAIT: Duration = Duration::from_secs(120);
 
-/// The bracketed-paste enable/disable sequences share this 7-byte prefix; the final byte is
-/// `h` (enable) or `l` (disable).
-const BRACKETED_PASTE_PREFIX: &[u8] = b"\x1b[?2004";
+/// How long a question may stay pending before presentation prints the one dim
+/// "waiting for output to settle" receipt line.
+const RECEIPT_NOTICE_DELAY: Duration = Duration::from_secs(1);
+
+/// A resting line longer than this never counts as prompt-like or short.
+const PROMPT_LIKE_MAX_CHARS: usize = 40;
+
+/// Characters that commonly end a prompt (`$`, `#`, `>`, `%`, `:`), plus interactive
+/// question/confirmation tails. Shapes only — no learned prompt templates.
+const PROMPT_TAIL_CHARS: &[char] = &['$', '#', '%', '>', ':', '?', '❯', '»', '›'];
+
+/// Which of the two emergent `#?` forms a question took. One firing rule covers both;
+/// this is annotation for the AI, not a code path selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerForm {
+    Standalone,
+    Inline,
+}
+
+impl TriggerForm {
+    fn as_str(self) -> &'static str {
+        match self {
+            TriggerForm::Standalone => "standalone",
+            TriggerForm::Inline => "inline",
+        }
+    }
+}
+
+/// Which completion authority fired a question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionKind {
+    /// Authoritative shell `command_end` marker (including failures).
+    CommandEnd,
+    /// Output quiescence reached the debounce tier for the resting screen shape.
+    Stabilized,
+    /// Output never went quiet; the bounded max-wait fired so the question is not lost.
+    MaxWait,
+}
+
+impl CompletionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            CompletionKind::CommandEnd => "command_end",
+            CompletionKind::Stabilized => "stabilized",
+            CompletionKind::MaxWait => "max_wait",
+        }
+    }
+}
 
 /// A detected `#?` question with the terminal context to answer it.
 #[derive(Debug, Clone)]
 pub struct Trigger {
     pub question: String,
+    pub completion: CompletionKind,
+    /// True when the triggering command had not returned to the prompt at fire time.
+    pub still_running: bool,
     pub context_package: serde_json::Value,
 }
 
-/// A bracketed-paste toggle observed in the PTY output stream. Line editors emit
-/// `ESC[?2004h` when they begin reading a line (prompt ready) and `ESC[?2004l` when the line
-/// is submitted (command running), so these edges bracket command execution for
-/// readline/libedit/PyREPL-style programs — koshell's S1 completion signal.
+/// What the session loop should do as a result of processing terminal events.
+#[derive(Debug)]
+pub enum Action {
+    /// Send the question to the AI daemon and print the local feedback line.
+    Fire(Trigger),
+    /// Print a one-line presentation notice (receipt delay, cancellation).
+    Notice(String),
+}
+
+/// Where a pending question was submitted; selects the stabilization tier set and the
+/// still-running annotation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BracketedPasteEdge {
-    /// `ESC[?2004h` — entering line edit; the previous command completed.
-    Enter,
-    /// `ESC[?2004l` — line submitted; a command is now running.
-    Leave,
+enum PendingOrigin {
+    /// A shell command line: created from a `command_start` marker (integrated shells)
+    /// or Enter-captured at the prompt (shells without integration). A `command_end`
+    /// marker, when it exists, is expected to win the race against stabilization.
+    PromptLine,
+    /// Inside a foreground child (REPL, remote shell): stabilization is the only signal.
+    InProgram,
 }
 
-/// Extracts bracketed-paste edges from a byte stream, buffering a partial sequence across
-/// chunk boundaries. Does not consume or hide the bytes; they still flow to the terminal.
-#[derive(Default)]
-struct BracketedPasteScanner {
-    carry: Vec<u8>,
+/// A submitted `#?` waiting for its line's completion or stabilization point.
+#[derive(Debug)]
+struct PendingQuestion {
+    question: String,
+    form: TriggerForm,
+    origin: PendingOrigin,
+    submitted_at: Instant,
+    receipt_notified: bool,
 }
 
-impl BracketedPasteScanner {
-    fn feed(&mut self, data: &[u8]) -> Vec<BracketedPasteEdge> {
-        let mut buf = std::mem::take(&mut self.carry);
-        buf.extend_from_slice(data);
-        let mut edges = Vec::new();
-        let mut i = 0;
-        while i < buf.len() {
-            if buf[i] != 0x1b {
-                i += 1;
-                continue;
-            }
-            // A full sequence is the 7-byte prefix plus one terminator byte.
-            if i + BRACKETED_PASTE_PREFIX.len() + 1 > buf.len() {
-                break; // Incomplete at the tail; carry it for the next chunk.
-            }
-            if &buf[i..i + BRACKETED_PASTE_PREFIX.len()] == BRACKETED_PASTE_PREFIX {
-                match buf[i + BRACKETED_PASTE_PREFIX.len()] {
-                    b'h' => {
-                        edges.push(BracketedPasteEdge::Enter);
-                        i += BRACKETED_PASTE_PREFIX.len() + 1;
-                        continue;
-                    }
-                    b'l' => {
-                        edges.push(BracketedPasteEdge::Leave);
-                        i += BRACKETED_PASTE_PREFIX.len() + 1;
-                        continue;
-                    }
-                    _ => {}
-                }
-            }
-            i += 1;
-        }
-        // Only an incomplete trailing ESC sequence is carried, so `carry` stays <= 7 bytes.
-        self.carry = buf[i..].to_vec();
-        edges
+/// The shape of the line the cursor is resting on; modulates debounce speed only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestingShape {
+    /// Cursor at the end of a short line ending in a prompt-like character.
+    Prompt,
+    /// Cursor at the end of a short non-prompt line (e.g. an inline question).
+    Short,
+    /// Anything else: empty line, long line, or cursor resting mid-text.
+    Other,
+}
+
+fn stabilization_tier(origin: PendingOrigin, shape: RestingShape) -> Duration {
+    match (origin, shape) {
+        (PendingOrigin::InProgram, RestingShape::Prompt) => IN_PROGRAM_TIER_PROMPT,
+        (PendingOrigin::InProgram, RestingShape::Short) => IN_PROGRAM_TIER_SHORT,
+        (PendingOrigin::InProgram, RestingShape::Other) => IN_PROGRAM_TIER_OTHER,
+        (PendingOrigin::PromptLine, RestingShape::Prompt) => PROMPT_LINE_TIER_PROMPT,
+        (PendingOrigin::PromptLine, RestingShape::Short) => PROMPT_LINE_TIER_SHORT,
+        (PendingOrigin::PromptLine, RestingShape::Other) => PROMPT_LINE_TIER_OTHER,
     }
 }
 
-/// Detects a `#?` typed inside a foreground CLI program (a REPL), and when that command
-/// completed, so the trigger can be deferred until completion — the in-program analogue of
-/// the shell's `command_end`. Prototype scope (S1 + S3 from
-/// `docs/design-0001-repl-command-completion.md`):
-/// - `#?` capture: the submitted line is reconstructed from keystrokes; robust mirror-read
-///   is a follow-up. Only fed while gated inside a child span.
-/// - completion: S1 bracketed-paste `ESC[?2004h` edge, or, for programs that emit no such
-///   edge (e.g. node), S3 output quiescence.
-#[derive(Default)]
-struct ReplDetector {
-    input_line: Vec<u8>,
-    pending_question: Option<String>,
-    bp_scanner: BracketedPasteScanner,
-    bp_seen: bool,
-}
-
-impl ReplDetector {
-    /// Accumulates keystrokes; on Enter, records a pending `#?` if the line contains one.
-    fn on_input(&mut self, data: &[u8]) {
-        for &b in data {
-            match b {
-                b'\r' | b'\n' => self.finish_line(),
-                0x7f | 0x08 => {
-                    self.input_line.pop();
-                }
-                _ => self.input_line.push(b),
-            }
-        }
-    }
-
-    fn finish_line(&mut self) {
-        let line = String::from_utf8_lossy(&self.input_line).into_owned();
-        self.input_line.clear();
-        if let Some(question) = extract_question(&line) {
-            self.pending_question = Some(question);
-        }
-    }
-
-    /// Feeds visible output; returns true if a command just completed (S1) with a pending `#?`.
-    fn on_output(&mut self, data: &[u8]) -> bool {
-        let mut completed = false;
-        for edge in self.bp_scanner.feed(data) {
-            self.bp_seen = true;
-            if edge == BracketedPasteEdge::Enter && self.pending_question.is_some() {
-                completed = true;
-            }
-        }
-        completed
-    }
-
-    /// True when the S3 (quiescence) path is eligible: a `#?` is pending and the program has
-    /// emitted no bracketed-paste edges, so S1 can never fire for it.
-    fn quiescence_armed(&self) -> bool {
-        self.pending_question.is_some() && !self.bp_seen
-    }
-
-    fn take_pending(&mut self) -> Option<String> {
-        self.pending_question.take()
-    }
-
-    /// Resets all state at a child-span boundary (`command_start` / `command_end`).
-    fn reset(&mut self) {
-        self.input_line.clear();
-        self.pending_question = None;
-        self.bp_scanner = BracketedPasteScanner::default();
-        self.bp_seen = false;
+fn max_wait(origin: PendingOrigin) -> Duration {
+    match origin {
+        PendingOrigin::InProgram => IN_PROGRAM_MAX_WAIT,
+        PendingOrigin::PromptLine => PROMPT_LINE_MAX_WAIT,
     }
 }
 
@@ -166,11 +182,26 @@ pub struct SessionState {
     next_snapshot_id: u64,
     next_command_id: u64,
     command_active: bool,
-    repl: ReplDetector,
+    /// Whether shell-integration markers exist in this session. When they do, the marker
+    /// layer owns `#?` at the shell prompt exclusively and submit-time mirror capture is
+    /// armed only inside command spans: the mirror cannot tell typed input from
+    /// program-rendered text (a fuzzy history finder renders `#?` history entries and its
+    /// own query line right where the cursor rests), but a marker only ever exists for a
+    /// line the shell really accepted.
+    shell_integrated: bool,
+    pending: VecDeque<PendingQuestion>,
+    last_output_at: Option<Instant>,
+    /// Guards against a repeated Enter (key repeat, `\r\n` pairs) re-capturing the same
+    /// rendered line; cleared whenever new PTY output changes the mirror.
+    captured_since_output: bool,
+    /// True when the current command span's question was already settled outside the
+    /// `command_end` path (fired at stabilization, or cancelled by Ctrl+C / Esc), so the
+    /// marker must not extract and fire it again.
+    span_settled: bool,
 }
 
 impl SessionState {
-    pub fn new(columns: u16, rows: u16) -> Self {
+    pub fn new(columns: u16, rows: u16, shell_integrated: bool) -> Self {
         Self {
             timeline: InMemoryTimelineStore::new(),
             mirror: TerminalMirror::new(columns, rows),
@@ -178,85 +209,220 @@ impl SessionState {
             next_snapshot_id: 1,
             next_command_id: 1,
             command_active: false,
-            repl: ReplDetector::default(),
+            shell_integrated,
+            pending: VecDeque::new(),
+            last_output_at: None,
+            captured_since_output: false,
+            span_settled: false,
         }
     }
 
-    /// Whether the in-program `#?` detector should observe I/O: we are inside a foreground
-    /// child (between `command_start` and `command_end`) and not on the alternate screen.
-    /// Outside a child span the shell OSC path owns `#?`, so the two never overlap.
-    fn repl_gated(&self) -> bool {
-        self.command_active && !self.mirror.is_alt_screen()
+    /// Whether a bare Esc currently cancels a pending question. Armed only while at least
+    /// one question is pending and the alternate screen is not active (`vim file #? q`
+    /// must never lose vim's Esc).
+    pub fn esc_cancellable(&self) -> bool {
+        !self.pending.is_empty() && !self.mirror.is_alt_screen()
     }
 
-    /// Records human keystrokes sent to the shell.
-    pub fn record_input(&mut self, data: &[u8]) {
+    /// Records human keystrokes sent to the shell. Detects submits (Enter → mirror-read
+    /// capture) and user interrupts (Ctrl+C → cancel pending questions).
+    pub fn record_input(&mut self, data: &[u8], now: Instant) -> Vec<Action> {
         if data.is_empty() {
-            return;
+            return Vec::new();
         }
         self.timeline.record(TerminalEvent::HumanInput {
             data: String::from_utf8_lossy(data).into_owned(),
             visible: true,
         });
-        if self.repl_gated() {
-            self.repl.on_input(data);
+        let mut actions = Vec::new();
+        for &byte in data {
+            match byte {
+                // A user-typed interrupt withdraws the line's future output, so pending
+                // questions are cancelled; autonomous failures still fire via the
+                // authoritative `command_end` marker. Not applied on the alternate screen,
+                // where Ctrl+C belongs to the full-screen program.
+                0x03 if !self.mirror.is_alt_screen() => {
+                    if self.command_active {
+                        self.span_settled = true;
+                    }
+                    actions.extend(self.cancel_all_pending("^C"));
+                }
+                // Submit-time capture is armed inside command spans (REPLs, remote
+                // shells) and in shells without integration hooks. At the integrated
+                // shell prompt the marker layer owns `#?` (see `shell_integrated`).
+                b'\r' | b'\n'
+                    if (self.command_active || !self.shell_integrated)
+                        && !self.mirror.is_alt_screen()
+                        && !self.captured_since_output =>
+                {
+                    self.capture_submitted_line(now);
+                }
+                _ => {}
+            }
         }
+        actions
     }
 
-    /// Records visible PTY output, updates the mirror, and captures a snapshot. Returns a
-    /// [`Trigger`] when a `#?` typed inside a foreground program completes via the S1
-    /// (bracketed-paste) signal.
-    pub fn record_output(&mut self, visible: &[u8]) -> Option<Trigger> {
-        if visible.is_empty() {
+    /// Reads the cursor's logical line from the mirror at the submit instant and records
+    /// a pending question when it contains `#?` outside quotes. Reading the rendered line
+    /// (not keystrokes) is robust to history recall, arrow edits, and multibyte input —
+    /// and doubles as the echo-verification arming check.
+    fn capture_submitted_line(&mut self, now: Instant) {
+        let line = self.mirror.cursor_logical_line();
+        let Some(split) = extract_question(&line) else {
+            return;
+        };
+        self.captured_since_output = true;
+        let origin = if self.command_active {
+            PendingOrigin::InProgram
+        } else {
+            PendingOrigin::PromptLine
+        };
+        self.pending.push_back(PendingQuestion {
+            question: split.question,
+            form: question_form(&split.left),
+            origin,
+            submitted_at: now,
+            receipt_notified: false,
+        });
+    }
+
+    fn cancel_all_pending(&mut self, reason: &str) -> Vec<Action> {
+        self.pending
+            .drain(..)
+            .map(|pending| Action::Notice(format!("#? cancelled ({reason}): {}", pending.question)))
+            .collect()
+    }
+
+    /// Cancels the most recently submitted pending question (bare-Esc path, LIFO).
+    /// Returns `None` when nothing is pending — the caller should forward the Esc.
+    pub fn cancel_latest(&mut self) -> Option<Action> {
+        if self.mirror.is_alt_screen() {
             return None;
+        }
+        let pending = self.pending.pop_back()?;
+        if self.command_active && pending.origin == PendingOrigin::PromptLine {
+            self.span_settled = true;
+        }
+        Some(Action::Notice(format!(
+            "#? cancelled: {}",
+            pending.question
+        )))
+    }
+
+    /// Records visible PTY output, updates the mirror, and captures a snapshot. Output
+    /// arrival resets the quiescence clock that stabilization firing debounces on.
+    pub fn record_output(&mut self, visible: &[u8], now: Instant) {
+        if visible.is_empty() {
+            return;
         }
         self.timeline.record(TerminalEvent::PtyOutput {
             data: String::from_utf8_lossy(visible).into_owned(),
         });
         self.mirror.write(visible);
         self.record_snapshot();
-        if self.repl_gated()
-            && self.repl.on_output(visible)
-            && let Some(question) = self.repl.take_pending()
-        {
-            return Some(self.build_repl_trigger(question));
-        }
-        None
+        self.last_output_at = Some(now);
+        self.captured_since_output = false;
     }
 
-    /// The debounce to wait for output quiescence when the S3 path is armed, or `None` when
-    /// it is not (the caller should then block indefinitely).
-    pub fn repl_quiescence_debounce(&self) -> Option<Duration> {
-        if self.repl_gated() && self.repl.quiescence_armed() {
-            Some(REPL_QUIESCENCE_DEBOUNCE)
-        } else {
-            None
+    /// Feeds presentation (koshell/AI) output into the mirror, keeping snapshots truthful
+    /// to what the user sees (the mirror-feed invariant, design 0002). Presentation output
+    /// is not PTY output: it is excluded from terminal text context and it does not reset
+    /// the stabilization quiescence clock (otherwise our own notices would delay firing).
+    pub fn record_presentation_output(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
         }
+        self.mirror.write(data);
+        self.record_snapshot();
     }
 
-    /// Called when the PTY output has been idle for [`Self::repl_quiescence_debounce`].
-    /// Fires a pending in-program `#?` via the S3 (quiescence) signal.
-    pub fn on_quiescence(&mut self) -> Option<Trigger> {
-        if self.repl_gated()
-            && self.repl.quiescence_armed()
-            && let Some(question) = self.repl.take_pending()
-        {
-            return Some(self.build_repl_trigger(question));
+    /// The delay until the nearest pending-question deadline (receipt notice,
+    /// stabilization tier, or max-wait), or `None` when there is nothing to wait for.
+    /// Deadlines are suspended on the alternate screen; leaving it produces output,
+    /// which re-enters this computation.
+    pub fn next_deadline(&self, now: Instant) -> Option<Duration> {
+        if self.pending.is_empty() || self.mirror.is_alt_screen() {
+            return None;
         }
-        None
+        let shape = self.resting_shape();
+        let mut nearest: Option<Instant> = None;
+        let mut consider = |candidate: Instant| {
+            nearest = Some(match nearest {
+                Some(current) => current.min(candidate),
+                None => candidate,
+            });
+        };
+        for pending in &self.pending {
+            if !pending.receipt_notified {
+                consider(pending.submitted_at + RECEIPT_NOTICE_DELAY);
+            }
+            consider(pending.submitted_at + max_wait(pending.origin));
+            if let Some(last_output) = self.last_output_at {
+                consider(last_output + stabilization_tier(pending.origin, shape));
+            }
+        }
+        nearest.map(|deadline| {
+            deadline
+                .saturating_duration_since(now)
+                .max(Duration::from_millis(1))
+        })
     }
 
-    fn build_repl_trigger(&mut self, question: String) -> Trigger {
-        let context_package = self.build_context_package(&question);
-        let request_id = format!("request-{}", self.next_command_id());
-        self.timeline.record(TerminalEvent::AiRequest {
-            request_id,
-            question: question.clone(),
-        });
-        Trigger {
-            question,
-            context_package,
+    /// Applies time-based transitions: stabilization and max-wait fires, then receipt
+    /// notices for questions that stay pending. Suspended on the alternate screen.
+    pub fn poll(&mut self, now: Instant) -> Vec<Action> {
+        if self.pending.is_empty() || self.mirror.is_alt_screen() {
+            return Vec::new();
         }
+        let shape = self.resting_shape();
+        let quiet_for = self
+            .last_output_at
+            .map(|last_output| now.saturating_duration_since(last_output));
+
+        let mut fired = Vec::new();
+        let mut remaining = VecDeque::new();
+        for pending in self.pending.drain(..) {
+            let stabilized =
+                quiet_for.is_some_and(|quiet| quiet >= stabilization_tier(pending.origin, shape));
+            let maxed =
+                now.saturating_duration_since(pending.submitted_at) >= max_wait(pending.origin);
+            if stabilized {
+                fired.push((pending, CompletionKind::Stabilized));
+            } else if maxed {
+                fired.push((pending, CompletionKind::MaxWait));
+            } else {
+                remaining.push_back(pending);
+            }
+        }
+        self.pending = remaining;
+
+        let mut actions = Vec::new();
+        for (pending, completion) in fired {
+            let still_running = self.command_active && pending.origin == PendingOrigin::PromptLine;
+            if still_running {
+                self.span_settled = true;
+            }
+            actions.push(self.fire(
+                pending.question,
+                pending.form,
+                completion,
+                None,
+                still_running,
+            ));
+        }
+        for pending in &mut self.pending {
+            if !pending.receipt_notified
+                && now.saturating_duration_since(pending.submitted_at) >= RECEIPT_NOTICE_DELAY
+            {
+                pending.receipt_notified = true;
+                actions.push(Action::Notice(format!(
+                    "#? waiting for output to settle: {}",
+                    pending.question
+                )));
+            }
+        }
+        actions
     }
 
     /// Resizes the mirror and captures a snapshot at the new size.
@@ -290,13 +456,37 @@ impl SessionState {
         self.previous_snapshot = Some((snapshot_id, snapshot.screen));
     }
 
-    /// Applies a shell-integration marker, recording the command span and returning a
-    /// [`Trigger`] when the command line contains `#?`.
-    pub fn handle_marker(&mut self, marker: ShellIntegrationMarker) -> Option<Trigger> {
+    /// Applies a shell-integration marker.
+    ///
+    /// `command_start` carries the full typed line (zsh `preexec`; bash reads it from
+    /// history inside the `DEBUG` trap) and is where a prompt-layer `#?` becomes a
+    /// pending question — enabling stabilization firing on non-terminating commands.
+    ///
+    /// `command_end` is the authoritative completion signal: it fires every pending
+    /// question (including in-program ones — the child has exited, so their completion
+    /// points are certainly reached). Extraction from the end marker's command text
+    /// remains the fallback when no pending exists (comment-only precmd fallbacks, or a
+    /// start marker whose text was unavailable) — unless the span's question was already
+    /// settled by stabilization or a cancel.
+    pub fn handle_marker(&mut self, marker: ShellIntegrationMarker, now: Instant) -> Vec<Action> {
         match marker.kind {
             MarkerKind::CommandStart => {
-                // Entering a foreground child: start a fresh in-program detection span.
-                self.repl.reset();
+                // Only a fresh span (transition from the prompt) resets the settled flag
+                // and may carry a new span question.
+                if !self.command_active {
+                    self.span_settled = false;
+                    if let Some(command) = &marker.command
+                        && let Some(split) = extract_question(command)
+                    {
+                        self.pending.push_back(PendingQuestion {
+                            question: split.question,
+                            form: question_form(&split.left),
+                            origin: PendingOrigin::PromptLine,
+                            submitted_at: now,
+                            receipt_notified: false,
+                        });
+                    }
+                }
                 if let Some(command) = marker.command {
                     let command_id = self.next_command_id();
                     self.command_active = true;
@@ -306,11 +496,9 @@ impl SessionState {
                         cwd: None,
                     });
                 }
-                None
+                Vec::new()
             }
             MarkerKind::CommandEnd => {
-                // The child exited; drop any pending in-program `#?` and leave the span.
-                self.repl.reset();
                 let command = marker.command.unwrap_or_default();
                 let command_id = self.next_command_id();
                 self.command_active = false;
@@ -320,20 +508,80 @@ impl SessionState {
                     exit_code: marker.exit_code,
                     duration_ms: None,
                 });
-                extract_question(&command).map(|question| {
-                    let context_package = self.build_context_package(&question);
-                    let request_id = format!("request-{}", self.next_command_id());
-                    self.timeline.record(TerminalEvent::AiRequest {
-                        request_id,
-                        question: question.clone(),
-                    });
-                    Trigger {
-                        question,
-                        context_package,
+
+                let mut actions = Vec::new();
+                if self.pending.is_empty() {
+                    if !self.span_settled
+                        && let Some(split) = extract_question(&command)
+                    {
+                        let form = question_form(&split.left);
+                        actions.push(self.fire(
+                            split.question,
+                            form,
+                            CompletionKind::CommandEnd,
+                            marker.exit_code,
+                            false,
+                        ));
                     }
-                })
+                } else {
+                    let drained: Vec<PendingQuestion> = self.pending.drain(..).collect();
+                    for pending in drained {
+                        actions.push(self.fire(
+                            pending.question,
+                            pending.form,
+                            CompletionKind::CommandEnd,
+                            marker.exit_code,
+                            false,
+                        ));
+                    }
+                }
+                self.span_settled = false;
+                actions
             }
         }
+    }
+
+    /// The shape of the line the cursor rests on, for the debounce modulator.
+    fn resting_shape(&self) -> RestingShape {
+        let (text, cursor_x) = self.mirror.cursor_row();
+        if text.is_empty() {
+            return RestingShape::Other;
+        }
+        let char_count = text.chars().count();
+        // The cursor must rest at (or just past) the end of the text; a cursor mid-line
+        // means output is being drawn, not awaited.
+        if (cursor_x as usize) < char_count || char_count > PROMPT_LIKE_MAX_CHARS {
+            return RestingShape::Other;
+        }
+        let last = text.chars().next_back().unwrap_or(' ');
+        if PROMPT_TAIL_CHARS.contains(&last) {
+            RestingShape::Prompt
+        } else {
+            RestingShape::Short
+        }
+    }
+
+    fn fire(
+        &mut self,
+        question: String,
+        form: TriggerForm,
+        completion: CompletionKind,
+        exit_code: Option<i32>,
+        still_running: bool,
+    ) -> Action {
+        let context_package =
+            self.build_context_package(&question, form, completion, exit_code, still_running);
+        let request_id = format!("request-{}", self.next_command_id());
+        self.timeline.record(TerminalEvent::AiRequest {
+            request_id,
+            question: question.clone(),
+        });
+        Action::Fire(Trigger {
+            question,
+            completion,
+            still_running,
+            context_package,
+        })
     }
 
     fn next_command_id(&mut self) -> String {
@@ -342,72 +590,446 @@ impl SessionState {
         id
     }
 
-    fn build_context_package(&self, question: &str) -> serde_json::Value {
+    fn build_context_package(
+        &self,
+        question: &str,
+        form: TriggerForm,
+        completion: CompletionKind,
+        exit_code: Option<i32>,
+        still_running: bool,
+    ) -> serde_json::Value {
         let context = build_terminal_context(&self.timeline, &TerminalContextOptions::default());
+        let mut trigger = serde_json::json!({
+            "form": form.as_str(),
+            "completion": completion.as_str(),
+            "stillRunning": still_running,
+        });
+        if let Some(exit_code) = exit_code {
+            trigger["exitCode"] = serde_json::Value::Number(exit_code.into());
+        }
         serde_json::json!({
             "contractVersion": AI_CONTEXT_CONTRACT_VERSION,
             "question": question,
+            "trigger": trigger,
             "dynamicContext": serde_json::to_value(&context)
                 .unwrap_or(serde_json::Value::Null),
         })
     }
 }
 
-/// Extracts a `#?` question from a command line, returning the trimmed remainder.
-fn extract_question(command: &str) -> Option<String> {
-    command
-        .find(TRIGGER_TOKEN)
-        .map(|index| command[index + TRIGGER_TOKEN.len()..].trim().to_string())
+/// A line split at its first `#?` outside quotes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QuestionSplit {
+    left: String,
+    question: String,
+}
+
+/// Extracts a `#?` question from a line, tracking quote parity (single quote, double
+/// quote, backslash — the common lexical subset across shells and REPL languages) so that
+/// `echo "#? not a question"` does not trigger. Heredocs and triple quotes are accepted
+/// misses.
+fn extract_question(line: &str) -> Option<QuestionSplit> {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (index, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if !in_single => escaped = true,
+            '\'' if !in_double => in_single = !in_single,
+            '"' if !in_single => in_double = !in_double,
+            '#' if !in_single && !in_double && line[index..].starts_with(TRIGGER_TOKEN) => {
+                return Some(QuestionSplit {
+                    left: line[..index].to_string(),
+                    question: line[index + TRIGGER_TOKEN.len()..].trim().to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Standalone when the left part is empty or carries no word characters (only a comment
+/// prefix such as `//` or `--`, or a bare prompt); inline otherwise. Annotation only.
+fn question_form(left: &str) -> TriggerForm {
+    if left.trim().chars().all(|c| !c.is_alphanumeric()) {
+        TriggerForm::Standalone
+    } else {
+        TriggerForm::Inline
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn end_marker(command: &str, exit_code: i32) -> ShellIntegrationMarker {
+        ShellIntegrationMarker {
+            kind: MarkerKind::CommandEnd,
+            command: Some(command.to_string()),
+            exit_code: Some(exit_code),
+        }
+    }
+
+    fn start_marker(command: &str) -> ShellIntegrationMarker {
+        ShellIntegrationMarker {
+            kind: MarkerKind::CommandStart,
+            command: Some(command.to_string()),
+            exit_code: None,
+        }
+    }
+
+    fn fires(actions: &[Action]) -> Vec<&Trigger> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Fire(trigger) => Some(trigger),
+                Action::Notice(_) => None,
+            })
+            .collect()
+    }
+
+    fn notices(actions: &[Action]) -> Vec<&str> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Notice(text) => Some(text.as_str()),
+                Action::Fire(_) => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn extracts_inline_question() {
+    fn extracts_question_with_quote_parity() {
+        let split = extract_question("ls -la #? explain this output").unwrap();
+        assert_eq!(split.left, "ls -la ");
+        assert_eq!(split.question, "explain this output");
+
         assert_eq!(
-            extract_question("ls -la #? explain this output").as_deref(),
-            Some("explain this output")
+            extract_question("#? what happened").unwrap().question,
+            "what happened"
         );
+        assert_eq!(extract_question("echo #?").unwrap().question, "");
+        assert_eq!(extract_question("ls -la"), None);
+
+        // Inside unclosed quotes: suppressed.
+        assert_eq!(extract_question("echo \"#? not a question\""), None);
+        assert_eq!(extract_question("echo '#? nope'"), None);
+        // Quotes closed before the token: fires.
         assert_eq!(
-            extract_question("#? what happened").as_deref(),
-            Some("what happened")
+            extract_question("echo 'done' #? real question")
+                .unwrap()
+                .question,
+            "real question"
         );
-        assert_eq!(extract_question("ls -la").as_deref(), None);
-        assert_eq!(extract_question("echo #?").as_deref(), Some(""));
+        // Escaped quote does not open a string.
+        assert_eq!(
+            extract_question("echo \\\" #? escaped").unwrap().question,
+            "escaped"
+        );
+    }
+
+    #[test]
+    fn classifies_question_form() {
+        assert_eq!(question_form(""), TriggerForm::Standalone);
+        assert_eq!(question_form("// "), TriggerForm::Standalone);
+        assert_eq!(question_form("-- "), TriggerForm::Standalone);
+        assert_eq!(question_form(">>> "), TriggerForm::Standalone);
+        assert_eq!(question_form("ls -la "), TriggerForm::Inline);
     }
 
     #[test]
     fn command_end_with_trigger_produces_context_package() {
-        let mut state = SessionState::new(80, 24);
-        state.record_output(b"file-a\r\nfile-b\r\n");
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        state.record_output(b"file-a\r\nfile-b\r\n", t0);
 
-        let trigger = state
-            .handle_marker(ShellIntegrationMarker {
-                kind: MarkerKind::CommandEnd,
-                command: Some("ls #? explain".to_string()),
-                exit_code: Some(0),
-            })
-            .expect("expected a trigger");
-
+        let actions = state.handle_marker(end_marker("ls #? explain", 0), t0);
+        let fired = fires(&actions);
+        assert_eq!(fired.len(), 1);
+        let trigger = fired[0];
         assert_eq!(trigger.question, "explain");
+        assert_eq!(trigger.completion, CompletionKind::CommandEnd);
+        assert!(!trigger.still_running);
         assert_eq!(
             trigger.context_package["contractVersion"],
             AI_CONTEXT_CONTRACT_VERSION
         );
         assert_eq!(trigger.context_package["question"], "explain");
+        assert_eq!(trigger.context_package["trigger"]["form"], "inline");
+        assert_eq!(
+            trigger.context_package["trigger"]["completion"],
+            "command_end"
+        );
+        assert_eq!(trigger.context_package["trigger"]["exitCode"], 0);
         assert!(trigger.context_package["dynamicContext"].is_object());
     }
 
     #[test]
-    fn command_end_without_trigger_returns_none() {
-        let mut state = SessionState::new(80, 24);
-        let trigger = state.handle_marker(ShellIntegrationMarker {
-            kind: MarkerKind::CommandEnd,
-            command: Some("ls -la".to_string()),
-            exit_code: Some(0),
-        });
-        assert!(trigger.is_none());
+    fn command_end_without_trigger_returns_no_actions() {
+        let mut state = SessionState::new(80, 24, true);
+        let actions = state.handle_marker(end_marker("ls -la", 0), Instant::now());
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn quoted_trigger_in_markers_is_suppressed() {
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        state.handle_marker(start_marker("echo \"#? not a question\""), t0);
+        assert!(!state.esc_cancellable());
+        let actions = state.handle_marker(end_marker("echo \"#? not a question\"", 0), t0);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn span_question_from_start_marker_fires_once_at_command_end() {
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        assert!(
+            state
+                .handle_marker(start_marker("ls #? explain"), t0)
+                .is_empty()
+        );
+        assert!(state.esc_cancellable());
+
+        let actions = state.handle_marker(end_marker("ls #? explain", 0), t0);
+        let fired = fires(&actions);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].question, "explain");
+        assert_eq!(fired[0].completion, CompletionKind::CommandEnd);
+        assert_eq!(fired[0].context_package["trigger"]["form"], "inline");
+
+        // The pending was consumed; nothing is left to fire or cancel.
+        assert!(state.poll(t0 + Duration::from_secs(60)).is_empty());
+        assert!(!state.esc_cancellable());
+    }
+
+    #[test]
+    fn rendered_ui_text_at_integrated_prompt_does_not_trigger() {
+        // Regression: fzf's Ctrl+R history widget paints `#?` history entries and its
+        // own query line right where the cursor rests. Confirming the selection with
+        // Enter happens at the prompt (no command span), so the marker layer owns `#?`
+        // and the rendered UI text must not be captured.
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        state.record_output(b"  #? a\r\n  2/2\r\n> #?", t0);
+        state.record_input(b"\r", t0);
+        assert!(!state.esc_cancellable());
+        assert!(state.poll(t0 + Duration::from_secs(60)).is_empty());
+    }
+
+    #[test]
+    fn non_integrated_prompt_capture_fires_via_stabilization() {
+        // Without integration hooks no marker will ever come, so the prompt line is
+        // Enter-captured and fired by stabilization.
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, false);
+        state.record_output(b"% ls #? explain", t0);
+        state.record_input(b"\r", t0);
+        state.record_output(b"\r\nfile-a\r\n% ", t0 + Duration::from_millis(30));
+
+        // Resting on a short prompt-like line: the 750 ms prompt-line tier applies.
+        let actions = state.poll(t0 + Duration::from_secs(1));
+        let fired = fires(&actions);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].question, "explain");
+        assert_eq!(fired[0].completion, CompletionKind::Stabilized);
+        assert!(!fired[0].still_running);
+    }
+
+    #[test]
+    fn repeated_enter_without_new_output_captures_once() {
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        state.handle_marker(start_marker("python3"), t0);
+        state.record_output(b">>> f() #? explain", t0);
+        state.record_input(b"\r\r\n", t0);
+        assert!(state.cancel_latest().is_some());
+        assert!(state.cancel_latest().is_none());
+    }
+
+    #[test]
+    fn in_program_question_fires_at_stabilization() {
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        state.handle_marker(start_marker("python3"), t0);
+        state.record_output(b">>> print(1) #? why", t0);
+        state.record_input(b"\r", t0);
+
+        // Resting line ends in "why" (short, non-prompt): the 500 ms tier applies.
+        assert!(state.poll(t0 + Duration::from_millis(300)).is_empty());
+        let actions = state.poll(t0 + Duration::from_millis(600));
+        let fired = fires(&actions);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].question, "why");
+        assert_eq!(fired[0].completion, CompletionKind::Stabilized);
+        assert!(!fired[0].still_running);
+        assert_eq!(
+            fired[0].context_package["trigger"]["completion"],
+            "stabilized"
+        );
+    }
+
+    #[test]
+    fn prompt_shaped_resting_line_selects_the_fast_tier() {
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        state.handle_marker(start_marker("python3"), t0);
+        state.record_output(b">>> #? what does this error mean", t0);
+        state.record_input(b"\r", t0);
+        // Echo of the newline; python prints nothing and the prompt returns.
+        state.record_output(b"\r\n>>> ", t0 + Duration::from_millis(20));
+
+        let actions = state.poll(t0 + Duration::from_millis(200));
+        let fired = fires(&actions);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].completion, CompletionKind::Stabilized);
+        assert_eq!(fired[0].context_package["trigger"]["form"], "standalone");
+    }
+
+    #[test]
+    fn span_question_fires_at_stabilization_with_still_running() {
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        // The start marker carries the full typed line (zsh preexec; bash history read).
+        state.handle_marker(start_marker("pnpm dev #? explain the startup log"), t0);
+        state.record_output(b"server ready on :3000\r\n", t0 + Duration::from_millis(50));
+
+        // Resting on an empty line below the log: the conservative 10 s tier applies.
+        let actions = state.poll(t0 + Duration::from_secs(11));
+        let fired = fires(&actions);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].question, "explain the startup log");
+        assert_eq!(fired[0].completion, CompletionKind::Stabilized);
+        assert!(fired[0].still_running);
+        assert_eq!(fired[0].context_package["trigger"]["stillRunning"], true);
+
+        // The later command_end must not re-fire the settled question.
+        let end_actions = state.handle_marker(
+            end_marker("pnpm dev #? explain the startup log", 130),
+            t0 + Duration::from_secs(60),
+        );
+        assert!(fires(&end_actions).is_empty());
+    }
+
+    #[test]
+    fn max_wait_fires_when_output_never_settles() {
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        state.handle_marker(start_marker("python3"), t0);
+        state.record_output(b">>> stream() #? summarize", t0);
+        state.record_input(b"\r", t0);
+
+        // Keep output arriving so quiescence never happens; max-wait (30 s) fires.
+        state.record_output(b"tick\r\n", t0 + Duration::from_secs(29));
+        let actions = state.poll(t0 + Duration::from_secs(31));
+        let fired = fires(&actions);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].completion, CompletionKind::MaxWait);
+        assert_eq!(
+            fired[0].context_package["trigger"]["completion"],
+            "max_wait"
+        );
+    }
+
+    #[test]
+    fn receipt_notice_prints_once_after_one_second() {
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        state.handle_marker(
+            start_marker("some-quiet-batch-job --with --many --flags #? why is this slow"),
+            t0,
+        );
+        // A long resting line selects the slow tier, keeping the question pending.
+        state.record_output(b"working on a long step, please wait patiently...", t0);
+
+        assert!(state.poll(t0 + Duration::from_millis(500)).is_empty());
+        let first = state.poll(t0 + Duration::from_millis(1100));
+        let first_notices = notices(&first);
+        assert_eq!(first_notices.len(), 1);
+        assert!(first_notices[0].contains("waiting for output to settle"));
+        // Only once.
+        assert!(state.poll(t0 + Duration::from_millis(1500)).is_empty());
+    }
+
+    #[test]
+    fn ctrl_c_cancels_pending_and_suppresses_command_end_refire() {
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        state.handle_marker(start_marker("sleep 30 #? why slow"), t0);
+
+        let actions = state.record_input(&[0x03], t0 + Duration::from_secs(2));
+        let cancel_notices = notices(&actions);
+        assert_eq!(cancel_notices.len(), 1);
+        assert!(cancel_notices[0].contains("cancelled (^C)"));
+
+        // The interrupted command's end marker (exit 130) must not extract and re-fire.
+        let end_actions = state.handle_marker(end_marker("sleep 30 #? why slow", 130), t0);
+        assert!(fires(&end_actions).is_empty());
+        // A later span behaves normally again.
+        let next = state.handle_marker(end_marker("ls #? explain", 0), t0);
+        assert_eq!(fires(&next).len(), 1);
+    }
+
+    #[test]
+    fn esc_cancels_most_recent_pending_first() {
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        state.handle_marker(start_marker("python3"), t0);
+        state.record_output(b">>> first() #? first question", t0);
+        state.record_input(b"\r", t0);
+        state.record_output(b"\r\n>>> second() #? second question", t0);
+        state.record_input(b"\r", t0);
+
+        let first_cancel = state.cancel_latest().expect("one pending to cancel");
+        match first_cancel {
+            Action::Notice(text) => assert!(text.contains("second question")),
+            Action::Fire(_) => panic!("expected a notice"),
+        }
+        let second_cancel = state.cancel_latest().expect("another pending to cancel");
+        match second_cancel {
+            Action::Notice(text) => assert!(text.contains("first question")),
+            Action::Fire(_) => panic!("expected a notice"),
+        }
+        assert!(state.cancel_latest().is_none());
+    }
+
+    #[test]
+    fn alternate_screen_disarms_capture_and_suspends_deadlines() {
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        // Pending question exists from before the program went full-screen.
+        state.handle_marker(start_marker("vim notes.txt #? what is in this file"), t0);
+        state.record_output(b"\x1b[?1049h\x1b[2Jfile contents #? decoy", t0);
+
+        // Enter inside the full-screen program captures nothing.
+        state.record_input(b"\r", t0);
+        // Deadlines and Esc-cancel are suspended while the alternate screen is active.
+        assert!(state.next_deadline(t0 + Duration::from_secs(60)).is_none());
+        assert!(state.poll(t0 + Duration::from_secs(60)).is_empty());
+        assert!(!state.esc_cancellable());
+        assert!(state.cancel_latest().is_none());
+
+        // Leaving the alternate screen re-arms the pending question.
+        state.record_output(b"\x1b[?1049l", t0 + Duration::from_secs(61));
+        assert!(state.esc_cancellable());
+        assert!(state.next_deadline(t0 + Duration::from_secs(61)).is_some());
+    }
+
+    #[test]
+    fn non_echoing_input_never_triggers() {
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        state.handle_marker(start_marker("read -s answer"), t0);
+        state.record_output(b"Password:", t0);
+        // The typed `#?` is never echoed, so the mirror read finds nothing.
+        state.record_input(b"#? is this armed\r", t0);
+        assert!(!state.esc_cancellable());
+        assert!(state.poll(t0 + Duration::from_secs(60)).is_empty());
     }
 }

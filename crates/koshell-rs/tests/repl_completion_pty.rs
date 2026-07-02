@@ -1,12 +1,16 @@
 //! Real-PTY regression tests for `#?` typed inside a foreground CLI program (a REPL), where
-//! shell integration is dormant and koshell must detect command completion itself. See
+//! shell integration is dormant and koshell must detect the stabilization point itself. See
 //! `docs/design-0001-repl-command-completion.md`.
 //!
 //! Each test runs koshell wrapping bash, launches a REPL, and submits a line that both prints
 //! a sentinel and carries a `#?`. The trigger must fire *after* the command's output (the
-//! deferred-until-completion behavior), detected via:
-//! - python (PyREPL): the S1 bracketed-paste `ESC[?2004h` edge;
-//! - node: the S3 output-quiescence fallback (node emits no bracketed-paste edges).
+//! deferred-until-stabilization behavior). Both python and node go through the same
+//! output-stabilization path: the REPL prompt returns, the resting line is prompt-shaped, and
+//! the fast debounce tier fires.
+//!
+//! Capture is a mirror read of the rendered line at the Enter instant, so each question line
+//! is written in two steps — text first (echo renders), then the newline — the same shape as
+//! human typing or a bracketed paste followed by Enter.
 //!
 //! The sentinel is assembled at runtime (`'COMPLETION' + 'MARK'`) so the string
 //! `COMPLETIONMARK` appears only in the command's *output*, never in the echoed input line —
@@ -151,9 +155,10 @@ fn python_repl_defers_hash_question_until_command_completes() {
             (Duration::from_millis(900), b"python3 -q\n"),
             (
                 Duration::from_millis(900),
-                b"print('COMPLETION' + 'MARK')  #? did it run\n",
+                b"print('COMPLETION' + 'MARK')  #? did it run",
             ),
-            (Duration::from_millis(600), b"exit()\n"),
+            (Duration::from_millis(400), b"\n"),
+            (Duration::from_millis(900), b"exit()\n"),
             (Duration::from_millis(400), b"exit\n"),
         ],
     );
@@ -180,9 +185,10 @@ fn node_repl_defers_hash_question_via_quiescence() {
             (Duration::from_millis(1200), b"node\n"),
             (
                 Duration::from_millis(1000),
-                b"console.log('COMPLETION' + 'MARK')  //#? did it run\n",
+                b"console.log('COMPLETION' + 'MARK')  //#? did it run",
             ),
-            (Duration::from_millis(600), b".exit\n"),
+            (Duration::from_millis(400), b"\n"),
+            (Duration::from_millis(900), b".exit\n"),
             (Duration::from_millis(400), b"exit\n"),
         ],
     );

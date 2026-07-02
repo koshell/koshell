@@ -4,14 +4,18 @@
 //! Threads communicate through a channel with a single processor thread owning the mirror
 //! and timeline, so the terminal-emulator state is never shared across threads:
 //! - reader thread: PTY output -> channel
-//! - stdin thread: keystrokes -> PTY and -> channel (for recording)
+//! - stdin thread: keystrokes -> PTY and -> channel (for recording); also owns the
+//!   bare-Esc cancel disambiguation, since it sits on the raw input stream
 //! - resize thread: SIGWINCH -> PTY resize and -> channel
 //! - processor thread: applies events, writes visible output to stdout, handles `#?`
+//!   (pending-question deadlines drive the channel receive timeout)
 
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use koshell_proto::ClientMessage;
@@ -20,7 +24,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use crate::ipc::{self, IpcClient};
 use crate::shell;
 use crate::shell_integration::{MarkerScanner, Segment, create_shell_launch_config};
-use crate::trigger::{SessionState, Trigger};
+use crate::trigger::{Action, CompletionKind, SessionState, Trigger};
 
 /// Immutable per-session metadata used for the IPC handshake.
 struct SessionMeta {
@@ -33,11 +37,18 @@ struct SessionMeta {
 const DEFAULT_COLUMNS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 
+/// How long a trailing lone ESC waits for continuation bytes before it is treated as a
+/// bare Esc (cancel) rather than an escape-sequence prefix (arrow keys, Alt combinations).
+/// Active only while the cancel window is armed. Design 0001 suggests ~25-50 ms.
+const ESC_DISAMBIGUATION_TIMEOUT_MS: i32 = 40;
+
 /// Messages from the I/O threads to the single processor thread.
 enum Msg {
     Pty(Vec<u8>),
     Input(Vec<u8>),
     Resize(u16, u16),
+    /// A bare Esc was swallowed while the cancel window was armed.
+    CancelPending,
     Exit,
 }
 
@@ -61,6 +72,16 @@ impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
     }
+}
+
+/// True when stdin has bytes available within `timeout_ms`.
+fn stdin_readable_within(timeout_ms: i32) -> bool {
+    let mut pollfd = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    unsafe { libc::poll(&mut pollfd, 1, timeout_ms) > 0 }
 }
 
 /// Runs an interactive shell wrapped in a PTY. Returns the child's exit code.
@@ -105,7 +126,10 @@ pub fn run_interactive_shell() -> Result<i32> {
     drop(pair.slave);
 
     let mut reader = pair.master.try_clone_reader()?;
-    let mut writer = pair.master.take_writer()?;
+    // Shared with the processor thread, which forwards a swallowed Esc when the cancel
+    // race is lost (the pending question fired just before the keypress).
+    let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+        Arc::new(Mutex::new(pair.master.take_writer()?));
     let master = pair.master;
 
     crossterm::terminal::enable_raw_mode()?;
@@ -122,80 +146,92 @@ pub fn run_interactive_shell() -> Result<i32> {
         rows,
     };
     let socket_path = ipc::default_socket_path();
+    // With shell integration active, the marker layer owns `#?` at the shell prompt and
+    // submit-time mirror capture is confined to command spans (see `trigger.rs`).
+    let shell_integrated = launch.kind.is_some();
+
+    // Whether a bare Esc currently cancels a pending `#?` (at least one question pending
+    // and the alternate screen inactive). Maintained by the processor thread, consumed by
+    // the stdin thread; everywhere else ESC is forwarded untouched.
+    let esc_window = Arc::new(AtomicBool::new(false));
 
     // Processor thread owns the terminal-core state and the (lazy) IPC connection.
+    let esc_window_proc = esc_window.clone();
+    let writer_proc = writer.clone();
     let processor = thread::spawn(move || {
-        let mut state = SessionState::new(cols, rows);
+        let mut state = SessionState::new(cols, rows, shell_integrated);
         let mut scanner = MarkerScanner::new();
         let mut stdout = std::io::stdout();
         let mut ipc_client: Option<IpcClient> = None;
         let mut request_seq: u64 = 0;
         loop {
-            // When an in-program `#?` awaits the S3 (quiescence) signal, bound the wait so an
-            // idle output stream fires it; otherwise block until the next message.
-            let msg = match state.repl_quiescence_debounce() {
-                Some(debounce) => match rx.recv_timeout(debounce) {
-                    Ok(msg) => msg,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        if let Some(trigger) = state.on_quiescence() {
-                            request_seq += 1;
-                            dispatch_trigger(
-                                &mut stdout,
-                                &mut ipc_client,
-                                &socket_path,
-                                &meta,
-                                request_seq,
-                                &trigger,
-                            );
-                        }
-                        continue;
-                    }
+            // Pending `#?` deadlines (receipt notice, stabilization tier, max-wait) bound
+            // the channel wait; with nothing pending, block until the next message.
+            let msg = match state.next_deadline(Instant::now()) {
+                Some(deadline) => match rx.recv_timeout(deadline) {
+                    Ok(msg) => Some(msg),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 },
                 None => match rx.recv() {
-                    Ok(msg) => msg,
+                    Ok(msg) => Some(msg),
                     Err(_) => break,
                 },
             };
+
+            let now = Instant::now();
+            let mut actions: Vec<Action> = Vec::new();
             match msg {
-                Msg::Pty(bytes) => {
+                Some(Msg::Pty(bytes)) => {
                     for segment in scanner.feed(&bytes) {
                         match segment {
                             Segment::Visible(visible) => {
                                 let _ = stdout.write_all(&visible);
                                 let _ = stdout.flush();
-                                if let Some(trigger) = state.record_output(&visible) {
-                                    request_seq += 1;
-                                    dispatch_trigger(
-                                        &mut stdout,
-                                        &mut ipc_client,
-                                        &socket_path,
-                                        &meta,
-                                        request_seq,
-                                        &trigger,
-                                    );
-                                }
+                                state.record_output(&visible, now);
                             }
                             Segment::Marker(marker) => {
-                                if let Some(trigger) = state.handle_marker(marker) {
-                                    request_seq += 1;
-                                    dispatch_trigger(
-                                        &mut stdout,
-                                        &mut ipc_client,
-                                        &socket_path,
-                                        &meta,
-                                        request_seq,
-                                        &trigger,
-                                    );
-                                }
+                                actions.extend(state.handle_marker(marker, now));
                             }
                         }
                     }
                 }
-                Msg::Input(bytes) => state.record_input(&bytes),
-                Msg::Resize(columns, lines) => state.resize(columns, lines),
-                Msg::Exit => break,
+                Some(Msg::Input(bytes)) => actions.extend(state.record_input(&bytes, now)),
+                Some(Msg::Resize(columns, lines)) => state.resize(columns, lines),
+                Some(Msg::CancelPending) => match state.cancel_latest() {
+                    Some(action) => actions.push(action),
+                    None => {
+                        // The cancel race was lost (nothing pending anymore); restore
+                        // transparency by forwarding the swallowed Esc after all.
+                        if let Ok(mut writer) = writer_proc.lock() {
+                            let _ = writer.write_all(b"\x1b");
+                            let _ = writer.flush();
+                        }
+                    }
+                },
+                Some(Msg::Exit) => break,
+                None => {}
             }
+            actions.extend(state.poll(now));
+
+            for action in actions {
+                match action {
+                    Action::Notice(text) => present_notice(&mut stdout, &mut state, &text),
+                    Action::Fire(trigger) => {
+                        request_seq += 1;
+                        dispatch_trigger(
+                            &mut stdout,
+                            &mut state,
+                            &mut ipc_client,
+                            &socket_path,
+                            &meta,
+                            request_seq,
+                            &trigger,
+                        );
+                    }
+                }
+            }
+            esc_window_proc.store(state.esc_cancellable(), Ordering::Relaxed);
         }
     });
 
@@ -216,20 +252,53 @@ pub fn run_interactive_shell() -> Result<i32> {
         let _ = tx_reader.send(Msg::Exit);
     });
 
-    // stdin -> PTY (low latency) and -> channel (for recording).
+    // stdin -> PTY (low latency) and -> channel (for recording). While the Esc cancel
+    // window is armed, a chunk ending in a lone ESC is held back briefly: if continuation
+    // bytes arrive it was an escape-sequence prefix and is forwarded whole; otherwise it
+    // is swallowed as a cancel keypress and never reaches the child.
     let tx_input = tx.clone();
+    let writer_input = writer.clone();
+    let esc_window_input = esc_window.clone();
     thread::spawn(move || {
         let mut buf = [0u8; 8192];
         let mut stdin = std::io::stdin();
+        let forward = |bytes: &[u8]| -> bool {
+            if bytes.is_empty() {
+                return true;
+            }
+            let _ = tx_input.send(Msg::Input(bytes.to_vec()));
+            let Ok(mut writer) = writer_input.lock() else {
+                return false;
+            };
+            if writer.write_all(bytes).is_err() {
+                return false;
+            }
+            let _ = writer.flush();
+            true
+        };
         loop {
             match stdin.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let _ = tx_input.send(Msg::Input(buf[..n].to_vec()));
-                    if writer.write_all(&buf[..n]).is_err() {
+                    let chunk = &buf[..n];
+                    if esc_window_input.load(Ordering::Relaxed) && chunk.last() == Some(&0x1b) {
+                        if !forward(&chunk[..n - 1]) {
+                            break;
+                        }
+                        if stdin_readable_within(ESC_DISAMBIGUATION_TIMEOUT_MS) {
+                            // Continuation arrived: an escape sequence. Forward the ESC;
+                            // the next read picks up and forwards the continuation.
+                            if !forward(b"\x1b") {
+                                break;
+                            }
+                        } else {
+                            let _ = tx_input.send(Msg::CancelPending);
+                        }
+                        continue;
+                    }
+                    if !forward(chunk) {
                         break;
                     }
-                    let _ = writer.flush();
                 }
             }
         }
@@ -262,11 +331,21 @@ pub fn run_interactive_shell() -> Result<i32> {
     Ok(status.exit_code() as i32)
 }
 
+/// Prints a dim one-line presentation notice and feeds it to the mirror, keeping screen
+/// snapshots truthful to what the user sees (the mirror-feed invariant).
+fn present_notice(stdout: &mut std::io::Stdout, state: &mut SessionState, text: &str) {
+    let bytes = format!("\r\n\x1b[2m[koshell] {text}\x1b[0m\r\n");
+    let _ = stdout.write_all(bytes.as_bytes());
+    let _ = stdout.flush();
+    state.record_presentation_output(bytes.as_bytes());
+}
+
 /// Sends a `#?` request to the AI daemon (connecting lazily), and acknowledges it inline.
 /// If the daemon is unavailable the terminal degrades gracefully. AI response streaming
 /// replaces the inline acknowledgement once pi is connected.
 fn dispatch_trigger(
     stdout: &mut std::io::Stdout,
+    state: &mut SessionState,
     ipc_client: &mut Option<IpcClient>,
     socket_path: &std::path::PathBuf,
     meta: &SessionMeta,
@@ -303,18 +382,23 @@ fn dispatch_trigger(
         false
     };
 
-    if sent {
-        let _ = write!(
-            stdout,
-            "\r\n[koshell] #? sent to AI daemon: {}\r\n",
-            trigger.question
-        );
+    let status = if sent {
+        "sent to AI daemon"
     } else {
-        let _ = write!(
-            stdout,
-            "\r\n[koshell] #? received (AI daemon unavailable): {}\r\n",
-            trigger.question
-        );
-    }
+        "received (AI daemon unavailable)"
+    };
+    let annotation = match (trigger.completion, trigger.still_running) {
+        (CompletionKind::Stabilized | CompletionKind::MaxWait, true) => {
+            " (command may still be running)"
+        }
+        (CompletionKind::MaxWait, false) => " (output not settled)",
+        _ => "",
+    };
+    let bytes = format!(
+        "\r\n[koshell] #? {status}{annotation}: {}\r\n",
+        trigger.question
+    );
+    let _ = stdout.write_all(bytes.as_bytes());
     let _ = stdout.flush();
+    state.record_presentation_output(bytes.as_bytes());
 }

@@ -3,8 +3,10 @@
 //!
 //! Ported from `coshell/src/shell-integration.ts` (renamed to koshell). The rc hooks
 //! source the user's own rc files first, then install `preexec`/`precmd` (zsh) or a
-//! `DEBUG` trap plus `PROMPT_COMMAND` (bash). A `command_start` marker carries the
-//! command line; `command_end` carries the command line and exit code. The precmd
+//! `DEBUG` trap plus `PROMPT_COMMAND` (bash). A `command_start` marker carries the full
+//! typed command line (zsh: `preexec $1`; bash: read back from history inside the DEBUG
+//! trap, since `$BASH_COMMAND` strips a trailing `#?` comment), emitted once per
+//! accepted line; `command_end` carries the command line and exit code. The precmd
 //! fallback also emits markers for comment-only lines containing `#?`, so a bare
 //! `#? question` works even though the shell runs no command.
 
@@ -310,23 +312,33 @@ __koshell_emit_end() {
 }
 "#;
 
-const BASH_HOOKS: &str = r#"__koshell_last_started_command=""
-__koshell_last_history_number=""
+const BASH_HOOKS: &str = r#"__koshell_last_history_number=""
 __koshell_command_active=""
 __koshell_in_prompt_command=""
 __koshell_debug_trap() {
-  local command="$BASH_COMMAND"
   if [ -n "$__koshell_in_prompt_command" ]; then
     return
   fi
-  case "$command" in
+  case "$BASH_COMMAND" in
     __koshell_*|PROMPT_COMMAND=*|trap\ *) return ;;
   esac
-  if [ "$command" != "$__koshell_last_started_command" ]; then
-    __koshell_last_started_command="$command"
-    __koshell_command_active=1
-    __koshell_emit_start "$command"
+  # One start marker per accepted line, not per simple command of a compound line.
+  if [ -n "$__koshell_command_active" ]; then
+    return
   fi
+  __koshell_command_active=1
+  # Emit the full typed line: bash has already pushed it to history at this point, and
+  # unlike $BASH_COMMAND the history text keeps a trailing `#?` comment, which koshell
+  # needs at command START to fire on non-terminating commands. When the line added no
+  # history entry (e.g. HISTCONTROL=ignorespace), fall back to $BASH_COMMAND.
+  local history_line history_number history_command
+  history_line=$(HISTTIMEFORMAT= builtin history 1 2>/dev/null)
+  history_number=$(printf '%s' "$history_line" | sed 's/^ *\([0-9][0-9]*\).*/\1/')
+  history_command=$(printf '%s' "$history_line" | sed 's/^ *[0-9][0-9]* *//')
+  if [ -z "$history_number" ] || [ "$history_number" = "$__koshell_last_history_number" ]; then
+    history_command="$BASH_COMMAND"
+  fi
+  __koshell_emit_start "$history_command"
 }
 __koshell_prompt_command() {
   local exit_status=$?

@@ -100,6 +100,64 @@ impl TerminalMirror {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
+    /// The right-trimmed text of the cursor's row plus the cursor column. Used by the
+    /// prompt-shape debounce modulator, which needs "what line is the cursor resting on".
+    pub fn cursor_row(&self) -> (String, u16) {
+        let cursor = self.term.grid().cursor.point;
+        let text = self.row_text(cursor.line.0.max(0));
+        (text.trim_end().to_string(), cursor.column.0 as u16)
+    }
+
+    /// The cursor's logical line: its row joined with any soft-wrapped neighbours (a row
+    /// whose last cell carries `WRAPLINE` continues into the row below). This is the
+    /// submit-time `#?` capture read — it reflects the final rendered input line, so it is
+    /// robust to line editing, and input that is never echoed never appears here.
+    pub fn cursor_logical_line(&self) -> String {
+        let cursor_row = self.term.grid().cursor.point.line.0.max(0);
+        let mut start = cursor_row;
+        while start > 0 && self.row_wraps(start - 1) {
+            start -= 1;
+        }
+        let mut end = cursor_row;
+        let last_row = self.rows as i32 - 1;
+        while end < last_row && self.row_wraps(end) {
+            end += 1;
+        }
+
+        let mut text = String::new();
+        for row in start..=end {
+            let row_text = self.row_text(row);
+            if row < end {
+                // A wrapped row is full width by construction; keep it untrimmed.
+                text.push_str(&row_text);
+            } else {
+                text.push_str(row_text.trim_end());
+            }
+        }
+        text
+    }
+
+    fn row_text(&self, row: i32) -> String {
+        let grid = self.term.grid();
+        let line = &grid[Line(row)];
+        let mut text = String::with_capacity(self.columns as usize);
+        for col in 0..self.columns as usize {
+            let cell = &line[Column(col)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            text.push(cell.c);
+        }
+        text
+    }
+
+    fn row_wraps(&self, row: i32) -> bool {
+        let last_col = (self.columns as usize).saturating_sub(1);
+        self.term.grid()[Line(row)][Column(last_col)]
+            .flags
+            .contains(Flags::WRAPLINE)
+    }
+
     /// Captures the current visible screen as a plain-text snapshot.
     pub fn snapshot(&self) -> TerminalSnapshot {
         let grid = self.term.grid();
@@ -188,5 +246,28 @@ mod tests {
         let mut mirror = TerminalMirror::new(80, 24);
         mirror.write(b"");
         assert_eq!(mirror.snapshot().screen, "");
+    }
+
+    #[test]
+    fn reads_cursor_row_text_and_column() {
+        let mut mirror = TerminalMirror::new(20, 5);
+        mirror.write(b"first\r\n>>> ");
+        let (text, cursor_x) = mirror.cursor_row();
+        assert_eq!(text, ">>>");
+        assert_eq!(cursor_x, 4);
+    }
+
+    #[test]
+    fn cursor_logical_line_joins_soft_wrapped_rows() {
+        let mut mirror = TerminalMirror::new(10, 5);
+        mirror.write(b"abcdefghij#? hello");
+        assert_eq!(mirror.cursor_logical_line(), "abcdefghij#? hello");
+    }
+
+    #[test]
+    fn cursor_logical_line_stops_at_hard_line_breaks() {
+        let mut mirror = TerminalMirror::new(20, 5);
+        mirror.write(b"previous line\r\n$ ls #? explain");
+        assert_eq!(mirror.cursor_logical_line(), "$ ls #? explain");
     }
 }

@@ -2,13 +2,16 @@
 
 Date: 2026-07-01 16:55:37 CST (original) / 2026-07-02 11:04 CST (revised) /
 2026-07-02 12:28 CST (pending-trigger interaction and line-semantics corners added) /
-2026-07-02 12:48 CST (Esc cancel added)
+2026-07-02 12:48 CST (Esc cancel added) / 2026-07-02 13:18 CST (implemented) /
+2026-07-02 14:32 CST (prompt-layer capture moved to marker ownership after an fzf false
+positive)
 
-Status: design revised after first-principles review. The revision replaces the original
-"S1 + S3 completion detector" decision: bracketed-paste (S1) is dropped as a load-bearing
-signal, "command completion" is reframed as "output stabilization", and the `#?` semantics
-are made explicit. The current prototype in `crates/koshell-rs` still implements the earlier
-S1 + S3 iteration; see "Prototype status" for the deltas.
+Status: implemented. The revision replaces the original "S1 + S3 completion detector"
+decision: bracketed-paste (S1) is dropped as a load-bearing signal, "command completion"
+is reframed as "output stabilization", and the `#?` semantics are made explicit. The
+revised design — including the pending-trigger interaction — now is what
+`crates/koshell-rs` implements; see "Implementation status" for what landed and the
+recorded residuals.
 
 ## Context
 
@@ -284,23 +287,62 @@ assert on `[koshell] #?` feedback and its position relative to output sentinels.
   multi-line input is a miss (the shell layer is covered by shell integration); `#? /` is
   reserved for session commands.
 
-## Prototype status
+## Implementation status
 
-The prototype currently in `crates/koshell-rs` implements the **earlier S1 + S3 iteration**
-of this design (commit `36ed0a4`): `ReplDetector`/`BracketedPasteScanner` in `trigger.rs`,
-keystroke-based line capture, a single 150 ms quiescence debounce wired through
-`session.rs`'s `recv_timeout` loop, and real-PTY tests for python (bracketed-paste) and
-node (quiescence). It works for the happy paths but predates this revision.
+Implemented in `crates/koshell-rs` on 2026-07-02, replacing the earlier S1 + S3 prototype
+(commit `36ed0a4`). All deltas listed by the revision landed:
 
-Deltas to implement for the revised design:
+- `BracketedPasteScanner`, `ReplDetector`, and keystroke reconstruction are removed;
+  python and node both fire through stabilization (real-PTY tests updated accordingly).
+- Capture is a mirror read of the cursor's logical line (soft-wrapped rows joined) at the
+  Enter instant, which doubles as the echo-verification arming check; quote parity
+  suppresses `#?` inside unclosed quotes on both the capture and the marker-text paths.
+- Stabilization fires on quiescence with debounce tiers selected by the prompt-shape
+  modulator — in-program: 150 ms prompt-like / 500 ms short / 3 s otherwise, max-wait
+  30 s; shell-layer: 750 ms / 3 s / 10 s, max-wait 120 s, conservative so the
+  authoritative `command_end` wins the race for terminating commands. All values are
+  dogfooding-tunable constants in `trigger.rs`.
+- An inline `#?` on a non-terminating command fires at stabilization annotated
+  still-running; the later `command_end` does not re-fire it.
+- The context package carries trigger metadata: `form` (standalone/inline), `completion`
+  (`command_end` / `stabilized` / `max_wait`), `stillRunning`, and the exit code when the
+  authoritative marker fired.
+- Pending-trigger interaction: the ~1 s delayed receipt notice, Ctrl+C cancel (with
+  `command_end` re-fire suppression so the interrupt's own failure marker stays quiet),
+  and bare-Esc cancel with a 40 ms continuation-timeout disambiguation in the stdin
+  thread. If the cancel race is lost (the question fired just before the keypress), the
+  swallowed Esc is forwarded after all, preserving transparency.
+- Presentation output (notices, fire feedback) is fed to the terminal mirror — the
+  mirror-feed invariant of design 0002, applied to the presentation lines that exist
+  today.
 
-- remove `BracketedPasteScanner` and the S1 fire path (tests move to stabilization);
-- replace keystroke reconstruction with mirror-read capture at submit time;
-- add echo-verification arming and quote-parity suppression;
-- add escalating debounce tiers with the prompt-shape modulator and the bounded max-wait
-  fallback;
-- extend the shell-layer path so inline `#?` on a non-terminating command fires at
-  stabilization with a "still running" annotation (today it waits for `command_end`
-  forever);
-- annotate deferred fires with completion-confidence metadata in the context package so the
-  future agent self-check can act on it.
+Implementation notes recorded for dogfooding:
+
+- **At the integrated shell prompt, the marker layer owns `#?` exclusively; submit-time
+  mirror capture is armed only inside command spans and in shells without integration
+  hooks.** The first implementation also captured at the prompt and dogfooding
+  immediately hit a false positive: fzf's Ctrl+R widget renders `#?` history entries and
+  its own query line right where the cursor rests, so confirming a selection captured
+  the rendered UI text (a bogus empty question that later double-fired at `command_end`).
+  Echo verification cannot help — the fzf query line _is_ echoed typed input. A marker,
+  by contrast, only exists for a line the shell really accepted. To keep stabilization
+  firing on non-terminating commands, the `command_start` marker now carries the full
+  typed line: zsh's `preexec` already does, and the bash `DEBUG` trap reads it back from
+  history (with a `$BASH_COMMAND` fallback), emitting one start per accepted line.
+- The `command_end` marker fires the span's pending question; extraction from the end
+  marker's text remains the fallback when no pending exists, which also covers
+  multi-line shell input (the marker carries the full logical command). In shells
+  without integration hooks, prompt-line capture plus stabilization is the only path.
+- Same-write submits (a paste whose trailing newline arrives in the same chunk as the
+  text) are covered at the shell layer by the markers, but are an accepted miss inside
+  programs without bracketed paste: the mirror has not rendered the line when Enter is
+  processed.
+- Rendered-UI `#?` text remains an accepted residual where capture is armed: inside
+  command spans (a program printing a `#?`-shaped prompt line, a finder launched as a
+  command) and at non-integrated prompts. Bounded cost: one unwanted answer.
+- While the alternate screen is active, pending deadlines, notices, and the Esc cancel
+  are suspended so nothing scribbles over a full-screen program; `command_end` still
+  fires, and leaving the alternate screen re-arms pending questions.
+- A quiet terminating command (a silent batch job) can reach the shell-layer slow tier
+  and fire before its `command_end`, annotated still-running — the accepted imprecision
+  the agent's snapshot self-check is designed to absorb.
