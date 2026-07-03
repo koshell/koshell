@@ -6,10 +6,20 @@
 
 use clap::Parser;
 
+use koshell_rs::cli::Command;
+
 fn main() {
     let cli = koshell_rs::cli::Cli::parse();
     koshell_rs::logging::init(cli.log_level.as_deref());
-    match koshell_rs::session::run_interactive_shell(&cli.command) {
+    let command = match cli.command {
+        Some(Command::ShellInit { shell }) => {
+            print!("{}", koshell_rs::shell_init::snippet(shell));
+            return;
+        }
+        Some(Command::Launch(command)) => command,
+        None => Vec::new(),
+    };
+    match koshell_rs::session::run_interactive_shell(&command) {
         Ok(code) => std::process::exit(code),
         Err(error) => {
             eprintln!("koshell failed: {error}");

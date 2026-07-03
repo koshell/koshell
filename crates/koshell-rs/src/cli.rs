@@ -1,18 +1,32 @@
 //! Command-line interface for the `koshell` binary.
 //!
 //! Without arguments koshell launches the default shell (with shell integration for
-//! bash/zsh). A trailing positional command launches that program directly instead —
+//! bash/zsh). `shell-init <shell>` prints the rc snippet for
+//! `eval "$(koshell shell-init zsh)"`-style auto-wrap installs. Any other leading
+//! positional launches that program directly instead of the default shell —
 //! `koshell python3 -i` runs `python3 -i` in the PTY with `#?` armed through the
-//! non-integrated capture path. Everything after the first positional belongs to the
-//! child program, and `--` allows a command whose name starts with a dash. Unknown
-//! dashed arguments before the command are rejected so the option namespace stays
-//! reserved for future flags.
+//! non-integrated capture path; everything after the program name belongs to it, and
+//! `--` allows a program whose name starts with a dash. Unknown dashed arguments before
+//! the program are rejected so the option namespace stays reserved for future flags.
+//!
+//! `shell-init` shadows a program literally named `shell-init`; launching such a
+//! program requires a path form (for example `koshell ./shell-init`). Accepted
+//! residual of reserving the name.
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
+
+use crate::shell_init::InitShell;
 
 /// koshell — a human-centric shared terminal: AI beside your terminal, not above it.
 #[derive(Debug, Parser)]
-#[command(name = "koshell", version, about, max_term_width = 100)]
+#[command(
+    name = "koshell",
+    version,
+    about,
+    max_term_width = 100,
+    after_help = "Run `koshell <command> [args...]` to launch a program directly \
+                  instead of the default shell (for example `koshell python3 -i`)."
+)]
 pub struct Cli {
     /// Log level filter (error, warn, info, debug, trace, off; env_logger module
     /// filters also work). Overrides the KOSHELL_LOG environment variable. Logs are
@@ -20,10 +34,25 @@ pub struct Cli {
     #[arg(long, value_name = "LEVEL")]
     pub log_level: Option<String>,
 
-    /// Program to launch instead of the default shell, with its arguments
-    /// (for example `koshell python3 -i`). Omit to launch the default shell.
-    #[arg(value_name = "COMMAND", trailing_var_arg = true)]
-    pub command: Vec<String>,
+    /// What to run; omit to launch the default shell.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum Command {
+    /// Print the startup snippet that makes new interactive shells exec into koshell;
+    /// install it as `eval "$(koshell shell-init zsh)"` at the top of ~/.zshrc (bash:
+    /// ~/.bashrc).
+    ShellInit {
+        /// Shell dialect to emit the snippet for.
+        #[arg(value_enum, value_name = "SHELL")]
+        shell: InitShell,
+    },
+
+    /// Program to launch instead of the default shell, with its arguments.
+    #[command(external_subcommand)]
+    Launch(Vec<String>),
 }
 
 #[cfg(test)]
@@ -34,27 +63,34 @@ mod tests {
         Cli::try_parse_from(std::iter::once("koshell").chain(args.iter().copied()))
     }
 
+    fn launch(cli: &Cli) -> &[String] {
+        match &cli.command {
+            Some(Command::Launch(command)) => command,
+            other => panic!("expected a program launch, got {other:?}"),
+        }
+    }
+
     #[test]
     fn no_arguments_means_default_shell() {
         let cli = parse(&[]).unwrap();
-        assert!(cli.command.is_empty());
+        assert!(cli.command.is_none());
     }
 
     #[test]
     fn positional_command_with_dashed_arguments_passes_through() {
         let cli = parse(&["python3", "-i", "--version"]).unwrap();
-        assert_eq!(cli.command, ["python3", "-i", "--version"]);
+        assert_eq!(launch(&cli), ["python3", "-i", "--version"]);
     }
 
     #[test]
     fn log_level_before_command_is_koshell_s_and_after_belongs_to_the_program() {
         let cli = parse(&["--log-level", "debug", "python3", "-i"]).unwrap();
         assert_eq!(cli.log_level.as_deref(), Some("debug"));
-        assert_eq!(cli.command, ["python3", "-i"]);
+        assert_eq!(launch(&cli), ["python3", "-i"]);
 
         let cli = parse(&["python3", "--log-level", "debug"]).unwrap();
         assert_eq!(cli.log_level, None);
-        assert_eq!(cli.command, ["python3", "--log-level", "debug"]);
+        assert_eq!(launch(&cli), ["python3", "--log-level", "debug"]);
     }
 
     #[test]
@@ -68,7 +104,7 @@ mod tests {
     #[test]
     fn double_dash_allows_dashed_command_names() {
         let cli = parse(&["--", "--weird-name", "arg"]).unwrap();
-        assert_eq!(cli.command, ["--weird-name", "arg"]);
+        assert_eq!(launch(&cli), ["--weird-name", "arg"]);
     }
 
     #[test]
@@ -77,5 +113,42 @@ mod tests {
         assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
         let error = parse(&["--version"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+    }
+
+    #[test]
+    fn shell_init_parses_supported_shells() {
+        let cli = parse(&["shell-init", "zsh"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::ShellInit {
+                shell: InitShell::Zsh
+            })
+        );
+        let cli = parse(&["shell-init", "bash"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::ShellInit {
+                shell: InitShell::Bash
+            })
+        );
+    }
+
+    #[test]
+    fn shell_init_requires_a_supported_shell() {
+        assert!(parse(&["shell-init"]).is_err());
+        let error = parse(&["shell-init", "fish"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn a_program_named_like_the_subcommand_needs_a_path_form() {
+        // Reserved name: plain `shell-init` is the subcommand.
+        assert!(matches!(
+            parse(&["shell-init", "zsh"]).unwrap().command,
+            Some(Command::ShellInit { .. })
+        ));
+        // A path spelling still launches a real program of that name.
+        let cli = parse(&["./shell-init", "zsh"]).unwrap();
+        assert_eq!(launch(&cli), ["./shell-init", "zsh"]);
     }
 }

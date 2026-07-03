@@ -10,6 +10,7 @@ pub mod presentation;
 pub mod screen_diff;
 pub mod session;
 pub mod shell;
+pub mod shell_init;
 pub mod shell_integration;
 pub mod timeline;
 pub mod trigger;

@@ -17,6 +17,22 @@ koshell -- some-command    # `--` reserves room for future koshell options and a
                            # command names that start with a dash
 ```
 
+To start koshell automatically in every new terminal, install the auto-wrap snippet at
+the top of your shell rc file:
+
+```bash
+eval "$(koshell shell-init zsh)"    # first line of ~/.zshrc
+eval "$(koshell shell-init bash)"   # first line of ~/.bashrc (on macOS, make sure
+                                    # ~/.bash_profile sources ~/.bashrc)
+```
+
+The snippet `exec`s the just-started interactive shell into koshell; the shell koshell
+spawns re-sources your rc and skips the exec (`KOSHELL=1`), so your configuration loads
+exactly once, inside the wrap. It stays inert for non-interactive shells, non-TTY
+stdio, and `TERM=dumb`. To opt out for one shell, start it with `KOSHELL_NO_AUTO=1`; to
+disable auto-wrap without a working shell, create `~/.config/koshell/no-auto` (see
+`docs/design-0003-shell-init-auto-wrap.md`).
+
 `#?` works in every form: type `#? <question>` (or `command #? <question>`) and the
 question fires when the line's output completes or stabilizes. Directly launched
 programs use the output-stabilization path, since shell integration markers only exist

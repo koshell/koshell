@@ -11,7 +11,9 @@ terminal operator while AI assists from beside the shell.
     launches that program directly (explicit bash/zsh still gets integration, appended
     before user arguments; any other program runs without integration, so `#?` uses the
     non-integrated mirror-capture + stabilization path). `--` reserves the option
-    namespace for future flags;
+    namespace for future flags. `koshell shell-init <shell>` prints the rc snippet for
+    `eval "$(koshell shell-init zsh)"`-style auto-wrap installs (see
+    `design-0003-shell-init-auto-wrap.md`);
   - the terminal mirror (via `alacritty_terminal`), screen snapshots, alternate-screen
     detection, and line-level screen diffs;
   - the append-only terminal timeline and local terminal context;
