@@ -3,11 +3,28 @@
 //!
 //! The wire format is newline-delimited JSON (JSONL) over a Unix domain socket.
 //! Each message is a single JSON object tagged by a `type` field. Both ends must
-//! agree on [`PROTOCOL_VERSION`], negotiated during the `hello` handshake.
+//! agree on [`PROTOCOL_VERSION`], negotiated during the `hello` handshake: the
+//! daemon serves `ai_request`s only after a version-matching `hello`, and answers
+//! anything else with an explicit `ai_error` (mixed versions are expected in
+//! practice — terminals are long-lived while the daemon restarts independently).
+//!
+//! # Evolution rules
+//!
+//! - The `hello` shape is frozen: existing fields never change meaning or type, so
+//!   any version of either side can always read the other's handshake. New fields
+//!   must be optional.
+//! - Evolve additively without bumping the version: new optional fields on existing
+//!   messages, and new message types. Receivers must ignore message types they do
+//!   not know (`koshell-rs` skips them in its IPC reader; the daemon's parser
+//!   returns null and logs).
+//! - Bump [`PROTOCOL_VERSION`] only for breaking changes: removing or retyping a
+//!   field, or changing message semantics. Keep `packages/ai-daemon/src/protocol.ts`
+//!   in lockstep.
 
 use serde::{Deserialize, Serialize};
 
-/// IPC protocol version. Bump on any breaking change to the message shapes.
+/// IPC protocol version. Bump on any breaking change to the message shapes (see the
+/// evolution rules in the crate docs).
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// A message sent from the terminal process to the AI daemon.

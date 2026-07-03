@@ -8,6 +8,7 @@ import { buildUserPrompt } from "./prompt.ts";
 import {
   type AiRequestMessage,
   type HelloMessage,
+  PROTOCOL_VERSION,
   type ServerMessage,
   parseClientMessage,
   serializeServerMessage,
@@ -32,10 +33,18 @@ function errorText(error: unknown): string {
 // conversation, and serializes ai_requests FIFO (pi forbids concurrent prompts on
 // one session). The conversation is discarded when the terminal disconnects; a
 // reconnecting terminal gets a fresh conversation.
+//
+// The hello handshake is enforced: ai_requests are only served after a hello whose
+// protocol_version matches this daemon's. Anything else (no hello yet, or a
+// mismatched version) is answered with an explicit ai_error so the terminal shows
+// the reason inline instead of failing on a message-shape mismatch later.
 export class TerminalConnection {
   private readonly sink: MessageSink;
   private readonly options: DaemonOptions;
   private hello: HelloMessage | undefined;
+  // Why ai_requests cannot be served yet; cleared by a version-matching hello.
+  private helloRejection: string | undefined =
+    "the terminal did not complete the hello handshake on this connection";
   private agent: Promise<KoshellAgent> | undefined;
   private queue: Promise<void> = Promise.resolve();
   private closed = false;
@@ -54,12 +63,38 @@ export class TerminalConnection {
     }
     switch (message.type) {
       case "hello":
+        if (message.protocol_version !== PROTOCOL_VERSION) {
+          this.hello = undefined;
+          this.helloRejection =
+            `protocol version mismatch: the terminal speaks v${String(message.protocol_version)}, ` +
+            `this daemon speaks v${String(PROTOCOL_VERSION)}. Upgrade the older side, ` +
+            `restart the daemon, and reopen this terminal window.`;
+          this.options.log.warn(
+            `rejected hello from ${message.terminal_session_id}: ${this.helloRejection}`,
+          );
+          break;
+        }
         this.hello = message;
+        this.helloRejection = undefined;
         this.options.log.info(
           `hello from ${message.terminal_session_id} (${message.shell}, ${String(message.cols)}x${String(message.rows)}) cwd=${message.cwd}`,
         );
         break;
       case "ai_request":
+        if (this.helloRejection !== undefined) {
+          // Keep the per-request contract (ack, then exactly one terminal
+          // marker) so the terminal's pending-request handling stays uniform.
+          this.options.log.warn(
+            `refused #? [${message.request_id}]: ${this.helloRejection}`,
+          );
+          this.send({ type: "ack", request_id: message.request_id });
+          this.send({
+            type: "ai_error",
+            request_id: message.request_id,
+            message: this.helloRejection,
+          });
+          break;
+        }
         this.options.log.info(`#? [${message.request_id}] ${message.question}`);
         this.options.log.debug(
           `#? [${message.request_id}] context_package: ${JSON.stringify(message.context_package)}`,

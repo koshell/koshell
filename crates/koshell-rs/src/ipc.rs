@@ -45,12 +45,30 @@ pub struct IpcReader {
 
 impl IpcReader {
     /// Reads one server message (blocking). Returns `None` on clean EOF.
+    ///
+    /// Lines that are valid JSON but do not decode as a known [`ServerMessage`] are
+    /// skipped (logged at debug), per the protocol's additive-evolution rule: a newer
+    /// daemon may send message types this terminal does not know yet, and they must
+    /// not kill the reader thread. Non-JSON lines are still hard errors — that is a
+    /// framing bug, not evolution.
     pub fn recv(&mut self) -> anyhow::Result<Option<ServerMessage>> {
-        let mut line = String::new();
-        if self.reader.read_line(&mut line)? == 0 {
-            return Ok(None);
+        loop {
+            let mut line = String::new();
+            if self.reader.read_line(&mut line)? == 0 {
+                return Ok(None);
+            }
+            let trimmed = line.trim_end();
+            match serde_json::from_str(trimmed) {
+                Ok(message) => return Ok(Some(message)),
+                Err(error) => {
+                    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+                        log::debug!("ignoring unknown daemon message: {trimmed}");
+                        continue;
+                    }
+                    return Err(error.into());
+                }
+            }
         }
-        Ok(Some(serde_json::from_str(line.trim_end())?))
     }
 }
 
@@ -84,5 +102,38 @@ pub fn hello(cwd: String, shell: String, rows: u16, cols: u16) -> ClientMessage 
         shell,
         rows,
         cols,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reader_of(lines: &str) -> IpcReader {
+        let (mut writer, reader) = UnixStream::pair().expect("socketpair");
+        writer.write_all(lines.as_bytes()).expect("write lines");
+        drop(writer);
+        IpcReader {
+            reader: BufReader::new(reader),
+        }
+    }
+
+    #[test]
+    fn recv_skips_unknown_message_types_and_reads_eof() {
+        let mut reader = reader_of(
+            "{\"type\":\"brand_new_thing\",\"payload\":1}\n\
+             {\"type\":\"ack\",\"request_id\":\"r1\"}\n",
+        );
+        match reader.recv().expect("recv known message") {
+            Some(ServerMessage::Ack { request_id }) => assert_eq!(request_id, "r1"),
+            other => panic!("unexpected message: {other:?}"),
+        }
+        assert!(reader.recv().expect("clean EOF").is_none());
+    }
+
+    #[test]
+    fn recv_rejects_non_json_lines() {
+        let mut reader = reader_of("not json at all\n");
+        assert!(reader.recv().is_err());
     }
 }

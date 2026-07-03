@@ -48,7 +48,14 @@ terminal operator while AI assists from beside the shell.
 Newline-delimited JSON (JSONL) over a Unix domain socket at
 `$XDG_RUNTIME_DIR/koshell/daemon.sock` (falling back under `$XDG_CACHE_HOME/koshell/`).
 The terminal connects lazily; if the daemon is unavailable the terminal keeps working and
-`#?` degrades explicitly. A `hello` handshake negotiates the protocol version.
+`#?` degrades explicitly. A `hello` handshake negotiates the protocol version, and the
+daemon enforces it: `ai_request`s are served only after a version-matching `hello`;
+otherwise each request is answered with an explicit `ai_error` naming both versions, so
+a mixed-version fleet (long-lived terminals, independently restarted daemon) degrades
+readably instead of failing on message-shape mismatches. Protocol evolution is additive
+by default — unknown message types are ignored by both ends, the `hello` shape is
+frozen, and the version is bumped only for breaking changes (see the `koshell-proto`
+crate docs and `design-0004-ipc-version-enforcement.md`).
 
 Messages (see `crates/koshell-proto`):
 

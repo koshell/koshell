@@ -6,6 +6,7 @@ import type {
   KoshellAgent,
 } from "../src/agent-runtime.ts";
 import type { Logger } from "../src/logging.ts";
+import { PROTOCOL_VERSION } from "../src/protocol.ts";
 import { TerminalConnection, type MessageSink } from "../src/server.ts";
 
 const noop = (): void => undefined;
@@ -17,15 +18,19 @@ const NOOP_LOGGER: Logger = {
   debug: noop,
 };
 
-const HELLO_LINE = JSON.stringify({
-  type: "hello",
-  protocol_version: 1,
-  terminal_session_id: "koshell-42",
-  cwd: "/tmp",
-  shell: "/bin/zsh",
-  rows: 24,
-  cols: 80,
-});
+const HELLO_LINE = helloLine(PROTOCOL_VERSION);
+
+function helloLine(protocolVersion: number): string {
+  return JSON.stringify({
+    type: "hello",
+    protocol_version: protocolVersion,
+    terminal_session_id: "koshell-42",
+    cwd: "/tmp",
+    shell: "/bin/zsh",
+    rows: 24,
+    cols: 80,
+  });
+}
 
 function aiRequestLine(requestId: string, question = "why"): string {
   return JSON.stringify({
@@ -111,6 +116,7 @@ describe("TerminalConnection", () => {
       log: NOOP_LOGGER,
     });
 
+    connection.handleLine(HELLO_LINE);
     connection.handleLine(aiRequestLine("r1"));
     await settle();
     connection.handleLine(aiRequestLine("r2"));
@@ -142,6 +148,7 @@ describe("TerminalConnection", () => {
       log: NOOP_LOGGER,
     });
 
+    connection.handleLine(HELLO_LINE);
     connection.handleLine(aiRequestLine("r1"));
     await settle();
 
@@ -173,6 +180,7 @@ describe("TerminalConnection", () => {
       log: NOOP_LOGGER,
     });
 
+    connection.handleLine(HELLO_LINE);
     connection.handleLine(aiRequestLine("r1"));
     connection.handleLine(aiRequestLine("r2"));
     await settle();
@@ -219,6 +227,7 @@ describe("TerminalConnection", () => {
       log: NOOP_LOGGER,
     });
 
+    connection.handleLine(HELLO_LINE);
     connection.handleLine(aiRequestLine("r1"));
     await settle();
     connection.handleLine(
@@ -233,16 +242,10 @@ describe("TerminalConnection", () => {
     expect(disposed).toBe(1);
   });
 
-  it("answers an ai_request that arrives before hello", async () => {
+  it("refuses an ai_request that arrives before hello", async () => {
     const { sink, lines } = collectingSink();
-    const factory: AgentFactory = ({ cwd }) => {
-      expect(cwd.length).toBeGreaterThan(0);
-      return Promise.resolve<KoshellAgent>({
-        ask(): Promise<void> {
-          return Promise.resolve();
-        },
-        dispose: noop,
-      });
+    const factory: AgentFactory = () => {
+      throw new Error("the agent must not be created without a handshake");
     };
     const connection = new TerminalConnection(sink, {
       createAgent: factory,
@@ -252,6 +255,45 @@ describe("TerminalConnection", () => {
     connection.handleLine(aiRequestLine("r1"));
     await settle();
 
-    expect(types(lines)).toEqual(["ack", "ai_response_end"]);
+    expect(types(lines)).toEqual(["ack", "ai_error"]);
+    expect(lines[1]).toContain("hello handshake");
+  });
+
+  it("refuses ai_requests after a protocol version mismatch, until a matching hello", async () => {
+    const { sink, lines } = collectingSink();
+    const factory: AgentFactory = () =>
+      Promise.resolve<KoshellAgent>({
+        ask({ onDelta }: AskOptions): Promise<void> {
+          onDelta("ok");
+          return Promise.resolve();
+        },
+        dispose: noop,
+      });
+    const connection = new TerminalConnection(sink, {
+      createAgent: factory,
+      log: NOOP_LOGGER,
+    });
+
+    connection.handleLine(helloLine(PROTOCOL_VERSION + 1));
+    connection.handleLine(aiRequestLine("r1"));
+    await settle();
+
+    expect(types(lines)).toEqual(["ack", "ai_error"]);
+    expect(lines[1]).toContain(`v${String(PROTOCOL_VERSION + 1)}`);
+    expect(lines[1]).toContain(`v${String(PROTOCOL_VERSION)}`);
+
+    // A matching hello on the same connection recovers it (e.g. a corrected
+    // client retrying its handshake).
+    connection.handleLine(HELLO_LINE);
+    connection.handleLine(aiRequestLine("r2"));
+    await settle();
+
+    expect(types(lines)).toEqual([
+      "ack",
+      "ai_error",
+      "ack",
+      "ai_delta",
+      "ai_response_end",
+    ]);
   });
 });
