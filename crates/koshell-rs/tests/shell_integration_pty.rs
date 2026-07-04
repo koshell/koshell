@@ -31,14 +31,22 @@ fn find_shell(candidates: &[&'static str]) -> Option<&'static str> {
         .find(|candidate| Path::new(candidate).exists())
 }
 
-/// Spawns `koshell` in a PTY with the given `SHELL`, an isolated `HOME` (its `rc_name`
-/// pre-populated with `rc_contents`), and no reachable AI daemon; drives `script` into the
-/// interactive shell and returns everything printed back to the PTY.
-fn drive_koshell(shell: &str, rc_name: &str, rc_contents: &str, script: &[u8]) -> String {
-    // Isolated HOME: koshell's generated rc sources the user's rc from HOME, so writing one
-    // here reproduces a specific shell configuration deterministically.
+/// Spawns `koshell` in a PTY with the given `SHELL`, an isolated `HOME` pre-populated
+/// with `files` (HOME-relative paths, parent directories created), and no reachable AI
+/// daemon; drives `script` into the interactive shell and returns everything printed
+/// back to the PTY.
+fn drive_koshell(shell: &str, files: &[(&str, &str)], script: &[u8]) -> String {
+    // Isolated HOME: koshell's generated rc sources the user's rc files from HOME (or a
+    // custom ZDOTDIR under it), so writing them here reproduces a specific shell
+    // configuration deterministically.
     let home = tempfile::tempdir().expect("create temp HOME");
-    std::fs::write(home.path().join(rc_name), rc_contents).expect("write rc");
+    for (name, contents) in files {
+        let path = home.path().join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create rc parent dirs");
+        }
+        std::fs::write(path, contents).expect("write rc");
+    }
     // Empty XDG_RUNTIME_DIR => daemon socket absent => koshell prints its graceful-degrade
     // `[koshell] #?` feedback line, which is what we count.
     let runtime = tempfile::tempdir().expect("create temp XDG_RUNTIME_DIR");
@@ -116,6 +124,18 @@ fn feedback_count(output: &str) -> usize {
     output.matches("[koshell] #?").count()
 }
 
+/// Extracts the value printed after `tag` (e.g. `ZD:`). Terminal escape sequences may
+/// share the line with the value (bracketed-paste toggles), so this matches the tag
+/// anywhere in a line; the echoed `printf` command line itself is skipped because its
+/// text after the tag starts with `%`.
+fn tagged_value<'a>(output: &'a str, tag: &str) -> Option<&'a str> {
+    output.lines().find_map(|line| {
+        let idx = line.find(tag)?;
+        let value = line[idx + tag.len()..].trim_end();
+        (!value.starts_with('%')).then_some(value)
+    })
+}
+
 #[test]
 fn bash_same_question_asked_twice_is_detected_both_times() {
     let Some(bash) = find_shell(&[
@@ -133,8 +153,7 @@ fn bash_same_question_asked_twice_is_detected_both_times() {
     // distinct history entry.
     let output = drive_koshell(
         bash,
-        ".bashrc",
-        "HISTCONTROL=\n",
+        &[(".bashrc", "HISTCONTROL=\n")],
         b"#? explain this output\n#? explain this output\nexit\n",
     );
 
@@ -164,8 +183,7 @@ fn zsh_repeated_question_survives_hist_ignore_dups() {
               SAVEHIST=1000\n";
     let output = drive_koshell(
         zsh,
-        ".zshrc",
-        rc,
+        &[(".zshrc", rc)],
         b"#? explain this output\n#? explain this output\nexit\n",
     );
 
@@ -174,5 +192,116 @@ fn zsh_repeated_question_survives_hist_ignore_dups() {
         hits >= 2,
         "expected the repeated `#?` question to be detected twice under zsh with \
          hist_ignore_dups, saw {hits} feedback line(s).\n--- captured PTY output ---\n{output}"
+    );
+}
+
+#[test]
+fn zsh_custom_zdotdir_config_is_loaded_and_restored() {
+    let Some(zsh) = find_shell(&["/bin/zsh", "/usr/bin/zsh", "/opt/homebrew/bin/zsh"]) else {
+        eprintln!("skipping zsh test: no zsh interpreter found");
+        return;
+    };
+
+    // The common dotfiles layout: ~/.zshenv relocates ZDOTDIR and the real .zshrc lives
+    // there. The integration must source that .zshrc (not $HOME/.zshrc), restore ZDOTDIR
+    // to the user value for the session, and still detect `#?`.
+    let output = drive_koshell(
+        zsh,
+        &[
+            (".zshenv", "export ZDOTDIR=\"$HOME/cfg/zsh\"\n"),
+            (
+                "cfg/zsh/.zshrc",
+                "setopt interactive_comments\necho USER_RC_LOADED\n",
+            ),
+        ],
+        b"printf 'ZD:%s\\n' \"$ZDOTDIR\"\n#? explain this output\nexit\n",
+    );
+
+    assert!(
+        output.contains("USER_RC_LOADED"),
+        "the user's .zshrc under the custom ZDOTDIR was not sourced.\n\
+         --- captured PTY output ---\n{output}"
+    );
+    let zdotdir_value = tagged_value(&output, "ZD:");
+    assert!(
+        zdotdir_value.is_some_and(|value| value.ends_with("cfg/zsh")),
+        "session ZDOTDIR was not restored to the user value (saw {zdotdir_value:?}).\n\
+         --- captured PTY output ---\n{output}"
+    );
+    let hits = feedback_count(&output);
+    assert!(
+        hits >= 1,
+        "expected `#?` to be detected under a custom ZDOTDIR, saw {hits} feedback \
+         line(s).\n--- captured PTY output ---\n{output}"
+    );
+}
+
+#[test]
+fn zsh_does_not_leak_integration_zdotdir_into_the_session() {
+    let Some(zsh) = find_shell(&["/bin/zsh", "/usr/bin/zsh", "/opt/homebrew/bin/zsh"]) else {
+        eprintln!("skipping zsh test: no zsh interpreter found");
+        return;
+    };
+
+    let output = drive_koshell(
+        zsh,
+        &[(".zshrc", "setopt interactive_comments\n")],
+        b"printf 'ZD:%s\\n' \"${ZDOTDIR:-empty}\"\n\
+          printf 'KUZ:%s\\n' \"${KOSHELL_USER_ZDOTDIR:-unset}\"\n\
+          exit\n",
+    );
+
+    // ZDOTDIR must end up as the user's real rc dir (HOME here), never koshell's temp
+    // injection dir, so compdump/history/nested-zsh all land in the real location.
+    let zdotdir_value = tagged_value(&output, "ZD:");
+    assert!(
+        zdotdir_value.is_some_and(|value| !value.contains("koshell-zsh")),
+        "session ZDOTDIR leaked the temp injection dir (saw {zdotdir_value:?}).\n\
+         --- captured PTY output ---\n{output}"
+    );
+    assert_eq!(
+        tagged_value(&output, "KUZ:"),
+        Some("unset"),
+        "KOSHELL_USER_ZDOTDIR was not cleaned out of the session.\n\
+         --- captured PTY output ---\n{output}"
+    );
+}
+
+#[test]
+fn bash_user_debug_trap_keeps_firing_alongside_koshell() {
+    let Some(bash) = find_shell(&[
+        "/opt/homebrew/bin/bash",
+        "/usr/local/bin/bash",
+        "/bin/bash",
+        "/usr/bin/bash",
+    ]) else {
+        eprintln!("skipping bash test: no bash interpreter found");
+        return;
+    };
+
+    // bash allows a single DEBUG trap; the integration must chain a trap installed by
+    // the user rc (the bash-preexec / iTerm2 pattern) instead of clobbering it, while
+    // `#?` detection keeps working.
+    let rc = "HISTCONTROL=\n\
+              __user_debug_hits=0\n\
+              trap '__user_debug_hits=$((__user_debug_hits+1))' DEBUG\n";
+    let output = drive_koshell(
+        bash,
+        &[(".bashrc", rc)],
+        b"echo hi\nprintf 'USERHITS:%s\\n' \"$__user_debug_hits\"\n#? explain this\nexit\n",
+    );
+
+    let user_hits: Option<u64> =
+        tagged_value(&output, "USERHITS:").and_then(|value| value.parse().ok());
+    assert!(
+        user_hits.is_some_and(|hits| hits >= 1),
+        "the user's DEBUG trap stopped firing under koshell (saw {user_hits:?}).\n\
+         --- captured PTY output ---\n{output}"
+    );
+    let hits = feedback_count(&output);
+    assert!(
+        hits >= 1,
+        "expected `#?` to be detected with a chained DEBUG trap, saw {hits} feedback \
+         line(s).\n--- captured PTY output ---\n{output}"
     );
 }

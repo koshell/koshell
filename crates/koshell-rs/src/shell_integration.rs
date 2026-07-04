@@ -9,6 +9,16 @@
 //! accepted line; `command_end` carries the command line and exit code. The precmd
 //! fallback also emits markers for comment-only lines containing `#?`, so a bare
 //! `#? question` works even though the shell runs no command.
+//!
+//! Config fidelity (fix 0002, following VS Code's injection scheme): the zsh temp
+//! `ZDOTDIR` holds three stage files (`.zshenv`, `.zprofile`, `.zshrc`) that delegate to
+//! the user's real files under `$KOSHELL_USER_ZDOTDIR` — honoring a pre-existing custom
+//! `ZDOTDIR`, re-capturing one set by the user's `.zshenv`, sourcing `.zprofile` for
+//! login shells only, and restoring `ZDOTDIR` before the user's `.zshrc` runs so
+//! everything derived from it (compdump, plugin caches, nested zsh, a login shell's
+//! native `.zlogin`) lands in the real location. The bash hooks never clobber a user
+//! `DEBUG` trap: with bash-preexec imported they register through its hook arrays, and
+//! otherwise they chain any existing trap.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -216,7 +226,7 @@ fn create_bash_launch_config(
 ) -> anyhow::Result<ShellLaunchConfig> {
     let temp_dir = tempfile::Builder::new().prefix("koshell-bash-").tempdir()?;
     let rc_file = temp_dir.path().join("bashrc");
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = env.get("HOME").cloned().unwrap_or_default();
     let user_rc = format!("{home}/.bashrc");
 
     let contents = format!(
@@ -249,24 +259,33 @@ fn create_zsh_launch_config(
     mut env: HashMap<String, String>,
 ) -> anyhow::Result<ShellLaunchConfig> {
     let temp_dir = tempfile::Builder::new().prefix("koshell-zsh-").tempdir()?;
-    let zshrc = temp_dir.path().join(".zshrc");
-    let home = std::env::var("HOME").unwrap_or_default();
 
-    let contents = format!(
-        "{zshenv}\n{zprofile}\n{zshrc_src}\n{shared}{zsh_hooks}",
-        zshenv = source_if_readable(&format!("{home}/.zshenv")),
-        zprofile = source_if_readable(&format!("{home}/.zprofile")),
-        zshrc_src = source_if_readable(&format!("{home}/.zshrc")),
+    // The user's real rc directory: a pre-existing custom ZDOTDIR wins over HOME. The
+    // stage files re-capture the value at runtime in case the user's .zshenv moves it.
+    let user_zdotdir = env
+        .get("ZDOTDIR")
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| env.get("HOME"))
+        .cloned()
+        .unwrap_or_default();
+
+    std::fs::write(temp_dir.path().join(".zshenv"), ZSH_STAGE_ZSHENV)?;
+    std::fs::write(temp_dir.path().join(".zprofile"), ZSH_STAGE_ZPROFILE)?;
+    let zshrc_contents = format!(
+        "{prelude}{shared}{zsh_hooks}",
+        prelude = ZSH_STAGE_ZSHRC_PRELUDE,
         shared = shared_shell_functions(),
         zsh_hooks = ZSH_HOOKS,
     );
-    std::fs::write(&zshrc, contents)?;
+    std::fs::write(temp_dir.path().join(".zshrc"), zshrc_contents)?;
 
-    // zsh sources rc files from ZDOTDIR; point it at our temp dir.
+    // zsh sources rc files from ZDOTDIR; point it at our temp dir. The stage .zshrc
+    // restores the user value before the user's own rc runs.
     env.insert(
         "ZDOTDIR".to_string(),
         temp_dir.path().to_string_lossy().to_string(),
     );
+    env.insert("KOSHELL_USER_ZDOTDIR".to_string(), user_zdotdir);
 
     let mut args = vec!["-i".to_string()];
     args.extend_from_slice(extra_args);
@@ -382,12 +401,89 @@ __koshell_prompt_command() {
   __koshell_command_active=""
   __koshell_in_prompt_command=""
 }
-if [ -n "${PROMPT_COMMAND:-}" ]; then
-  PROMPT_COMMAND="__koshell_prompt_command; $PROMPT_COMMAND"
+if [ -n "${bash_preexec_imported:-}${__bp_imported:-}" ]; then
+  # The user rc imported bash-preexec, which owns the DEBUG trap (iTerm2 integration,
+  # atuin, ble.sh, ...). Register through its hook arrays instead of competing for the
+  # trap: it passes the history line (trailing #? comment preserved) to preexec
+  # functions and restores $? for precmd functions.
+  __koshell_bp_preexec() {
+    if [ -z "$__koshell_command_active" ]; then
+      __koshell_command_active=1
+      __koshell_emit_start "$1"
+    fi
+  }
+  preexec_functions+=(__koshell_bp_preexec)
+  precmd_functions+=(__koshell_prompt_command)
 else
-  PROMPT_COMMAND="__koshell_prompt_command"
+  if [ -n "${PROMPT_COMMAND:-}" ]; then
+    PROMPT_COMMAND="__koshell_prompt_command; $PROMPT_COMMAND"
+  else
+    PROMPT_COMMAND="__koshell_prompt_command"
+  fi
+  # Chain any DEBUG trap the user rc installed instead of clobbering it (bash keeps a
+  # single DEBUG trap). The eval-into-array trick preserves the trap body's quoting
+  # even across newlines; term 2 of `trap -- '...' DEBUG` is the body.
+  __koshell_get_debug_trap() {
+    builtin local -a terms
+    builtin eval "terms=( $(trap -p DEBUG) )"
+    builtin printf '%s' "${terms[2]:-}"
+  }
+  __koshell_orig_debug_trap="$(__koshell_get_debug_trap)"
+  if [ -n "$__koshell_orig_debug_trap" ]; then
+    __koshell_chained_debug_trap() {
+      __koshell_debug_trap
+      builtin eval "$__koshell_orig_debug_trap"
+    }
+    trap '__koshell_chained_debug_trap' DEBUG
+  else
+    trap '__koshell_debug_trap' DEBUG
+  fi
 fi
-trap '__koshell_debug_trap' DEBUG
+"#;
+
+/// Stage `.zshenv`: delegate to the user's `.zshenv`, honoring a `ZDOTDIR` the user's
+/// file may itself set (re-captured into `KOSHELL_USER_ZDOTDIR` for the later stages).
+const ZSH_STAGE_ZSHENV: &str = r#"# koshell zsh integration stage file (generated).
+if [ -f "$KOSHELL_USER_ZDOTDIR/.zshenv" ]; then
+  __koshell_stage_zdotdir="$ZDOTDIR"
+  ZDOTDIR="$KOSHELL_USER_ZDOTDIR"
+  if [ "$KOSHELL_USER_ZDOTDIR" != "$__koshell_stage_zdotdir" ]; then
+    . "$KOSHELL_USER_ZDOTDIR/.zshenv"
+  fi
+  KOSHELL_USER_ZDOTDIR="$ZDOTDIR"
+  ZDOTDIR="$__koshell_stage_zdotdir"
+  unset __koshell_stage_zdotdir
+fi
+"#;
+
+/// Stage `.zprofile`: delegate to the user's `.zprofile` for login shells only,
+/// matching zsh's own sourcing rule instead of forcing login config on every session.
+const ZSH_STAGE_ZPROFILE: &str = r#"# koshell zsh integration stage file (generated).
+if [[ -o login ]] && [ -f "$KOSHELL_USER_ZDOTDIR/.zprofile" ]; then
+  __koshell_stage_zdotdir="$ZDOTDIR"
+  ZDOTDIR="$KOSHELL_USER_ZDOTDIR"
+  . "$KOSHELL_USER_ZDOTDIR/.zprofile"
+  ZDOTDIR="$__koshell_stage_zdotdir"
+  unset __koshell_stage_zdotdir
+fi
+"#;
+
+/// Stage `.zshrc` prelude: restore the user's `ZDOTDIR` before their rc runs, so
+/// everything derived from it (compdump, plugin caches, nested zsh, a login shell's
+/// native `.zlogin`) lands in the real location, then source the user's `.zshrc`.
+/// macOS `/etc/zshrc` derives `HISTFILE` from `ZDOTDIR`, which still pointed at the
+/// temp dir when it ran; point it back before the user rc (which may override it).
+const ZSH_STAGE_ZSHRC_PRELUDE: &str = r#"# koshell zsh integration stage file (generated).
+__koshell_stage_zdotdir="$ZDOTDIR"
+ZDOTDIR="$KOSHELL_USER_ZDOTDIR"
+if [ "$HISTFILE" = "$__koshell_stage_zdotdir/.zsh_history" ]; then
+  HISTFILE="$ZDOTDIR/.zsh_history"
+fi
+unset __koshell_stage_zdotdir
+if [ -f "$ZDOTDIR/.zshrc" ]; then
+  . "$ZDOTDIR/.zshrc"
+fi
+unset KOSHELL_USER_ZDOTDIR
 "#;
 
 const ZSH_HOOKS: &str = r#"autoload -Uz add-zsh-hook
@@ -566,5 +662,78 @@ mod tests {
         let config = create_shell_launch_config("/bin/zsh", &args, HashMap::new()).unwrap();
         assert_eq!(config.kind, Some(ShellIntegrationKind::Zsh));
         assert_eq!(config.args, ["-i", "-l"]);
+    }
+
+    #[test]
+    fn zsh_integration_preserves_custom_zdotdir_and_writes_stage_files() {
+        let mut env = HashMap::new();
+        env.insert("HOME".to_string(), "/home/user".to_string());
+        env.insert("ZDOTDIR".to_string(), "/home/user/cfg/zsh".to_string());
+        let config = create_shell_launch_config("/bin/zsh", &[], env).unwrap();
+
+        assert_eq!(
+            config.env.get("KOSHELL_USER_ZDOTDIR").map(String::as_str),
+            Some("/home/user/cfg/zsh")
+        );
+        let zdotdir = config.env.get("ZDOTDIR").expect("ZDOTDIR set");
+        assert_ne!(zdotdir, "/home/user/cfg/zsh");
+        for stage in [".zshenv", ".zprofile", ".zshrc"] {
+            assert!(
+                Path::new(zdotdir).join(stage).is_file(),
+                "missing stage file {stage}"
+            );
+        }
+    }
+
+    #[test]
+    fn zsh_integration_falls_back_to_home_for_user_zdotdir() {
+        let mut env = HashMap::new();
+        env.insert("HOME".to_string(), "/home/user".to_string());
+        let config = create_shell_launch_config("/bin/zsh", &[], env).unwrap();
+        assert_eq!(
+            config.env.get("KOSHELL_USER_ZDOTDIR").map(String::as_str),
+            Some("/home/user")
+        );
+    }
+
+    /// Syntax-checks a generated rc file with `interpreter -n`; skips when the
+    /// interpreter is not installed.
+    fn assert_rc_parses(candidates: &[&str], rc_path: &Path) {
+        let Some(interpreter) = candidates.iter().find(|c| Path::new(c).exists()) else {
+            eprintln!("skipping syntax check: none of {candidates:?} found");
+            return;
+        };
+        let status = std::process::Command::new(interpreter)
+            .arg("-n")
+            .arg(rc_path)
+            .status()
+            .expect("run syntax check");
+        assert!(status.success(), "{interpreter} -n rejected {rc_path:?}");
+    }
+
+    #[test]
+    fn generated_zsh_stage_files_are_valid_zsh() {
+        let mut env = HashMap::new();
+        env.insert("HOME".to_string(), "/home/user".to_string());
+        let config = create_shell_launch_config("/bin/zsh", &[], env).unwrap();
+        let zdotdir = config.env.get("ZDOTDIR").expect("ZDOTDIR set");
+        for stage in [".zshenv", ".zprofile", ".zshrc"] {
+            assert_rc_parses(
+                &["/bin/zsh", "/usr/bin/zsh", "/opt/homebrew/bin/zsh"],
+                &Path::new(zdotdir).join(stage),
+            );
+        }
+    }
+
+    #[test]
+    fn generated_bash_rc_is_valid_bash() {
+        let mut env = HashMap::new();
+        env.insert("HOME".to_string(), "/home/user".to_string());
+        let config = create_shell_launch_config("/bin/bash", &[], env).unwrap();
+        let rc_path = &config.args[1];
+        assert_rc_parses(
+            &["/bin/bash", "/usr/bin/bash", "/opt/homebrew/bin/bash"],
+            Path::new(rc_path),
+        );
     }
 }
