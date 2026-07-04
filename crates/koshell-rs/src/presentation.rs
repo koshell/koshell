@@ -16,6 +16,23 @@
 //!   accumulate and the whole response is inserted as one block when it completes.
 //!   Quiescence-gap insertion and its max-wait are deferred to dogfooding.
 //!
+//! Two line-position rules keep the chrome tight:
+//! - Presentation lines start with a leading newline only when the cursor is not
+//!   already resting at the start of an empty line, so the `#?` line is followed
+//!   directly by koshell output instead of a blank line.
+//! - When stabilization fired with an already-rendered prompt under the cursor (the
+//!   REPL case — stabilization by definition waits for the prompt to settle, so the
+//!   prompt cannot be buffered like the shell-integrated path), the response runs in
+//!   **anchored streaming** (design 0005): the cursor's live input line stays usable
+//!   and PTY output writes through in real time, while each delta is inserted into
+//!   the free zone directly above it — erase the live region, continue the AI text
+//!   where it left off (position and pending-wrap resumed from the mirror), then
+//!   rewrite the live region below, styling and cursor column intact. A pre-redraw
+//!   invariant check (the row above the live region must still be the AI tail)
+//!   detects intervening program output — a mid-stream command's result, a screen
+//!   clear — and degrades the rest of the response to one block at the end, so
+//!   program output and AI text never interleave line-by-line.
+//!
 //! The AI output style (a dim `[koshell ai]` header) is a placeholder; design 0002
 //! leaves the final prefix/style open.
 
@@ -25,6 +42,7 @@ use std::time::{Duration, Instant};
 
 use koshell_proto::ServerMessage;
 
+use crate::mirror::LiveRegionSnapshot;
 use crate::trigger::SessionState;
 
 /// Buffered-PTY fuse: past this, buffering gives up and output interleaves, so a
@@ -41,7 +59,11 @@ const RECEIPT_NOTICE_DELAY: Duration = Duration::from_secs(1);
 /// can never freeze the terminal. Tunable during dogfooding.
 const RESPONSE_MAX_HOLD: Duration = Duration::from_secs(30);
 
-const AI_HEADER: &str = "\r\n\x1b[2m[koshell ai]\x1b[0m\r\n";
+const AI_HEADER: &str = "\x1b[2m[koshell ai]\x1b[0m\r\n";
+
+/// Erases the cursor's row (used to lift the live input line out of the way before
+/// inserting presentation content above it).
+const ERASE_LINE: &[u8] = b"\r\x1b[K";
 
 /// How an in-flight response is rendered, decided by the trigger's completion state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +72,21 @@ enum Mode {
     Stream,
     /// Command still running: PTY flows, accumulate deltas, insert one block at end.
     Block,
+}
+
+/// The AI text's resume point for anchored streaming, sampled from the mirror after
+/// each delta (the mirror cursor is the real cursor, so this is exact — no local
+/// width bookkeeping, CJK safe).
+#[derive(Debug)]
+struct AiEnd {
+    /// Cursor column at the end of the AI text.
+    col: u16,
+    /// Terminal pending-wrap state at the end of the AI text: the line is exactly
+    /// full and must be resumed without cursor movement (movement clears the
+    /// pending wrap and would overwrite the last column).
+    needs_wrap: bool,
+    /// Plain text of the AI tail row, for the pre-redraw invariant check.
+    tail: String,
 }
 
 #[derive(Debug)]
@@ -66,10 +103,18 @@ struct ActiveResponse {
     last_was_cr: bool,
     /// Block mode: accumulated response text.
     accumulated: String,
-    /// Stream mode: PTY visible bytes held back while the response is in flight.
+    /// Non-anchored stream mode: PTY visible bytes held back while the response is
+    /// in flight.
     buffered_pty: Vec<u8>,
-    /// Stream mode: the fuse blew or the max hold expired; stop buffering.
+    /// Non-anchored stream mode: the fuse blew or the max hold expired; stop
+    /// buffering.
     interleaved: bool,
+    /// Anchored streaming (design 0005): the response was dispatched onto an
+    /// already-rendered prompt, so deltas insert above the live input line and PTY
+    /// output writes through in real time (never buffered).
+    anchored: bool,
+    /// Anchored streaming: the AI resume point; `None` until the first delta.
+    ai_end: Option<AiEnd>,
 }
 
 impl ActiveResponse {
@@ -84,6 +129,8 @@ impl ActiveResponse {
             accumulated: String::new(),
             buffered_pty: Vec::new(),
             interleaved: false,
+            anchored: false,
+            ai_end: None,
         }
     }
 
@@ -92,9 +139,10 @@ impl ActiveResponse {
         !self.started && self.accumulated.is_empty()
     }
 
-    /// True while stream-mode buffering is holding PTY output.
+    /// True while stream-mode buffering is holding PTY output. Anchored streaming
+    /// never buffers: the live input line stays usable in real time.
     fn holding_pty(&self) -> bool {
-        self.mode == Mode::Stream && !self.interleaved
+        self.mode == Mode::Stream && !self.interleaved && !self.anchored
     }
 }
 
@@ -122,12 +170,149 @@ fn normalize_newlines(text: &str, last_was_cr: &mut bool) -> Vec<u8> {
     out
 }
 
+/// The prefix that puts presentation output at the start of a line: empty when the
+/// cursor already rests at the start of an empty line, a newline otherwise — so a
+/// `#?` line is followed directly by koshell output instead of a blank line.
+fn line_prefix(state: &SessionState) -> &'static str {
+    if state.at_line_start() { "" } else { "\r\n" }
+}
+
 /// Prints a dim one-line presentation notice, mirror-fed like all output.
-fn notice<W: Write>(text: &str, out: &mut W, state: &mut SessionState) {
-    let bytes = format!("\r\n\x1b[2m[koshell] {text}\x1b[0m\r\n");
+pub(crate) fn notice<W: Write>(text: &str, out: &mut W, state: &mut SessionState) {
+    let bytes = format!("{}\x1b[2m[koshell] {text}\x1b[0m\r\n", line_prefix(state));
     let _ = out.write_all(bytes.as_bytes());
     let _ = out.flush();
     state.record_presentation_output(bytes.as_bytes());
+}
+
+/// Appends the erase sequence for a live region: bottom-up from the cursor row to
+/// the region's top row, ending at column 0 of the top row.
+fn erase_region(bytes: &mut Vec<u8>, region: &LiveRegionSnapshot) {
+    bytes.extend_from_slice(ERASE_LINE);
+    for _ in 1..region.styled_rows.len() {
+        bytes.extend_from_slice(b"\x1b[A\x1b[K");
+    }
+}
+
+/// Appends the live region's rows (styled, joined so soft wrapping reproduces
+/// itself) plus the spaces that put the cursor back on its live column. The caller
+/// must have the cursor at column 0 of the row where the region should start.
+fn restore_region(bytes: &mut Vec<u8>, region: &LiveRegionSnapshot) {
+    for row in &region.styled_rows {
+        bytes.extend_from_slice(row.as_bytes());
+    }
+    let padding = (region.cursor_col as usize).saturating_sub(region.last_row_chars);
+    bytes.extend_from_slice(" ".repeat(padding).as_bytes());
+}
+
+/// Inserts presentation content (one or more complete lines, `\r\n`-terminated)
+/// directly above the cursor's live input line, restoring the line — echoed input,
+/// styling, soft wrapping, cursor column — below it. Returns `false` without
+/// writing when the live region cannot be sampled (alternate screen, cursor
+/// mid-logical-line); the caller falls back to a plain notice.
+fn insert_above_live<W: Write>(lines: &[u8], out: &mut W, state: &mut SessionState) -> bool {
+    let Some(region) = state.live_region() else {
+        return false;
+    };
+    let mut bytes = Vec::with_capacity(lines.len() + 64);
+    erase_region(&mut bytes, &region);
+    bytes.extend_from_slice(lines);
+    restore_region(&mut bytes, &region);
+    let _ = out.write_all(&bytes);
+    let _ = out.flush();
+    state.record_presentation_output(&bytes);
+    true
+}
+
+/// Renders one anchored-streaming delta: erase the live input line, resume the AI
+/// text exactly where it left off in the free zone above, then rewrite the live
+/// line below it — echoed input, styling, soft wrapping, and cursor column intact.
+///
+/// Before redrawing, the row directly above the live region must still be the AI
+/// tail. When it is not (a mid-stream command printed its result, the screen was
+/// cleared) or the live region cannot be sampled, the rest of the response degrades
+/// to block mode — one seam at the end, never line-level interleaving with program
+/// output.
+fn anchored_delta<W: Write>(
+    active: &mut ActiveResponse,
+    delta: &str,
+    out: &mut W,
+    state: &mut SessionState,
+) {
+    let region = match state.live_region() {
+        Some(region) => region,
+        None => return degrade_to_block(active, delta),
+    };
+    if let Some(ai_end) = &active.ai_end
+        && region.row_above.as_deref() != Some(ai_end.tail.as_str())
+    {
+        return degrade_to_block(active, delta);
+    }
+
+    // Phase 1: lift the live region and resume the AI text.
+    let mut bytes = Vec::with_capacity(delta.len() + 64);
+    erase_region(&mut bytes, &region);
+    match &active.ai_end {
+        // First delta: the header takes the erased top row; the AI text starts on
+        // the line below it.
+        None => bytes.extend_from_slice(AI_HEADER.as_bytes()),
+        // The AI line is exactly full: the erased row below it is its natural wrap
+        // continuation, and any cursor movement would clear the pending state.
+        Some(ai_end) if ai_end.needs_wrap => {}
+        Some(ai_end) => {
+            bytes.extend_from_slice(format!("\x1b[A\x1b[{}G", ai_end.col + 1).as_bytes());
+        }
+    }
+    active.started = true;
+    bytes.extend(normalize_newlines(delta, &mut active.last_was_cr));
+    let _ = out.write_all(&bytes);
+    state.record_presentation_output(&bytes);
+
+    // The mirror consumed the same bytes, so its cursor is the exact resume point.
+    let (col, needs_wrap, tail) = state.cursor_probe();
+    active.ai_end = Some(AiEnd {
+        col,
+        needs_wrap,
+        tail,
+    });
+
+    // Phase 2: put the live region back below the AI text.
+    let mut bytes = Vec::with_capacity(64);
+    bytes.extend_from_slice(b"\r\n");
+    restore_region(&mut bytes, &region);
+    let _ = out.write_all(&bytes);
+    let _ = out.flush();
+    state.record_presentation_output(&bytes);
+}
+
+/// Switches the rest of an anchored response to block accumulation (the already
+/// streamed part stays in the free zone; the remainder is inserted as one block at
+/// response end).
+fn degrade_to_block(active: &mut ActiveResponse, delta: &str) {
+    active.mode = Mode::Block;
+    active.anchored = false;
+    active.accumulated.push_str(delta);
+}
+
+/// Prints a notice inserted above the live input line (echoed input and cursor
+/// restored below it), falling back to a plain notice when the live region cannot
+/// be sampled.
+fn notice_above_live<W: Write>(text: &str, out: &mut W, state: &mut SessionState) {
+    let line = format!("\x1b[2m[koshell] {text}\x1b[0m\r\n");
+    if !insert_above_live(line.as_bytes(), out, state) {
+        notice(text, out, state);
+    }
+}
+
+/// Prints a notice keeping the live input line as the last line: when the cursor
+/// rests on a prompt-shaped line, the notice is inserted above the live region, so
+/// the program's input line stays where the user expects it.
+pub(crate) fn notice_before_prompt<W: Write>(text: &str, out: &mut W, state: &mut SessionState) {
+    if state.resting_prompt() {
+        notice_above_live(text, out, state);
+    } else {
+        notice(text, out, state);
+    }
 }
 
 impl Presentation {
@@ -140,9 +325,16 @@ impl Presentation {
 
     /// Records a `#?` request handed to the daemon and the bounded-side decision made
     /// at fire time (whether the triggering command was still running). For a command
-    /// that ended, PTY buffering starts here — before the first delta — so the
-    /// returning prompt is already held while the daemon thinks.
-    pub fn note_dispatch(&mut self, request_id: &str, still_running: bool, now: Instant) {
+    /// that ended without a rendered prompt, PTY buffering starts here — before the
+    /// first delta — so the returning prompt is already held while the daemon
+    /// thinks; with a rendered prompt the response runs anchored instead.
+    pub fn note_dispatch(
+        &mut self,
+        request_id: &str,
+        still_running: bool,
+        state: &SessionState,
+        now: Instant,
+    ) {
         self.dispatched
             .insert(request_id.to_string(), still_running);
         if self.active.is_none() {
@@ -151,8 +343,19 @@ impl Presentation {
             } else {
                 Mode::Stream
             };
-            self.active = Some(ActiveResponse::new(request_id.to_string(), mode, now));
+            self.begin_response(request_id, mode, state, now);
         }
+    }
+
+    /// Creates the active response. In stream mode, when the cursor rests on an
+    /// already-rendered prompt (the stabilization path fires only after the prompt
+    /// settles, so it cannot be buffered like the shell-integrated path), the
+    /// response runs anchored: deltas insert above the live input line, which stays
+    /// fully usable in the meantime. Nothing is written at dispatch time.
+    fn begin_response(&mut self, request_id: &str, mode: Mode, state: &SessionState, now: Instant) {
+        let mut active = ActiveResponse::new(request_id.to_string(), mode, now);
+        active.anchored = mode == Mode::Stream && state.resting_prompt();
+        self.active = Some(active);
     }
 
     /// Routes PTY visible output: buffered while a stream-mode response is in flight
@@ -208,7 +411,12 @@ impl Presentation {
             && now >= active.dispatched_at + RECEIPT_NOTICE_DELAY
         {
             active.receipt_shown = true;
-            notice("waiting for the AI answer…", out, state);
+            if active.anchored {
+                // The live input line stays the last line; the notice goes above it.
+                notice_above_live("waiting for the AI answer…", out, state);
+            } else {
+                notice("waiting for the AI answer…", out, state);
+            }
         }
         if active.holding_pty() && now >= active.dispatched_at + RESPONSE_MAX_HOLD {
             active.interleaved = true;
@@ -273,15 +481,17 @@ impl Presentation {
                 Some(false) => Mode::Stream,
                 _ => Mode::Block,
             };
-            self.active = Some(ActiveResponse::new(request_id.to_string(), mode, now));
+            self.begin_response(request_id, mode, state, now);
         }
         let active = self.active.as_mut().expect("active response just ensured");
         match active.mode {
+            Mode::Stream if active.anchored => anchored_delta(active, delta, out, state),
             Mode::Stream => {
                 if !active.started {
                     active.started = true;
-                    let _ = out.write_all(AI_HEADER.as_bytes());
-                    state.record_presentation_output(AI_HEADER.as_bytes());
+                    let header = format!("{}{AI_HEADER}", line_prefix(state));
+                    let _ = out.write_all(header.as_bytes());
+                    state.record_presentation_output(header.as_bytes());
                 }
                 let bytes = normalize_newlines(delta, &mut active.last_was_cr);
                 let _ = out.write_all(&bytes);
@@ -313,6 +523,13 @@ impl Presentation {
         };
 
         match active.mode {
+            Mode::Stream if active.anchored => {
+                // The screen is already in its final shape: AI text in the free
+                // zone, the live input line last. Only a failure needs ink.
+                if let Some(message) = error {
+                    notice_above_live(&format!("AI error: {message}"), out, state);
+                }
+            }
             Mode::Stream => {
                 if active.started {
                     let tail = b"\r\n";
@@ -334,12 +551,19 @@ impl Presentation {
                     let mut block = AI_HEADER.as_bytes().to_vec();
                     block.extend(normalize_newlines(&active.accumulated, &mut last_was_cr));
                     block.extend_from_slice(b"\r\n");
-                    let _ = out.write_all(&block);
-                    let _ = out.flush();
-                    state.record_presentation_output(&block);
+                    // With a prompt-shaped live line resting under the cursor, the
+                    // block is inserted above it instead of consuming it.
+                    let inserted = state.resting_prompt() && insert_above_live(&block, out, state);
+                    if !inserted {
+                        let mut placed = line_prefix(state).as_bytes().to_vec();
+                        placed.extend_from_slice(&block);
+                        let _ = out.write_all(&placed);
+                        let _ = out.flush();
+                        state.record_presentation_output(&placed);
+                    }
                 }
                 if let Some(message) = error {
-                    notice(&format!("AI error: {message}"), out, state);
+                    notice_before_prompt(&format!("AI error: {message}"), out, state);
                 }
             }
         }
@@ -355,9 +579,23 @@ impl Default for Presentation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mirror::TerminalMirror;
+    use crate::shell_integration::{MarkerKind, ShellIntegrationMarker};
 
     fn state() -> SessionState {
         SessionState::new(80, 24, true)
+    }
+
+    /// Replays what the user's terminal received — the setup PTY bytes, then
+    /// everything presentation wrote — and returns the resulting screen text plus
+    /// the cursor column. The strongest assertion available: it checks the final
+    /// picture, not the byte choreography.
+    fn replay_screen(columns: u16, setup: &[u8], out: &[u8]) -> (String, u16) {
+        let mut mirror = TerminalMirror::new(columns, 24);
+        mirror.write(setup);
+        mirror.write(out);
+        let snapshot = mirror.snapshot();
+        (snapshot.screen, snapshot.cursor_x)
     }
 
     fn delta(request_id: &str, text: &str) -> ServerMessage {
@@ -373,6 +611,9 @@ mod tests {
         }
     }
 
+    // Koshell's own chrome must stay safe for legacy/no-color terminals. A reprinted
+    // prompt is exempt: it replays styling the program itself just rendered on this
+    // terminal, so the terminal supports those sequences by construction.
     fn assert_no_rich_terminal_sequences(output: &[u8]) {
         let text = String::from_utf8_lossy(output);
         for sequence in [
@@ -402,7 +643,7 @@ mod tests {
         let now = Instant::now();
 
         // The returning prompt arrives before the first delta and must be held.
-        presentation.note_dispatch("r1", false, now);
+        presentation.note_dispatch("r1", false, &state, now);
         presentation.pty_output(b"$ ", &mut out, &mut state, now);
         assert!(out.is_empty(), "prompt must be held from dispatch time");
 
@@ -434,7 +675,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let now = Instant::now();
 
-        presentation.note_dispatch("r1", true, now);
+        presentation.note_dispatch("r1", true, &state, now);
         presentation.handle_server_message(&delta("r1", "Still "), &mut out, &mut state, now);
         presentation.pty_output(b"build output\r\n", &mut out, &mut state, now);
         let during = String::from_utf8_lossy(&out).to_string();
@@ -458,7 +699,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let now = Instant::now();
 
-        presentation.note_dispatch("r1", false, now);
+        presentation.note_dispatch("r1", false, &state, now);
         presentation.handle_server_message(&delta("r1", "line one\n"), &mut out, &mut state, now);
         presentation.handle_server_message(&delta("r1", "line two\r"), &mut out, &mut state, now);
         presentation.handle_server_message(&delta("r1", "\nline three"), &mut out, &mut state, now);
@@ -479,7 +720,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let now = Instant::now();
 
-        presentation.note_dispatch("r1", false, now);
+        presentation.note_dispatch("r1", false, &state, now);
         presentation.handle_server_message(&delta("r1", "answer"), &mut out, &mut state, now);
 
         let big = vec![b'x'; PTY_BUFFER_FUSE_BYTES + 1];
@@ -506,7 +747,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let now = Instant::now();
 
-        presentation.note_dispatch("r1", false, now);
+        presentation.note_dispatch("r1", false, &state, now);
         assert!(presentation.next_deadline(now).is_some());
 
         presentation.poll(now, &mut out, &mut state);
@@ -529,7 +770,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let now = Instant::now();
 
-        presentation.note_dispatch("r1", false, now);
+        presentation.note_dispatch("r1", false, &state, now);
         presentation.handle_server_message(&delta("r1", "quick"), &mut out, &mut state, now);
         let len = out.len();
         let later = now + RECEIPT_NOTICE_DELAY + Duration::from_millis(10);
@@ -544,7 +785,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let now = Instant::now();
 
-        presentation.note_dispatch("r1", false, now);
+        presentation.note_dispatch("r1", false, &state, now);
         presentation.pty_output(b"$ ", &mut out, &mut state, now);
         assert!(out.is_empty());
 
@@ -567,7 +808,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let now = Instant::now();
 
-        presentation.note_dispatch("r1", false, now);
+        presentation.note_dispatch("r1", false, &state, now);
         presentation.handle_server_message(&delta("r1", "partial"), &mut out, &mut state, now);
         presentation.pty_output(b"$ ", &mut out, &mut state, now);
         presentation.handle_server_message(
@@ -596,7 +837,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let now = Instant::now();
 
-        presentation.note_dispatch("r1", false, now);
+        presentation.note_dispatch("r1", false, &state, now);
         presentation.pty_output(b"$ ", &mut out, &mut state, now);
         presentation.handle_server_message(
             &ServerMessage::AiError {
@@ -619,7 +860,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let now = Instant::now();
 
-        presentation.note_dispatch("stream", false, now);
+        presentation.note_dispatch("stream", false, &state, now);
         presentation.handle_server_message(
             &delta("stream", "streamed answer"),
             &mut out,
@@ -636,7 +877,7 @@ mod tests {
             now,
         );
 
-        presentation.note_dispatch("wait", false, now);
+        presentation.note_dispatch("wait", false, &state, now);
         presentation.poll(
             now + RECEIPT_NOTICE_DELAY + Duration::from_millis(10),
             &mut out,
@@ -649,7 +890,7 @@ mod tests {
         );
         presentation.handle_server_message(&end("wait"), &mut out, &mut state, now);
 
-        presentation.note_dispatch("block", true, now);
+        presentation.note_dispatch("block", true, &state, now);
         presentation.handle_server_message(
             &delta("block", "block answer"),
             &mut out,
@@ -664,6 +905,309 @@ mod tests {
         assert!(text.contains("waiting for the AI answer"));
         assert!(text.contains("block answer"));
         assert_no_rich_terminal_sequences(&out);
+    }
+
+    #[test]
+    fn presentation_lines_skip_the_leading_blank_at_line_start() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        // The Enter echo left the cursor at the start of an empty line (the returning
+        // prompt is buffered), so the notice starts right there — no blank line.
+        state.record_output(b"% #? question\r\n", now);
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.poll(
+            now + RECEIPT_NOTICE_DELAY + Duration::from_millis(10),
+            &mut out,
+            &mut state,
+        );
+        assert!(
+            out.starts_with(b"\x1b[2m[koshell] waiting"),
+            "no leading blank line at line start: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+
+        // The header follows the notice directly, again without a blank line.
+        presentation.handle_server_message(&delta("r1", "answer"), &mut out, &mut state, now);
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(!text.contains("\r\n\r\n"), "no blank lines: {text:?}");
+    }
+
+    #[test]
+    fn presentation_lines_keep_the_newline_when_mid_line() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        // The cursor rests mid-line on non-prompt output; the notice must move to a
+        // fresh line first.
+        state.record_output(b"downloading", now);
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.poll(
+            now + RECEIPT_NOTICE_DELAY + Duration::from_millis(10),
+            &mut out,
+            &mut state,
+        );
+        assert!(
+            out.starts_with(b"\r\n\x1b[2m[koshell] waiting"),
+            "mid-line output needs the leading newline: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[test]
+    fn anchored_stream_inserts_deltas_above_the_live_prompt() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        // The REPL case: stabilization fired only after the prompt rendered.
+        let setup = b"2\r\n>>> ";
+        state.record_output(setup, now);
+        presentation.note_dispatch("r1", false, &state, now);
+        assert!(
+            out.is_empty(),
+            "dispatch writes nothing; the prompt stays live"
+        );
+
+        presentation.handle_server_message(
+            &delta("r1", "The answer is"),
+            &mut out,
+            &mut state,
+            now,
+        );
+        let (mid, col) = replay_screen(80, setup, &out);
+        assert_eq!(mid, "2\n[koshell ai]\nThe answer is\n>>>");
+        assert_eq!(col, 4, "cursor parked at the live prompt column");
+
+        presentation.handle_server_message(
+            &delta("r1", " two.\nSecond"),
+            &mut out,
+            &mut state,
+            now,
+        );
+        presentation.handle_server_message(&end("r1"), &mut out, &mut state, now);
+        let (screen, col) = replay_screen(80, setup, &out);
+        assert_eq!(screen, "2\n[koshell ai]\nThe answer is two.\nSecond\n>>>");
+        assert_eq!(col, 4);
+    }
+
+    #[test]
+    fn anchored_stream_keeps_typed_input_live_across_redraws() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        let setup = b">>> ";
+        state.record_output(setup, now);
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.handle_server_message(&delta("r1", "Thinking"), &mut out, &mut state, now);
+
+        // The user types mid-stream: the echo shows immediately (never buffered).
+        presentation.pty_output(b"1+1", &mut out, &mut state, now);
+        let (mid, col) = replay_screen(80, setup, &out);
+        assert_eq!(mid, "[koshell ai]\nThinking\n>>> 1+1");
+        assert_eq!(col, 7);
+
+        // The next delta redraw preserves the typed input and cursor column.
+        presentation.handle_server_message(&delta("r1", " done"), &mut out, &mut state, now);
+        presentation.handle_server_message(&end("r1"), &mut out, &mut state, now);
+        let (screen, col) = replay_screen(80, setup, &out);
+        assert_eq!(screen, "[koshell ai]\nThinking done\n>>> 1+1");
+        assert_eq!(col, 7);
+    }
+
+    #[test]
+    fn anchored_stream_resumes_an_exactly_full_ai_line_without_loss() {
+        let mut presentation = Presentation::new();
+        let mut state = SessionState::new(20, 24, true);
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        let setup = b">>> ";
+        state.record_output(setup, now);
+        presentation.note_dispatch("r1", false, &state, now);
+        // Exactly the terminal width: the AI line ends in the pending-wrap state.
+        presentation.handle_server_message(
+            &delta("r1", &"a".repeat(20)),
+            &mut out,
+            &mut state,
+            now,
+        );
+        presentation.handle_server_message(&delta("r1", "bbb"), &mut out, &mut state, now);
+        presentation.handle_server_message(&end("r1"), &mut out, &mut state, now);
+
+        let (screen, _) = replay_screen(20, setup, &out);
+        assert_eq!(
+            screen,
+            format!("[koshell ai]\n{}\nbbb\n>>>", "a".repeat(20)),
+            "the wrap continuation resumes without losing or shifting characters"
+        );
+    }
+
+    #[test]
+    fn anchored_stream_restores_a_soft_wrapped_live_line() {
+        let mut presentation = Presentation::new();
+        let mut state = SessionState::new(20, 24, true);
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        let setup = b">>> ";
+        state.record_output(setup, now);
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.handle_server_message(&delta("r1", "Answer"), &mut out, &mut state, now);
+
+        // Typed input long enough to wrap the live line onto a second row.
+        presentation.pty_output(
+            &[b"x".repeat(20).as_slice()].concat(),
+            &mut out,
+            &mut state,
+            now,
+        );
+        presentation.handle_server_message(&delta("r1", " more"), &mut out, &mut state, now);
+        presentation.handle_server_message(&end("r1"), &mut out, &mut state, now);
+
+        let (screen, col) = replay_screen(20, setup, &out);
+        assert_eq!(
+            screen,
+            format!(
+                "[koshell ai]\nAnswer more\n>>> {}\n{}",
+                "x".repeat(16),
+                "x".repeat(4)
+            ),
+            "both rows of the wrapped live line survive the redraw"
+        );
+        assert_eq!(col, 4);
+    }
+
+    #[test]
+    fn intervening_program_output_degrades_to_one_block() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        let setup = b">>> ";
+        state.record_output(setup, now);
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.handle_server_message(&delta("r1", "Part one."), &mut out, &mut state, now);
+
+        // A mid-stream command executed: its output breaks the free-zone adjacency.
+        presentation.pty_output(b"\r\n2\r\n>>> ", &mut out, &mut state, now);
+        presentation.handle_server_message(&delta("r1", "Part two."), &mut out, &mut state, now);
+        presentation.handle_server_message(&end("r1"), &mut out, &mut state, now);
+
+        let (screen, col) = replay_screen(80, setup, &out);
+        assert_eq!(
+            screen, "[koshell ai]\nPart one.\n>>>\n2\n[koshell ai]\nPart two.\n>>>",
+            "the remainder arrives as one block above the new prompt, never interleaved"
+        );
+        assert_eq!(col, 4);
+    }
+
+    #[test]
+    fn anchored_error_keeps_the_live_line_last() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        let setup = b">>> ";
+        state.record_output(setup, now);
+        presentation.note_dispatch("r1", false, &state, now);
+        // Typed-ahead input echoes live while the response is in flight.
+        presentation.pty_output(b"x", &mut out, &mut state, now);
+        presentation.handle_server_message(
+            &ServerMessage::AiError {
+                request_id: "r1".to_string(),
+                message: "provider exploded".to_string(),
+            },
+            &mut out,
+            &mut state,
+            now,
+        );
+        let (screen, col) = replay_screen(80, setup, &out);
+        assert_eq!(screen, "[koshell] AI error: provider exploded\n>>> x");
+        assert_eq!(col, 5);
+    }
+
+    #[test]
+    fn anchored_waiting_notice_inserts_above_the_live_prompt() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        let setup = b">>> ";
+        state.record_output(setup, now);
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.poll(
+            now + RECEIPT_NOTICE_DELAY + Duration::from_millis(10),
+            &mut out,
+            &mut state,
+        );
+        let (screen, col) = replay_screen(80, setup, &out);
+        assert_eq!(screen, "[koshell] waiting for the AI answer…\n>>>");
+        assert_eq!(col, 4, "the prompt stays the last line, cursor on it");
+    }
+
+    #[test]
+    fn interjected_question_mid_stream_is_captured_and_queued() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        // Inside a REPL command span, as in real use.
+        state.handle_marker(
+            ShellIntegrationMarker {
+                kind: MarkerKind::CommandStart,
+                command: Some("python3".to_string()),
+                exit_code: None,
+            },
+            now,
+        );
+        state.record_output(b">>> ", now);
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.handle_server_message(&delta("r1", "Thinking"), &mut out, &mut state, now);
+
+        // The user interjects: the echo reaches the mirror live, so the ordinary
+        // Enter capture sees the line and queues the question.
+        presentation.pty_output(b"1+1 #? why", &mut out, &mut state, now);
+        state.record_input(b"\r", now);
+        assert!(state.esc_cancellable(), "the interjection is pending");
+
+        let actions = state.poll(now + Duration::from_millis(600));
+        let questions: Vec<&str> = actions
+            .iter()
+            .filter_map(|action| match action {
+                crate::trigger::Action::Fire(trigger) => Some(trigger.question.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(questions, vec!["why"], "queued question fires normally");
+    }
+
+    #[test]
+    fn notice_before_prompt_keeps_the_prompt_as_the_last_line() {
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        state.record_output(b">>> ", now);
+        notice_before_prompt("#? cancelled: why", &mut out, &mut state);
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(
+            text.starts_with("\r\x1b[K"),
+            "prompt line erased first: {text:?}"
+        );
+        assert!(text.contains("[koshell] #? cancelled: why"));
+        assert!(text.ends_with(">>> "), "prompt reprinted below: {text:?}");
     }
 
     #[test]

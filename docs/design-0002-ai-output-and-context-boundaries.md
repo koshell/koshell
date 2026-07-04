@@ -14,7 +14,10 @@ rendered shortly after dispatch; still running → the response accumulates and 
 as one block at response end, without quiescence-gap detection or its max-wait.
 Still open: the pull-side tool catalog and inventory (push-only for now), the final AI
 output style (a dim `[koshell ai]` header is the placeholder), gap insertion, and the
-pushed-package size budgets.
+pushed-package size budgets. Presentation line positioning and anchored streaming for
+the stabilization path (where the prompt renders before the response can be presented,
+so the answer is inserted above the live input line while the terminal stays usable)
+are refined in `design-0005-presentation-line-position-and-prompt-redraw.md`.
 
 ## Context
 

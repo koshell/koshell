@@ -541,6 +541,38 @@ impl SessionState {
         }
     }
 
+    /// True when the mirror cursor rests at column 0 of an empty row, so presentation
+    /// output can start on the current line without a leading blank line.
+    pub fn at_line_start(&self) -> bool {
+        let (text, cursor_x) = self.mirror.cursor_row();
+        cursor_x == 0 && text.is_empty()
+    }
+
+    /// True when the cursor rests on a prompt-shaped line outside the alternate
+    /// screen. Presentation uses this as the gate for anchored streaming and for
+    /// notices that keep the prompt as the last line: stabilization fires only
+    /// after the prompt has rendered, so the prompt cannot be buffered the way the
+    /// shell-integrated path does — AI content is instead inserted above the live
+    /// input line (see design 0005).
+    pub fn resting_prompt(&self) -> bool {
+        !self.mirror.is_alt_screen() && self.resting_shape() == RestingShape::Prompt
+    }
+
+    /// The live region (the cursor's logical line, styled) for presentation's
+    /// anchored streaming; `None` on the alternate screen or when the cursor rests
+    /// mid-logical-line. See [`TerminalMirror::live_region`].
+    pub fn live_region(&self) -> Option<crate::mirror::LiveRegionSnapshot> {
+        self.mirror.live_region()
+    }
+
+    /// Cursor facts sampled after presentation writes AI text: column, terminal
+    /// pending-wrap state, and the right-trimmed plain text of the cursor row (the
+    /// AI tail used by the anchored-streaming invariant check).
+    pub fn cursor_probe(&self) -> (u16, bool, String) {
+        let (text, cursor_x) = self.mirror.cursor_row();
+        (cursor_x, self.mirror.cursor_needs_wrap(), text)
+    }
+
     /// The shape of the line the cursor rests on, for the debounce modulator.
     fn resting_shape(&self) -> RestingShape {
         let (text, cursor_x) = self.mirror.cursor_row();
@@ -1019,6 +1051,47 @@ mod tests {
         state.record_output(b"\x1b[?1049l", t0 + Duration::from_secs(61));
         assert!(state.esc_cancellable());
         assert!(state.next_deadline(t0 + Duration::from_secs(61)).is_some());
+    }
+
+    #[test]
+    fn at_line_start_tracks_the_mirror_cursor() {
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        assert!(state.at_line_start());
+        state.record_output(b">>> ", t0);
+        assert!(!state.at_line_start());
+        state.record_output(b"\r\n", t0);
+        assert!(state.at_line_start());
+    }
+
+    #[test]
+    fn resting_prompt_matches_prompt_shapes_only() {
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        assert!(!state.resting_prompt());
+
+        // A prompt-shaped resting line.
+        state.record_output(b"2\r\n>>> ", t0);
+        assert!(state.resting_prompt());
+
+        // A short non-prompt resting line is not a prompt.
+        state.record_output(b"\r\ndownloading", t0);
+        assert!(!state.resting_prompt());
+
+        // Suspended on the alternate screen.
+        state.record_output(b"\x1b[?1049h\x1b[2J\x1b[H% ", t0);
+        assert!(!state.resting_prompt());
+    }
+
+    #[test]
+    fn cursor_probe_reports_the_ai_tail_facts() {
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        state.record_output(b"answer line", t0);
+        let (col, needs_wrap, tail) = state.cursor_probe();
+        assert_eq!(col, 11);
+        assert!(!needs_wrap);
+        assert_eq!(tail, "answer line");
     }
 
     #[test]

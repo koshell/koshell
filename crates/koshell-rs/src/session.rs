@@ -359,12 +359,10 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
 }
 
 /// Prints a dim one-line presentation notice and feeds it to the mirror, keeping screen
-/// snapshots truthful to what the user sees (the mirror-feed invariant).
+/// snapshots truthful to what the user sees (the mirror-feed invariant). A rendered
+/// prompt under the cursor stays the last line (the notice is inserted above it).
 fn present_notice(stdout: &mut std::io::Stdout, state: &mut SessionState, text: &str) {
-    let bytes = format!("\r\n\x1b[2m[koshell] {text}\x1b[0m\r\n");
-    let _ = stdout.write_all(bytes.as_bytes());
-    let _ = stdout.flush();
-    state.record_presentation_output(bytes.as_bytes());
+    crate::presentation::notice_before_prompt(text, stdout, state);
 }
 
 /// Sends a `#?` request to the AI daemon (connecting lazily), and acknowledges it inline.
@@ -426,7 +424,7 @@ fn dispatch_trigger(
     if sent {
         // The streamed response (or the delayed waiting notice) is the user-facing
         // receipt; the dispatch itself is only worth a log line.
-        presentation.note_dispatch(&request_id, trigger.still_running, Instant::now());
+        presentation.note_dispatch(&request_id, trigger.still_running, state, Instant::now());
         log::info!(
             "#? [{request_id}] dispatched (completion: {:?}, still running: {}): {}",
             trigger.completion,
@@ -447,12 +445,13 @@ fn dispatch_trigger(
             (CompletionKind::MaxWait, false) => " (output not settled)",
             _ => "",
         };
-        let bytes = format!(
-            "\r\n\x1b[2m[koshell] #? received (AI daemon unavailable){annotation}: {}\x1b[0m\r\n",
-            trigger.question
+        crate::presentation::notice_before_prompt(
+            &format!(
+                "#? received (AI daemon unavailable){annotation}: {}",
+                trigger.question
+            ),
+            stdout,
+            state,
         );
-        let _ = stdout.write_all(bytes.as_bytes());
-        let _ = stdout.flush();
-        state.record_presentation_output(bytes.as_bytes());
     }
 }
