@@ -224,6 +224,12 @@ impl SessionState {
         !self.pending.is_empty() && !self.mirror.is_alt_screen()
     }
 
+    /// Whether the alternate screen is active (a full-screen program owns the
+    /// keys, so koshell must not claim interrupts or cancels).
+    pub fn alt_screen(&self) -> bool {
+        self.mirror.is_alt_screen()
+    }
+
     /// Records human keystrokes sent to the shell. Detects submits (Enter → mirror-read
     /// capture) and user interrupts (Ctrl+C → cancel pending questions).
     pub fn record_input(&mut self, data: &[u8], now: Instant) -> Vec<Action> {

@@ -36,7 +36,7 @@
 //! The AI output style (a dim `[koshell ai]` header) is a placeholder; design 0002
 //! leaves the final prefix/style open.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -154,6 +154,10 @@ pub struct Presentation {
     /// still-running at fire time.
     dispatched: HashMap<String, bool>,
     active: Option<ActiveResponse>,
+    /// Requests aborted by a user interrupt (Ctrl+C): rendering stopped locally,
+    /// so late deltas and the daemon's terminal marker are dropped silently. The
+    /// local stop is authoritative — the daemon-side cancel is only best-effort.
+    aborted: HashSet<String>,
 }
 
 /// Normalizes `\n` to `\r\n` for a terminal in raw mode. `last_was_cr` carries the
@@ -320,7 +324,61 @@ impl Presentation {
         Self {
             dispatched: HashMap::new(),
             active: None,
+            aborted: HashSet::new(),
         }
+    }
+
+    /// Whether a Ctrl+C currently belongs to the AI response rather than the
+    /// child program: a stream-mode response is in flight, meaning the triggering
+    /// command already ended and the AI is the only thing occupying the terminal.
+    /// Block mode (command still running) never claims Ctrl+C — killing the
+    /// foreground program is inviolable.
+    pub fn owns_interrupt(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| active.mode == Mode::Stream)
+    }
+
+    /// Aborts the active response on a user interrupt (Ctrl+C): rendering stops
+    /// immediately and everything the daemon still sends for this request is
+    /// dropped. Returns the request id so the caller can send a best-effort
+    /// `ai_cancel` to the daemon. `None` when no response is active (the caller
+    /// treats the interrupt as ordinary input).
+    pub fn user_interrupt<W: Write>(
+        &mut self,
+        out: &mut W,
+        state: &mut SessionState,
+        now: Instant,
+    ) -> Option<String> {
+        let active = self.active.take()?;
+        self.dispatched.remove(&active.request_id);
+        self.aborted.insert(active.request_id.clone());
+        match active.mode {
+            Mode::Stream if active.anchored => {
+                // The streamed part stays in the free zone; close it with an
+                // interrupted marker and keep the live input line last.
+                notice_above_live("answer interrupted (^C)", out, state);
+            }
+            Mode::Stream => {
+                if active.started {
+                    let tail = b"\r\n";
+                    let _ = out.write_all(tail);
+                    state.record_presentation_output(tail);
+                }
+                notice("answer interrupted (^C)", out, state);
+                if !active.buffered_pty.is_empty() {
+                    let _ = out.write_all(&active.buffered_pty);
+                    state.record_output(&active.buffered_pty, now);
+                }
+                let _ = out.flush();
+            }
+            Mode::Block => {
+                // The accumulated text was never rendered; drop it. The Ctrl+C
+                // was forwarded to the program, so only the withdrawal needs ink.
+                notice_before_prompt("answer cancelled (^C)", out, state);
+            }
+        }
+        Some(active.request_id)
     }
 
     /// Records a `#?` request handed to the daemon and the bounded-side decision made
@@ -469,6 +527,9 @@ impl Presentation {
         state: &mut SessionState,
         now: Instant,
     ) {
+        if self.aborted.contains(request_id) {
+            return;
+        }
         if self
             .active
             .as_ref()
@@ -510,6 +571,12 @@ impl Presentation {
         state: &mut SessionState,
         now: Instant,
     ) {
+        // An aborted request's terminal marker is part of the suppressed tail;
+        // dropping it here also completes the abort bookkeeping.
+        if self.aborted.remove(request_id) {
+            self.dispatched.remove(request_id);
+            return;
+        }
         self.dispatched.remove(request_id);
         let active = match self.active.take() {
             Some(active) if active.request_id == request_id => active,
@@ -1222,6 +1289,147 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&out).contains("live output"),
             "unknown responses must not buffer PTY output"
+        );
+    }
+
+    #[test]
+    fn interrupt_stops_an_anchored_stream_and_drops_the_late_tail() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        let setup = b">>> ";
+        state.record_output(setup, now);
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.handle_server_message(&delta("r1", "The answer"), &mut out, &mut state, now);
+        assert!(presentation.owns_interrupt(), "stream in flight claims ^C");
+
+        let aborted = presentation.user_interrupt(&mut out, &mut state, now);
+        assert_eq!(aborted.as_deref(), Some("r1"));
+        assert!(!presentation.owns_interrupt(), "window disarms after abort");
+
+        // Everything the daemon still sends for r1 is dropped silently: the
+        // local stop is authoritative, the daemon cancel only best-effort.
+        let len = out.len();
+        presentation.handle_server_message(&delta("r1", " is 42."), &mut out, &mut state, now);
+        presentation.handle_server_message(&end("r1"), &mut out, &mut state, now);
+        assert_eq!(out.len(), len, "late deltas and the end marker are silent");
+
+        let (screen, col) = replay_screen(80, setup, &out);
+        assert_eq!(
+            screen,
+            "[koshell ai]\nThe answer\n[koshell] answer interrupted (^C)\n>>>"
+        );
+        assert_eq!(col, 4, "the live prompt stays last and usable");
+        assert_no_rich_terminal_sequences(&out);
+    }
+
+    #[test]
+    fn interrupt_before_the_first_delta_leaves_the_prompt_live() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        let setup = b">>> ";
+        state.record_output(setup, now);
+        presentation.note_dispatch("r1", false, &state, now);
+        assert!(presentation.owns_interrupt());
+
+        let aborted = presentation.user_interrupt(&mut out, &mut state, now);
+        assert_eq!(aborted.as_deref(), Some("r1"));
+
+        let (screen, col) = replay_screen(80, setup, &out);
+        assert_eq!(screen, "[koshell] answer interrupted (^C)\n>>>");
+        assert_eq!(col, 4);
+    }
+
+    #[test]
+    fn interrupt_flushes_the_held_prompt_in_buffered_stream_mode() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        // Shell-integrated path: the returning prompt is buffered at dispatch.
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.pty_output(b"$ ", &mut out, &mut state, now);
+        presentation.handle_server_message(&delta("r1", "Partial"), &mut out, &mut state, now);
+        assert!(presentation.owns_interrupt());
+
+        let aborted = presentation.user_interrupt(&mut out, &mut state, now);
+        assert_eq!(aborted.as_deref(), Some("r1"));
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(text.contains("answer interrupted (^C)"));
+        assert!(
+            text.ends_with("$ "),
+            "the held prompt flushes on interrupt: {text:?}"
+        );
+    }
+
+    #[test]
+    fn interrupt_withdraws_a_block_mode_answer() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        presentation.note_dispatch("r1", true, &state, now);
+        presentation.handle_server_message(&delta("r1", "Never shown"), &mut out, &mut state, now);
+        assert!(
+            !presentation.owns_interrupt(),
+            "block mode must never claim ^C from the running program"
+        );
+
+        let aborted = presentation.user_interrupt(&mut out, &mut state, now);
+        assert_eq!(aborted.as_deref(), Some("r1"));
+        presentation.handle_server_message(&delta("r1", " either"), &mut out, &mut state, now);
+        presentation.handle_server_message(&end("r1"), &mut out, &mut state, now);
+
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(text.contains("answer cancelled (^C)"));
+        assert!(
+            !text.contains("Never shown"),
+            "the withdrawn block must not be inserted at response end: {text:?}"
+        );
+    }
+
+    #[test]
+    fn interrupt_with_nothing_active_is_a_no_op() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        assert!(!presentation.owns_interrupt());
+        assert_eq!(presentation.user_interrupt(&mut out, &mut state, now), None);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_new_question_streams_normally_after_an_interrupt() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        let setup = b">>> ";
+        state.record_output(setup, now);
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.handle_server_message(&delta("r1", "Old"), &mut out, &mut state, now);
+        presentation.user_interrupt(&mut out, &mut state, now);
+
+        // The daemon (cancelled or not) eventually terminates r1, then serves r2.
+        presentation.handle_server_message(&end("r1"), &mut out, &mut state, now);
+        presentation.note_dispatch("r2", false, &state, now);
+        presentation.handle_server_message(&delta("r2", "Fresh answer"), &mut out, &mut state, now);
+        presentation.handle_server_message(&end("r2"), &mut out, &mut state, now);
+
+        let (screen, _) = replay_screen(80, setup, &out);
+        assert!(
+            screen.contains("Fresh answer"),
+            "the next response must render normally: {screen}"
         );
     }
 }

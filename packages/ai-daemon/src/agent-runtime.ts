@@ -27,6 +27,9 @@ export interface AskOptions {
 export interface KoshellAgent {
   // Resolves when the response is complete; rejects with the provider/setup error.
   ask(options: AskOptions): Promise<void>;
+  // Interrupts the in-flight ask (user Ctrl+C); a no-op when nothing is running.
+  // The session survives and serves later asks.
+  abort(): void;
   dispose(): void;
 }
 
@@ -120,6 +123,9 @@ export function createPiAgentFactory(): AgentFactory {
         if (failure !== undefined) {
           throw new Error(failure);
         }
+      },
+      abort(): void {
+        void session.abort().catch(() => undefined);
       },
       dispose(): void {
         void session.abort().catch(() => undefined);

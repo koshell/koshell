@@ -34,11 +34,25 @@ describe("parseClientMessage", () => {
     expect(parseClientMessage(line)?.type).toBe("hello");
   });
 
+  it("parses an ai_cancel", () => {
+    const line = JSON.stringify({
+      type: "ai_cancel",
+      request_id: "koshell-req-1",
+    });
+    expect(parseClientMessage(line)).toEqual({
+      type: "ai_cancel",
+      request_id: "koshell-req-1",
+    });
+  });
+
   it("rejects malformed input", () => {
     expect(parseClientMessage("not json")).toBeNull();
     expect(parseClientMessage(JSON.stringify({ type: "unknown" }))).toBeNull();
     expect(
       parseClientMessage(JSON.stringify({ type: "ai_request" })),
+    ).toBeNull();
+    expect(
+      parseClientMessage(JSON.stringify({ type: "ai_cancel" })),
     ).toBeNull();
   });
 });

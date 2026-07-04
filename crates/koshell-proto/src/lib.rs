@@ -53,6 +53,14 @@ pub enum ClientMessage {
         trigger: String,
         context_package: serde_json::Value,
     },
+    /// Withdraws an in-flight [`ClientMessage::AiRequest`] after a user interrupt
+    /// (Ctrl+C). Best-effort: the terminal has already stopped rendering the
+    /// response locally and suppresses whatever still arrives, so this only asks
+    /// the daemon to stop generating (saving tokens) and to skip the request if it
+    /// is still queued (unblocking later questions). The daemon still terminates
+    /// the request with its usual single end/error marker; a daemon that does not
+    /// know this message type ignores it, per the additive-evolution rule.
+    AiCancel { request_id: String },
     /// Response to a daemon-initiated context tool call. Reserved for the next
     /// stage (tool round-trips); not produced yet.
     ToolResponse {
@@ -101,6 +109,20 @@ mod tests {
         let back: ClientMessage = serde_json::from_str(&line).unwrap();
         match back {
             ClientMessage::AiRequest { request_id, .. } => assert_eq!(request_id, "req-1"),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ai_cancel_round_trips_as_tagged_json() {
+        let line = serde_json::to_string(&ClientMessage::AiCancel {
+            request_id: "req-1".into(),
+        })
+        .unwrap();
+        assert_eq!(line, r#"{"type":"ai_cancel","request_id":"req-1"}"#);
+        let back: ClientMessage = serde_json::from_str(&line).unwrap();
+        match back {
+            ClientMessage::AiCancel { request_id } => assert_eq!(request_id, "req-1"),
             other => panic!("unexpected variant: {other:?}"),
         }
     }

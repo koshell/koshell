@@ -21,12 +21,22 @@ export interface AiRequestMessage {
   context_package: unknown;
 }
 
+// Best-effort withdrawal of an in-flight ai_request after a user interrupt
+// (Ctrl+C). The terminal has already stopped rendering locally; this only stops
+// generation and unblocks the FIFO queue. The request still terminates with its
+// usual single end/error marker.
+export interface AiCancelMessage {
+  type: "ai_cancel";
+  request_id: string;
+}
+
 export interface ByeMessage {
   type: "bye";
   terminal_session_id: string;
 }
 
-export type ClientMessage = HelloMessage | AiRequestMessage | ByeMessage;
+export type ClientMessage =
+  HelloMessage | AiRequestMessage | AiCancelMessage | ByeMessage;
 
 // Per request, the daemon sends `ack` first (parsed and enqueued), then zero or
 // more `ai_delta` chunks, then exactly one of `ai_response_end` or `ai_error`.
@@ -110,6 +120,14 @@ export function parseClientMessage(line: string): ClientMessage | null {
           question: value.question,
           trigger: value.trigger,
           context_package: value.context_package,
+        };
+      }
+      return null;
+    case "ai_cancel":
+      if (typeof value.request_id === "string") {
+        return {
+          type: "ai_cancel",
+          request_id: value.request_id,
         };
       }
       return null;

@@ -47,6 +47,11 @@ export class TerminalConnection {
     "the terminal did not complete the hello handshake on this connection";
   private agent: Promise<KoshellAgent> | undefined;
   private queue: Promise<void> = Promise.resolve();
+  // Requests withdrawn by ai_cancel; consumed when run() reaches them (queued
+  // requests are skipped without prompting) and cleared when the request ends,
+  // so a cancel that raced past its request's completion cannot linger.
+  private readonly cancelled = new Set<string>();
+  private runningRequestId: string | undefined;
   private closed = false;
 
   constructor(sink: MessageSink, options: DaemonOptions) {
@@ -102,6 +107,21 @@ export class TerminalConnection {
         this.send({ type: "ack", request_id: message.request_id });
         this.queue = this.queue.then(() => this.run(message));
         break;
+      case "ai_cancel":
+        // Best-effort: the terminal already stopped rendering and suppresses
+        // late messages, so this only stops generation and unblocks the queue.
+        this.options.log.info(
+          `#? [${message.request_id}] cancelled by the terminal`,
+        );
+        this.cancelled.add(message.request_id);
+        if (this.runningRequestId === message.request_id) {
+          void this.agent
+            ?.then((agent) => {
+              agent.abort();
+            })
+            .catch(() => undefined);
+        }
+        break;
       case "bye":
         this.options.log.info(`bye from ${message.terminal_session_id}`);
         this.dispose();
@@ -125,9 +145,24 @@ export class TerminalConnection {
   }
 
   // Never rejects: exactly one of ai_response_end or ai_error per request.
+  // A cancelled request keeps that contract: skipped before prompting when the
+  // cancel arrived while it was queued (or while the agent was being created),
+  // and ended normally when abort() cut the prompt short mid-generation.
   private async run(message: AiRequestMessage): Promise<void> {
+    if (this.cancelled.has(message.request_id)) {
+      this.options.log.info(`#? [${message.request_id}] skipped (cancelled)`);
+      this.cancelled.delete(message.request_id);
+      this.send({ type: "ai_response_end", request_id: message.request_id });
+      return;
+    }
+    this.runningRequestId = message.request_id;
     try {
       const agent = await this.getAgent();
+      if (this.cancelled.has(message.request_id)) {
+        this.options.log.info(`#? [${message.request_id}] skipped (cancelled)`);
+        this.send({ type: "ai_response_end", request_id: message.request_id });
+        return;
+      }
       await agent.ask({
         prompt: buildUserPrompt(message, this.hello),
         onDelta: (delta) => {
@@ -148,6 +183,9 @@ export class TerminalConnection {
         request_id: message.request_id,
         message: errorText(error),
       });
+    } finally {
+      this.cancelled.delete(message.request_id);
+      this.runningRequestId = undefined;
     }
   }
 

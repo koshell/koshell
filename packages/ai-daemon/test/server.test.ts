@@ -75,6 +75,7 @@ describe("TerminalConnection", () => {
           onDelta("world");
           return Promise.resolve();
         },
+        abort: noop,
         dispose: noop,
       });
     const connection = new TerminalConnection(sink, {
@@ -108,6 +109,7 @@ describe("TerminalConnection", () => {
           onDelta("ok");
           return Promise.resolve();
         },
+        abort: noop,
         dispose: noop,
       });
     };
@@ -141,6 +143,7 @@ describe("TerminalConnection", () => {
           onDelta("partial");
           return Promise.reject(new Error("provider exploded"));
         },
+        abort: noop,
         dispose: noop,
       });
     const connection = new TerminalConnection(sink, {
@@ -173,6 +176,7 @@ describe("TerminalConnection", () => {
           }
           return Promise.resolve();
         },
+        abort: noop,
         dispose: noop,
       });
     const connection = new TerminalConnection(sink, {
@@ -204,6 +208,88 @@ describe("TerminalConnection", () => {
     expect(lines[4]).toContain("answer-2");
   });
 
+  it("aborts the running request on ai_cancel and still ends it", async () => {
+    const { sink, lines } = collectingSink();
+    let aborts = 0;
+    let finishAsk: (() => void) | undefined;
+    const factory: AgentFactory = () =>
+      Promise.resolve<KoshellAgent>({
+        ask({ onDelta }: AskOptions): Promise<void> {
+          onDelta("partial");
+          // Like pi: abort() makes the in-flight prompt resolve early.
+          return new Promise((resolve) => {
+            finishAsk = resolve;
+          });
+        },
+        abort(): void {
+          aborts += 1;
+          finishAsk?.();
+        },
+        dispose: noop,
+      });
+    const connection = new TerminalConnection(sink, {
+      createAgent: factory,
+      log: NOOP_LOGGER,
+    });
+
+    connection.handleLine(HELLO_LINE);
+    connection.handleLine(aiRequestLine("r1"));
+    await settle();
+    connection.handleLine(
+      JSON.stringify({ type: "ai_cancel", request_id: "r1" }),
+    );
+    await settle();
+
+    expect(aborts).toBe(1);
+    expect(types(lines)).toEqual(["ack", "ai_delta", "ai_response_end"]);
+  });
+
+  it("skips a queued request cancelled before it starts", async () => {
+    const { sink, lines } = collectingSink();
+    let releaseFirst: (() => void) | undefined;
+    let asks = 0;
+    const factory: AgentFactory = () =>
+      Promise.resolve<KoshellAgent>({
+        ask({ onDelta }: AskOptions): Promise<void> {
+          asks += 1;
+          onDelta(`answer-${String(asks)}`);
+          if (asks === 1) {
+            return new Promise((resolve) => {
+              releaseFirst = resolve;
+            });
+          }
+          return Promise.resolve();
+        },
+        abort: noop,
+        dispose: noop,
+      });
+    const connection = new TerminalConnection(sink, {
+      createAgent: factory,
+      log: NOOP_LOGGER,
+    });
+
+    connection.handleLine(HELLO_LINE);
+    connection.handleLine(aiRequestLine("r1"));
+    connection.handleLine(aiRequestLine("r2"));
+    await settle();
+    // r2 sits behind r1 in the FIFO queue; cancelling it must skip its prompt
+    // entirely when its turn comes, while still ending it for the terminal.
+    connection.handleLine(
+      JSON.stringify({ type: "ai_cancel", request_id: "r2" }),
+    );
+    releaseFirst?.();
+    await settle();
+
+    expect(asks).toBe(1);
+    expect(types(lines)).toEqual([
+      "ack",
+      "ack",
+      "ai_delta",
+      "ai_response_end",
+      "ai_response_end",
+    ]);
+  });
+
   it("disposes the agent on bye and drops late deltas", async () => {
     const { sink, lines } = collectingSink();
     let disposed = 0;
@@ -218,6 +304,7 @@ describe("TerminalConnection", () => {
             };
           });
         },
+        abort: noop,
         dispose(): void {
           disposed += 1;
         },
@@ -267,6 +354,7 @@ describe("TerminalConnection", () => {
           onDelta("ok");
           return Promise.resolve();
         },
+        abort: noop,
         dispose: noop,
       });
     const connection = new TerminalConnection(sink, {

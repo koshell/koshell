@@ -60,10 +60,11 @@ crate docs and `design-0004-ipc-version-enforcement.md`).
 Messages (see `crates/koshell-proto`):
 
 - Terminal → daemon: `hello`, `ai_request` (carries the assembled context package),
-  `tool_response` (reserved), `bye`.
+  `ai_cancel` (best-effort withdrawal after a user interrupt; see
+  `design-0006-interrupting-ai-responses.md`), `tool_response` (reserved), `bye`.
 - Daemon → terminal: `ack`, then per request zero or more `ai_delta` chunks followed by
-  exactly one of `ai_response_end` or `ai_error`. `ai_tool_call` is reserved for the
-  tool round-trip stage.
+  exactly one of `ai_response_end` or `ai_error` (a cancelled request still gets its
+  terminal marker). `ai_tool_call` is reserved for the tool round-trip stage.
 
 ## Implementation status
 

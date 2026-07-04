@@ -5,7 +5,8 @@
 //! and timeline, so the terminal-emulator state is never shared across threads:
 //! - reader thread: PTY output -> channel
 //! - stdin thread: keystrokes -> PTY and -> channel (for recording); also owns the
-//!   bare-Esc cancel disambiguation, since it sits on the raw input stream
+//!   bare-Esc cancel disambiguation and the Ctrl+C interrupt swallow (while an AI
+//!   response streams onto an idle prompt), since it sits on the raw input stream
 //! - resize thread: SIGWINCH -> PTY resize and -> channel
 //! - processor thread: applies events, writes visible output to stdout, handles `#?`
 //!   (pending-question deadlines drive the channel receive timeout)
@@ -52,6 +53,9 @@ enum Msg {
     Daemon(ServerMessage),
     /// A bare Esc was swallowed while the cancel window was armed.
     CancelPending,
+    /// A Ctrl+C was swallowed while the interrupt window was armed (an AI
+    /// response streaming onto an idle prompt).
+    Interrupt,
     Exit,
 }
 
@@ -165,10 +169,20 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
     // the stdin thread; everywhere else ESC is forwarded untouched.
     let esc_window = Arc::new(AtomicBool::new(false));
 
+    // Whether a Ctrl+C currently belongs to the AI response instead of the child: a
+    // stream-mode response is in flight (the triggering command already ended, so no
+    // foreground program is waiting for the interrupt) and the alternate screen is
+    // inactive. While armed, Ctrl+C is swallowed and aborts the response — forwarding
+    // it would discard whatever the user typed ahead on the live input line. With a
+    // command still running (block mode) the window stays dark and Ctrl+C passes
+    // through to the program as always.
+    let interrupt_window = Arc::new(AtomicBool::new(false));
+
     // Processor thread owns the terminal-core state and the (lazy) IPC connection.
     // It keeps a channel sender so daemon replies (read by a dedicated IPC reader
     // thread) flow through the same single-consumer loop as PTY output.
     let esc_window_proc = esc_window.clone();
+    let interrupt_window_proc = interrupt_window.clone();
     let writer_proc = writer.clone();
     let tx_daemon = tx.clone();
     let processor = thread::spawn(move || {
@@ -220,8 +234,36 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
                 Some(Msg::Daemon(message)) => {
                     presentation.handle_server_message(&message, &mut stdout, &mut state, now);
                 }
-                Some(Msg::Input(bytes)) => actions.extend(state.record_input(&bytes, now)),
+                Some(Msg::Input(bytes)) => {
+                    actions.extend(state.record_input(&bytes, now));
+                    // A forwarded Ctrl+C (command still running, or the swallow
+                    // window was stale) also withdraws the in-flight response:
+                    // pending and dispatched questions are cancelled alike, so
+                    // withdrawal never depends on dispatch timing.
+                    if bytes.contains(&0x03)
+                        && !state.alt_screen()
+                        && let Some(request_id) =
+                            presentation.user_interrupt(&mut stdout, &mut state, now)
+                    {
+                        send_ai_cancel(&mut ipc_client, &request_id);
+                    }
+                }
                 Some(Msg::Resize(columns, lines)) => state.resize(columns, lines),
+                Some(Msg::Interrupt) => {
+                    match presentation.user_interrupt(&mut stdout, &mut state, now) {
+                        Some(request_id) => send_ai_cancel(&mut ipc_client, &request_id),
+                        None => {
+                            // The interrupt race was lost (the response finished
+                            // first); restore transparency by forwarding the
+                            // swallowed Ctrl+C and treating it as ordinary input.
+                            if let Ok(mut writer) = writer_proc.lock() {
+                                let _ = writer.write_all(b"\x03");
+                                let _ = writer.flush();
+                            }
+                            actions.extend(state.record_input(&[0x03], now));
+                        }
+                    }
+                }
                 Some(Msg::CancelPending) => match state.cancel_latest() {
                     Some(action) => actions.push(action),
                     None => {
@@ -259,6 +301,10 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
                 }
             }
             esc_window_proc.store(state.esc_cancellable(), Ordering::Relaxed);
+            interrupt_window_proc.store(
+                presentation.owns_interrupt() && !state.alt_screen(),
+                Ordering::Relaxed,
+            );
         }
     });
 
@@ -286,6 +332,7 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
     let tx_input = tx.clone();
     let writer_input = writer.clone();
     let esc_window_input = esc_window.clone();
+    let interrupt_window_input = interrupt_window.clone();
     thread::spawn(move || {
         let mut buf = [0u8; 8192];
         let mut stdin = std::io::stdin();
@@ -307,9 +354,25 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
             match stdin.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let chunk = &buf[..n];
+                    let mut chunk = &buf[..n];
+                    // While the interrupt window is armed, the first Ctrl+C in the
+                    // chunk is swallowed: it aborts the streaming AI response and
+                    // never reaches the child (whose line editor would discard the
+                    // input typed ahead on the live line).
+                    if interrupt_window_input.load(Ordering::Relaxed)
+                        && let Some(pos) = chunk.iter().position(|&byte| byte == 0x03)
+                    {
+                        if !forward(&chunk[..pos]) {
+                            break;
+                        }
+                        let _ = tx_input.send(Msg::Interrupt);
+                        chunk = &chunk[pos + 1..];
+                        if chunk.is_empty() {
+                            continue;
+                        }
+                    }
                     if esc_window_input.load(Ordering::Relaxed) && chunk.last() == Some(&0x1b) {
-                        if !forward(&chunk[..n - 1]) {
+                        if !forward(&chunk[..chunk.len() - 1]) {
                             break;
                         }
                         if stdin_readable_within(ESC_DISAMBIGUATION_TIMEOUT_MS) {
@@ -363,6 +426,22 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
 /// prompt under the cursor stays the last line (the notice is inserted above it).
 fn present_notice(stdout: &mut std::io::Stdout, state: &mut SessionState, text: &str) {
     crate::presentation::notice_before_prompt(text, stdout, state);
+}
+
+/// Sends a best-effort `ai_cancel` for a locally aborted request. The local
+/// rendering stop is authoritative; this only asks the daemon to stop generating
+/// and to unblock its queue, so a send failure just lets the response run out
+/// server-side (its output is suppressed either way).
+fn send_ai_cancel(ipc_client: &mut Option<IpcClient>, request_id: &str) {
+    log::info!("#? [{request_id}] interrupted by the user (^C)");
+    if let Some(client) = ipc_client.as_mut() {
+        let cancel = ClientMessage::AiCancel {
+            request_id: request_id.to_string(),
+        };
+        if client.send(&cancel).is_err() {
+            *ipc_client = None;
+        }
+    }
 }
 
 /// Sends a `#?` request to the AI daemon (connecting lazily), and acknowledges it inline.
