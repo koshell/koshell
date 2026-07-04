@@ -174,6 +174,19 @@ fn max_wait(origin: PendingOrigin) -> Duration {
     }
 }
 
+/// The instant a pending question's quiescence is measured from: the later of the
+/// last PTY output and the question's submission. Output that predates the submit
+/// (the echo of the user's own typing before a thinking pause) must not count as
+/// settled — otherwise the question fires before the program has had any chance to
+/// respond to the Enter (echo the newline, print the next prompt), the dispatch
+/// samples a mid-line cursor instead of the resting prompt, and the echo ends up
+/// buffered behind the response (fix 0003).
+fn quiet_from(last_output_at: Option<Instant>, pending: &PendingQuestion) -> Instant {
+    last_output_at.map_or(pending.submitted_at, |last_output| {
+        last_output.max(pending.submitted_at)
+    })
+}
+
 /// Owns the timeline and mirror and applies terminal events as they happen.
 pub struct SessionState {
     timeline: InMemoryTimelineStore,
@@ -364,9 +377,10 @@ impl SessionState {
                 consider(pending.submitted_at + RECEIPT_NOTICE_DELAY);
             }
             consider(pending.submitted_at + max_wait(pending.origin));
-            if let Some(last_output) = self.last_output_at {
-                consider(last_output + stabilization_tier(pending.origin, shape));
-            }
+            consider(
+                quiet_from(self.last_output_at, pending)
+                    + stabilization_tier(pending.origin, shape),
+            );
         }
         nearest.map(|deadline| {
             deadline
@@ -382,15 +396,14 @@ impl SessionState {
             return Vec::new();
         }
         let shape = self.resting_shape();
-        let quiet_for = self
-            .last_output_at
-            .map(|last_output| now.saturating_duration_since(last_output));
+        let last_output_at = self.last_output_at;
 
         let mut fired = Vec::new();
         let mut remaining = VecDeque::new();
         for pending in self.pending.drain(..) {
-            let stabilized =
-                quiet_for.is_some_and(|quiet| quiet >= stabilization_tier(pending.origin, shape));
+            let quiet_from = quiet_from(last_output_at, &pending);
+            let stabilized = now.saturating_duration_since(quiet_from)
+                >= stabilization_tier(pending.origin, shape);
             let maxed =
                 now.saturating_duration_since(pending.submitted_at) >= max_wait(pending.origin);
             if stabilized {
@@ -911,6 +924,53 @@ mod tests {
             fired[0].context_package["trigger"]["completion"],
             "stabilized"
         );
+    }
+
+    #[test]
+    fn thinking_pause_before_enter_does_not_fire_before_the_echo() {
+        // Regression (fix 0003): the user types the question, pauses to think, then
+        // presses Enter. The pre-submit silence (last output = the echo of their own
+        // typing) must not count as stabilization — otherwise the question fires
+        // before the REPL echoes the newline, the dispatch samples a mid-line cursor
+        // (no anchored streaming), and the echo gets buffered behind the response.
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        state.handle_marker(start_marker("python3"), t0);
+        state.record_output(b">>> #? why", t0);
+
+        let submit = t0 + Duration::from_secs(2);
+        assert!(fires(&state.record_input(b"\r", submit)).is_empty());
+        assert!(
+            state.poll(submit).is_empty(),
+            "the question must not fire at the submit instant"
+        );
+
+        // The echo arrives; the prompt-shaped resting line stabilizes from there.
+        state.record_output(b"\r\n>>> ", submit + Duration::from_millis(20));
+        let actions = state.poll(submit + Duration::from_millis(300));
+        let fired = fires(&actions);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].completion, CompletionKind::Stabilized);
+    }
+
+    #[test]
+    fn silent_program_still_fires_a_tier_after_submission() {
+        // A program that never responds to the Enter must still get its answer:
+        // with no output after the submit, quiescence is measured from the
+        // submission itself.
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        state.handle_marker(start_marker("python3"), t0);
+        state.record_output(b">>> #? why", t0);
+
+        let submit = t0 + Duration::from_secs(2);
+        state.record_input(b"\r", submit);
+        // Resting line ends in "why" (short, non-prompt): the 500 ms tier applies.
+        assert!(state.poll(submit + Duration::from_millis(300)).is_empty());
+        let actions = state.poll(submit + Duration::from_millis(600));
+        let fired = fires(&actions);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].completion, CompletionKind::Stabilized);
     }
 
     #[test]

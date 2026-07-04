@@ -144,6 +144,10 @@ Where shell markers are dormant (REPLs, remote shells), the echo-armed `#?` uses
 stabilization directly:
 
 - **Quiescence with escalating debounce** (indicative tiers: ~150 ms → ~500 ms → ~2–5 s).
+  Quiescence is measured from the later of the last PTY output and the question's
+  submission (fix 0003): the echo of the user's own typing before a thinking pause
+  must not count as "settled", or the question fires before the program has had any
+  chance to respond to the Enter.
 - **A generic prompt-shape heuristic as a debounce modulator, never a gate**: cursor
   resting at the end of a short, prompt-like line (`$`, `#`, `>`, `%`, `:` + space, etc.)
   selects the fast tier; anything else selects a slower tier _but still fires_. Gating on
