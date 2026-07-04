@@ -5,8 +5,8 @@
 //! and timeline, so the terminal-emulator state is never shared across threads:
 //! - reader thread: PTY output -> channel
 //! - stdin thread: keystrokes -> PTY and -> channel (for recording); also owns the
-//!   bare-Esc cancel disambiguation and the Ctrl+C interrupt swallow (while an AI
-//!   response streams onto an idle prompt), since it sits on the raw input stream
+//!   Ctrl+C interrupt swallow (while an AI response streams onto an idle prompt),
+//!   since it sits on the raw input stream
 //! - resize thread: SIGWINCH -> PTY resize and -> channel
 //! - processor thread: applies events, writes visible output to stdout, handles `#?`
 //!   (pending-question deadlines drive the channel receive timeout)
@@ -39,11 +39,6 @@ struct SessionMeta {
 const DEFAULT_COLUMNS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 
-/// How long a trailing lone ESC waits for continuation bytes before it is treated as a
-/// bare Esc (cancel) rather than an escape-sequence prefix (arrow keys, Alt combinations).
-/// Active only while the cancel window is armed. Design 0001 suggests ~25-50 ms.
-const ESC_DISAMBIGUATION_TIMEOUT_MS: i32 = 40;
-
 /// Messages from the I/O threads to the single processor thread.
 enum Msg {
     Pty(Vec<u8>),
@@ -51,8 +46,6 @@ enum Msg {
     Resize(u16, u16),
     /// A reply from the AI daemon, forwarded by the IPC reader thread.
     Daemon(ServerMessage),
-    /// A bare Esc was swallowed while the cancel window was armed.
-    CancelPending,
     /// A Ctrl+C was swallowed while the interrupt window was armed (an AI
     /// response streaming onto an idle prompt).
     Interrupt,
@@ -79,16 +72,6 @@ impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
     }
-}
-
-/// True when stdin has bytes available within `timeout_ms`.
-fn stdin_readable_within(timeout_ms: i32) -> bool {
-    let mut pollfd = libc::pollfd {
-        fd: libc::STDIN_FILENO,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    unsafe { libc::poll(&mut pollfd, 1, timeout_ms) > 0 }
 }
 
 /// Runs an interactive session wrapped in a PTY and returns the child's exit code.
@@ -164,11 +147,6 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
     // submit-time mirror capture is confined to command spans (see `trigger.rs`).
     let shell_integrated = launch.kind.is_some();
 
-    // Whether a bare Esc currently cancels a pending `#?` (at least one question pending
-    // and the alternate screen inactive). Maintained by the processor thread, consumed by
-    // the stdin thread; everywhere else ESC is forwarded untouched.
-    let esc_window = Arc::new(AtomicBool::new(false));
-
     // Whether a Ctrl+C currently belongs to the AI response instead of the child: a
     // stream-mode response is in flight (the triggering command already ended, so no
     // foreground program is waiting for the interrupt) and the alternate screen is
@@ -181,7 +159,6 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
     // Processor thread owns the terminal-core state and the (lazy) IPC connection.
     // It keeps a channel sender so daemon replies (read by a dedicated IPC reader
     // thread) flow through the same single-consumer loop as PTY output.
-    let esc_window_proc = esc_window.clone();
     let interrupt_window_proc = interrupt_window.clone();
     let writer_proc = writer.clone();
     let tx_daemon = tx.clone();
@@ -264,17 +241,6 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
                         }
                     }
                 }
-                Some(Msg::CancelPending) => match state.cancel_latest() {
-                    Some(action) => actions.push(action),
-                    None => {
-                        // The cancel race was lost (nothing pending anymore); restore
-                        // transparency by forwarding the swallowed Esc after all.
-                        if let Ok(mut writer) = writer_proc.lock() {
-                            let _ = writer.write_all(b"\x1b");
-                            let _ = writer.flush();
-                        }
-                    }
-                },
                 Some(Msg::Exit) => break,
                 None => {}
             }
@@ -300,7 +266,6 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
                     }
                 }
             }
-            esc_window_proc.store(state.esc_cancellable(), Ordering::Relaxed);
             interrupt_window_proc.store(
                 presentation.owns_interrupt() && !state.alt_screen(),
                 Ordering::Relaxed,
@@ -325,13 +290,11 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
         let _ = tx_reader.send(Msg::Exit);
     });
 
-    // stdin -> PTY (low latency) and -> channel (for recording). While the Esc cancel
-    // window is armed, a chunk ending in a lone ESC is held back briefly: if continuation
-    // bytes arrive it was an escape-sequence prefix and is forwarded whole; otherwise it
-    // is swallowed as a cancel keypress and never reaches the child.
+    // stdin -> PTY (low latency) and -> channel (for recording). While the interrupt
+    // window is armed, a Ctrl+C is swallowed as an interrupt keypress and never
+    // reaches the child; everything else is forwarded untouched.
     let tx_input = tx.clone();
     let writer_input = writer.clone();
-    let esc_window_input = esc_window.clone();
     let interrupt_window_input = interrupt_window.clone();
     thread::spawn(move || {
         let mut buf = [0u8; 8192];
@@ -370,21 +333,6 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
                         if chunk.is_empty() {
                             continue;
                         }
-                    }
-                    if esc_window_input.load(Ordering::Relaxed) && chunk.last() == Some(&0x1b) {
-                        if !forward(&chunk[..chunk.len() - 1]) {
-                            break;
-                        }
-                        if stdin_readable_within(ESC_DISAMBIGUATION_TIMEOUT_MS) {
-                            // Continuation arrived: an escape sequence. Forward the ESC;
-                            // the next read picks up and forwards the continuation.
-                            if !forward(b"\x1b") {
-                                break;
-                            }
-                        } else {
-                            let _ = tx_input.send(Msg::CancelPending);
-                        }
-                        continue;
                     }
                     if !forward(chunk) {
                         break;

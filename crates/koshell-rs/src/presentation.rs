@@ -1247,7 +1247,7 @@ mod tests {
         // Enter capture sees the line and queues the question.
         presentation.pty_output(b"1+1 #? why", &mut out, &mut state, now);
         state.record_input(b"\r", now);
-        assert!(state.esc_cancellable(), "the interjection is pending");
+        assert!(state.has_pending(), "the interjection is pending");
 
         let actions = state.poll(now + Duration::from_millis(600));
         let questions: Vec<&str> = actions

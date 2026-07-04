@@ -18,9 +18,11 @@
 //!   with escalating debounce tiers, a prompt-shape heuristic that only modulates debounce
 //!   speed (never gates), and a bounded max-wait fallback so a pending question is never
 //!   silently lost.
-//! - **Pending-trigger interaction**: a delayed receipt notice (~1 s), user-typed Ctrl+C
-//!   cancels pending questions (autonomous failures still fire via `command_end`), and a
-//!   bare Esc cancels the most recent pending question without killing the command.
+//! - **Pending-trigger interaction**: a delayed receipt notice (~1 s), and user-typed
+//!   Ctrl+C cancels pending questions (autonomous failures still fire via `command_end`).
+//!   Ctrl+C is the only cancel key; a bare-Esc cancel path existed briefly and was
+//!   removed — undiscoverable against the universal Ctrl+C mental model, and its
+//!   pending-window key swallow conflicted with vi-mode line editors (design 0006).
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -208,7 +210,7 @@ pub struct SessionState {
     /// rendered line; cleared whenever new PTY output changes the mirror.
     captured_since_output: bool,
     /// True when the current command span's question was already settled outside the
-    /// `command_end` path (fired at stabilization, or cancelled by Ctrl+C / Esc), so the
+    /// `command_end` path (fired at stabilization, or cancelled by Ctrl+C), so the
     /// marker must not extract and fire it again.
     span_settled: bool,
 }
@@ -230,17 +232,16 @@ impl SessionState {
         }
     }
 
-    /// Whether a bare Esc currently cancels a pending question. Armed only while at least
-    /// one question is pending and the alternate screen is not active (`vim file #? q`
-    /// must never lose vim's Esc).
-    pub fn esc_cancellable(&self) -> bool {
-        !self.pending.is_empty() && !self.mirror.is_alt_screen()
-    }
-
     /// Whether the alternate screen is active (a full-screen program owns the
     /// keys, so koshell must not claim interrupts or cancels).
     pub fn alt_screen(&self) -> bool {
         self.mirror.is_alt_screen()
+    }
+
+    /// Whether at least one `#?` question is pending (submitted, not yet fired).
+    #[cfg(test)]
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
     }
 
     /// Records human keystrokes sent to the shell. Detects submits (Enter → mirror-read
@@ -311,22 +312,6 @@ impl SessionState {
             .drain(..)
             .map(|pending| Action::Notice(format!("#? cancelled ({reason}): {}", pending.question)))
             .collect()
-    }
-
-    /// Cancels the most recently submitted pending question (bare-Esc path, LIFO).
-    /// Returns `None` when nothing is pending — the caller should forward the Esc.
-    pub fn cancel_latest(&mut self) -> Option<Action> {
-        if self.mirror.is_alt_screen() {
-            return None;
-        }
-        let pending = self.pending.pop_back()?;
-        if self.command_active && pending.origin == PendingOrigin::PromptLine {
-            self.span_settled = true;
-        }
-        Some(Action::Notice(format!(
-            "#? cancelled: {}",
-            pending.question
-        )))
     }
 
     /// Records visible PTY output, updates the mirror, and captures a snapshot. Output
@@ -832,7 +817,7 @@ mod tests {
         let t0 = Instant::now();
         let mut state = SessionState::new(80, 24, true);
         state.handle_marker(start_marker("echo \"#? not a question\""), t0);
-        assert!(!state.esc_cancellable());
+        assert!(!state.has_pending());
         let actions = state.handle_marker(end_marker("echo \"#? not a question\"", 0), t0);
         assert!(actions.is_empty());
     }
@@ -846,7 +831,7 @@ mod tests {
                 .handle_marker(start_marker("ls #? explain"), t0)
                 .is_empty()
         );
-        assert!(state.esc_cancellable());
+        assert!(state.has_pending());
 
         let actions = state.handle_marker(end_marker("ls #? explain", 0), t0);
         let fired = fires(&actions);
@@ -857,7 +842,7 @@ mod tests {
 
         // The pending was consumed; nothing is left to fire or cancel.
         assert!(state.poll(t0 + Duration::from_secs(60)).is_empty());
-        assert!(!state.esc_cancellable());
+        assert!(!state.has_pending());
     }
 
     #[test]
@@ -870,7 +855,7 @@ mod tests {
         let mut state = SessionState::new(80, 24, true);
         state.record_output(b"  #? a\r\n  2/2\r\n> #?", t0);
         state.record_input(b"\r", t0);
-        assert!(!state.esc_cancellable());
+        assert!(!state.has_pending());
         assert!(state.poll(t0 + Duration::from_secs(60)).is_empty());
     }
 
@@ -900,8 +885,13 @@ mod tests {
         state.handle_marker(start_marker("python3"), t0);
         state.record_output(b">>> f() #? explain", t0);
         state.record_input(b"\r\r\n", t0);
-        assert!(state.cancel_latest().is_some());
-        assert!(state.cancel_latest().is_none());
+        let cancelled = state.record_input(&[0x03], t0);
+        assert_eq!(
+            notices(&cancelled).len(),
+            1,
+            "exactly one pending was captured"
+        );
+        assert!(!state.has_pending());
     }
 
     #[test]
@@ -1075,29 +1065,6 @@ mod tests {
     }
 
     #[test]
-    fn esc_cancels_most_recent_pending_first() {
-        let t0 = Instant::now();
-        let mut state = SessionState::new(80, 24, true);
-        state.handle_marker(start_marker("python3"), t0);
-        state.record_output(b">>> first() #? first question", t0);
-        state.record_input(b"\r", t0);
-        state.record_output(b"\r\n>>> second() #? second question", t0);
-        state.record_input(b"\r", t0);
-
-        let first_cancel = state.cancel_latest().expect("one pending to cancel");
-        match first_cancel {
-            Action::Notice(text) => assert!(text.contains("second question")),
-            Action::Fire(_) => panic!("expected a notice"),
-        }
-        let second_cancel = state.cancel_latest().expect("another pending to cancel");
-        match second_cancel {
-            Action::Notice(text) => assert!(text.contains("first question")),
-            Action::Fire(_) => panic!("expected a notice"),
-        }
-        assert!(state.cancel_latest().is_none());
-    }
-
-    #[test]
     fn alternate_screen_disarms_capture_and_suspends_deadlines() {
         let t0 = Instant::now();
         let mut state = SessionState::new(80, 24, true);
@@ -1107,15 +1074,16 @@ mod tests {
 
         // Enter inside the full-screen program captures nothing.
         state.record_input(b"\r", t0);
-        // Deadlines and Esc-cancel are suspended while the alternate screen is active.
+        // Deadlines are suspended while the alternate screen is active, and Ctrl+C
+        // belongs to the full-screen program (no cancel).
         assert!(state.next_deadline(t0 + Duration::from_secs(60)).is_none());
         assert!(state.poll(t0 + Duration::from_secs(60)).is_empty());
-        assert!(!state.esc_cancellable());
-        assert!(state.cancel_latest().is_none());
+        assert!(notices(&state.record_input(&[0x03], t0)).is_empty());
+        assert!(state.has_pending());
 
         // Leaving the alternate screen re-arms the pending question.
         state.record_output(b"\x1b[?1049l", t0 + Duration::from_secs(61));
-        assert!(state.esc_cancellable());
+        assert!(state.has_pending());
         assert!(state.next_deadline(t0 + Duration::from_secs(61)).is_some());
     }
 
@@ -1168,7 +1136,7 @@ mod tests {
         state.record_output(b"Password:", t0);
         // The typed `#?` is never echoed, so the mirror read finds nothing.
         state.record_input(b"#? is this armed\r", t0);
-        assert!(!state.esc_cancellable());
+        assert!(!state.has_pending());
         assert!(state.poll(t0 + Duration::from_secs(60)).is_empty());
     }
 }

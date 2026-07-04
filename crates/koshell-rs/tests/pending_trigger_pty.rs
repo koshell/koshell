@@ -5,7 +5,8 @@
 //! - quote parity: `echo "#? ..."` must not trigger;
 //! - stabilization on a non-terminating command: an inline `#?` on a still-running command
 //!   fires at the output-stabilization point, annotated, and exactly once;
-//! - bare Esc cancels the pending question without killing the command;
+//! - Esc is forwarded untouched and cancels nothing (the bare-Esc cancel path was
+//!   removed by design 0006; Ctrl+C is the only cancel key);
 //! - a user-typed Ctrl+C cancels the pending question (no fire at the failure marker).
 //!
 //! All tests run the real `koshell` binary wrapping bash in a PTY with no reachable AI
@@ -201,7 +202,10 @@ fn still_running_command_fires_at_stabilization_exactly_once() {
 }
 
 #[test]
-fn esc_cancels_pending_question_without_killing_command() {
+fn esc_is_forwarded_untouched_and_cancels_nothing() {
+    // Regression guard for the bare-Esc cancel removal (design 0006): Ctrl+C is
+    // the only cancel key. An Esc pressed while a question is pending goes to the
+    // foreground program like any other byte, and the question still fires.
     let Some(bash) = resolve("bash") else {
         eprintln!("skipping: no bash");
         return;
@@ -212,29 +216,25 @@ fn esc_cancels_pending_question_without_killing_command() {
         &[
             (
                 Duration::from_millis(900),
-                b"sleep 3 && echo COMPLETION''MARK  #? cancel me",
+                b"cat > /dev/null  #? still fires",
             ),
             (Duration::from_millis(300), b"\n"),
+            // Into cat's stdin: previously this cancelled the pending question.
             (Duration::from_millis(1500), b"\x1b"),
-            (Duration::from_millis(3000), b"exit\n"),
+            // First ^D flushes the partial line to cat, second is EOF; the
+            // command ends and the authoritative marker fires the question.
+            (Duration::from_millis(800), b"\x04\x04"),
+            (Duration::from_millis(600), b"exit\n"),
         ],
     );
 
     assert!(
-        output.contains("waiting for output to settle"),
-        "the delayed-receipt notice is missing.\n--- output ---\n{output}"
+        !output.contains("#? cancelled"),
+        "Esc must not cancel anything.\n--- output ---\n{output}"
     );
     assert!(
-        output.contains("#? cancelled: cancel me"),
-        "the Esc cancel notice is missing.\n--- output ---\n{output}"
-    );
-    assert!(
-        output.contains("COMPLETIONMARK"),
-        "Esc must not kill the running command.\n--- output ---\n{output}"
-    );
-    assert!(
-        !output.contains("AI daemon unavailable"),
-        "a cancelled question must not fire.\n--- output ---\n{output}"
+        output.contains("AI daemon unavailable"),
+        "the question must still fire after an Esc keypress.\n--- output ---\n{output}"
     );
 }
 

@@ -144,4 +144,6 @@ against design 0002's rule that a living producer owns the terminal in real time
   trimmed text contains wide characters followed by trailing spaces would be
   over-padded. Prompt tails are all narrow, so this stays theoretical.
 - Esc aborting a streaming response (design 0001's pending-trigger interaction)
-  remains unimplemented; interjection currently queues rather than cancels.
+  is superseded: interrupting a streaming response landed on Ctrl+C, and the
+  bare-Esc cancel path was removed entirely (design 0006). Interjection still
+  queues rather than cancels.

@@ -4,7 +4,7 @@ Date: 2026-07-01 16:55:37 CST (original) / 2026-07-02 11:04 CST (revised) /
 2026-07-02 12:28 CST (pending-trigger interaction and line-semantics corners added) /
 2026-07-02 12:48 CST (Esc cancel added) / 2026-07-02 13:18 CST (implemented) /
 2026-07-02 14:32 CST (prompt-layer capture moved to marker ownership after an fzf false
-positive)
+positive) / 2026-07-04 (bare-Esc cancel removed; Ctrl+C is the only cancel key — design 0006)
 
 Status: implemented. The revision replaces the original "S1 + S3 completion detector"
 decision: bracketed-paste (S1) is dropped as a load-bearing signal, "command completion"
@@ -208,17 +208,15 @@ A deferred `#?` (submitted, not yet fired) is a visible interaction state:
   `command_end` is authoritative including failures. An inline `#?` asks about the line's
   future output; interrupting the command withdraws that future, and a follow-up
   standalone `#?` is the natural way to ask about the aborted past.
-- **A bare Esc cancels the pending question without killing the command.** While at least
-  one question is pending and the trigger context is armed (not on the alternate screen —
-  `vim file #? question` must never lose vim's Esc), a bare Esc is consumed: it cancels
-  the most recently submitted pending question (LIFO, one per press), prints a one-line
-  notice, and is not forwarded. The same key aborts a streaming AI response. In every
-  other state ESC is forwarded untouched, so baseline transparency is intact. A bare Esc
-  is disambiguated from escape-sequence prefixes (arrow keys, Alt combinations) by a
-  short continuation timeout (~25–50 ms), active only inside the pending/streaming
-  window. Accepted residual: a non-alt-screen program that binds ESC (for example
-  `less -X`) loses one keypress while a question is pending — bounded, visible through
-  the notice, recoverable by pressing again.
+- **Esc is forwarded untouched; Ctrl+C is the only cancel key.** A bare-Esc cancel path
+  (LIFO, one per press, with a ~40 ms escape-sequence disambiguation timeout) shipped on
+  2026-07-02 and was removed on 2026-07-04 (design 0006): it was undiscoverable against
+  the universal Ctrl+C mental model, its pending-window key swallow conflicted with
+  vi-mode line editors and Esc-binding programs (the very residual it had to accept),
+  and it kept real complexity on the stdin hot path. The one capability lost —
+  withdrawing a question about a still-running command without killing the command — is
+  an accepted residual: the question fires and yields one unwanted, ignorable answer.
+  Revisit with a non-conflicting binding if dogfooding shows the need.
 - **FIFO concurrency.** Pending triggers are per-line and independent, each firing at its
   own line's completion point; AI requests serialize through the single conversation (the
   agent session is sequential by nature) with a small defensive queue cap. Typed input
@@ -242,8 +240,8 @@ A deferred `#?` (submitted, not yet fired) is a visible interaction state:
 
 - Programs that read stdin without echoing or printing a prompt: `#?` is disarmed there by
   design; the future entry point is a koshell-owned escape hotkey (koshell owns stdin
-  forwarding), deferred. Bare Esc is now taken by pending-question cancel, so that entry
-  hotkey needs a different binding (for example double-Esc or a Ctrl combination).
+  forwarding), deferred. With the bare-Esc cancel removed, Esc is available again as an
+  entry-hotkey candidate.
 - Quote-parity misses: heredocs, triple quotes.
 - Full-screen TUIs (alt-screen): deferred, separate design.
 - Continuous tracking of a long-running command (AI keeps watching `pnpm dev` and speaks on
@@ -284,9 +282,9 @@ assert on `[koshell] #?` feedback and its position relative to output sentinels.
 - Post-stabilization semantic precision is delegated to the agent's snapshot self-check
   once the AI runtime lands.
 - Pending-trigger interaction: delayed receipt (about one second), user-typed Ctrl+C
-  cancels the pending question while autonomous failures still fire, bare Esc cancels
-  without killing the command (and aborts a streaming response), FIFO serialization
-  through one conversation.
+  cancels the pending question while autonomous failures still fire (and, since design
+  0006, also interrupts a streaming/in-flight response), FIFO serialization through one
+  conversation.
 - Accepted corners: background commands fire immediately with an empty span; REPL
   multi-line input is a miss (the shell layer is covered by shell integration); `#? /` is
   reserved for session commands.
@@ -311,11 +309,9 @@ Implemented in `crates/koshell-rs` on 2026-07-02, replacing the earlier S1 + S3 
 - The context package carries trigger metadata: `form` (standalone/inline), `completion`
   (`command_end` / `stabilized` / `max_wait`), `stillRunning`, and the exit code when the
   authoritative marker fired.
-- Pending-trigger interaction: the ~1 s delayed receipt notice, Ctrl+C cancel (with
-  `command_end` re-fire suppression so the interrupt's own failure marker stays quiet),
-  and bare-Esc cancel with a 40 ms continuation-timeout disambiguation in the stdin
-  thread. If the cancel race is lost (the question fired just before the keypress), the
-  swallowed Esc is forwarded after all, preserving transparency.
+- Pending-trigger interaction: the ~1 s delayed receipt notice and Ctrl+C cancel (with
+  `command_end` re-fire suppression so the interrupt's own failure marker stays quiet).
+  The bare-Esc cancel that also landed here was removed on 2026-07-04 (design 0006).
 - Presentation output (notices, fire feedback) is fed to the terminal mirror — the
   mirror-feed invariant of design 0002, applied to the presentation lines that exist
   today.
@@ -344,9 +340,9 @@ Implementation notes recorded for dogfooding:
 - Rendered-UI `#?` text remains an accepted residual where capture is armed: inside
   command spans (a program printing a `#?`-shaped prompt line, a finder launched as a
   command) and at non-integrated prompts. Bounded cost: one unwanted answer.
-- While the alternate screen is active, pending deadlines, notices, and the Esc cancel
-  are suspended so nothing scribbles over a full-screen program; `command_end` still
-  fires, and leaving the alternate screen re-arms pending questions.
+- While the alternate screen is active, pending deadlines, notices, and the Ctrl+C
+  cancel are suspended so nothing scribbles over a full-screen program; `command_end`
+  still fires, and leaving the alternate screen re-arms pending questions.
 - A quiet terminating command (a silent batch job) can reach the shell-layer slow tier
   and fire before its `command_end`, annotated still-running — the accepted imprecision
   the agent's snapshot self-check is designed to absorb.

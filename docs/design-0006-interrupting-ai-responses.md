@@ -114,11 +114,33 @@ linger.
   cost.
 - The interrupt aborts only the currently rendering response. Questions still
   pending terminal-side are cancelled by the existing Ctrl+C path when the byte
-  is forwarded, or left alone when it is swallowed (bare Esc remains the tool
-  for withdrawing a queued question without touching the stream).
+  is forwarded, or left alone when it is swallowed. With the bare-Esc cancel
+  removed (see below), there is no way to withdraw a queued question without
+  Ctrl+C's side effects — accepted; the cost is one unwanted, ignorable answer.
 - The partial assistant turn stays in the daemon-side pi conversation; the next
   answer may reference it. Acceptable for the prototype; revisit if it confuses
   real use.
+
+## Bare-Esc cancel removed (2026-07-04)
+
+Once Ctrl+C owned interruption, the bare-Esc pending-cancel path (design 0001,
+2026-07-02) lost its reason to exist and was removed in the same dogfooding wave:
+
+- Ctrl+C covers every cancel scenario but one — withdrawing a question about a
+  still-running command without killing the command. That niche is not worth a
+  dedicated key: the regretted question just fires and yields one ignorable
+  answer, the same bounded worst case accepted for quote-parity misses.
+- The Esc swallow was the product's most intrusive input interception: it armed
+  whenever a question was pending — exactly the moment after submitting `#?`,
+  when vi-mode line editor users habitually press Esc. Undiscoverable benefit,
+  real mental-model conflict.
+- Removal deletes the 40 ms disambiguation timeout, the `esc_window` state, and
+  the lost-race Esc re-forward from the stdin hot path, and frees Esc as a
+  candidate binding for the future non-echoing-program entry hotkey.
+
+ESC is now forwarded unconditionally, in every state. Revisit with a
+non-conflicting binding only if dogfooding shows real demand for
+question-withdrawal-without-interrupt.
 
 ## Verification
 
