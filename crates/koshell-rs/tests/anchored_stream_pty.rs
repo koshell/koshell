@@ -326,13 +326,15 @@ fn ctrl_c_mid_stream_stops_the_answer_and_cancels_daemon_side() {
         screen.contains("chunk-0"),
         "the part streamed before the interrupt stays on screen.\n--- screen ---\n{screen}"
     );
+    // How many chunks render before the interrupt depends on how fast the
+    // stabilization fired, so the assertion is about order, not count: once the
+    // interrupt notice is on screen, no further chunk may render below it.
+    let interrupted = screen.find("answer interrupted (^C)").unwrap_or_else(|| {
+        panic!("the interrupt must be acknowledged on screen.\n--- screen ---\n{screen}")
+    });
     assert!(
-        !screen.contains("chunk-12"),
+        !screen[interrupted..].contains("chunk-"),
         "the answer tail must not keep rendering after Ctrl+C.\n--- screen ---\n{screen}"
-    );
-    assert!(
-        screen.contains("answer interrupted (^C)"),
-        "the interrupt must be acknowledged on screen.\n--- screen ---\n{screen}"
     );
     assert!(
         !screen.contains("KeyboardInterrupt"),
