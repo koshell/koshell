@@ -3,6 +3,7 @@
 
 pub mod cli;
 pub mod context;
+pub mod event_log;
 pub mod ipc;
 pub mod logging;
 pub mod mirror;

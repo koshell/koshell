@@ -28,6 +28,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use crate::context::{TerminalContextOptions, build_terminal_context};
+use crate::event_log::{Event, EventLog};
 use crate::mirror::TerminalMirror;
 use crate::screen_diff::summarize_screen_diff;
 use crate::shell_integration::{MarkerKind, ShellIntegrationMarker};
@@ -97,7 +98,7 @@ pub enum CompletionKind {
 }
 
 impl CompletionKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             CompletionKind::CommandEnd => "command_end",
             CompletionKind::Stabilized => "stabilized",
@@ -113,6 +114,9 @@ pub struct Trigger {
     pub completion: CompletionKind,
     /// True when the triggering command had not returned to the prompt at fire time.
     pub still_running: bool,
+    /// When the question was submitted, for the submit-to-dispatch latency metric
+    /// (design 0007). Fallback-extracted questions use the fire instant.
+    pub submitted_at: Instant,
     pub context_package: serde_json::Value,
 }
 
@@ -135,6 +139,15 @@ enum PendingOrigin {
     PromptLine,
     /// Inside a foreground child (REPL, remote shell): stabilization is the only signal.
     InProgram,
+}
+
+impl PendingOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            PendingOrigin::PromptLine => "prompt_line",
+            PendingOrigin::InProgram => "in_program",
+        }
+    }
 }
 
 /// A submitted `#?` waiting for its line's completion or stabilization point.
@@ -213,6 +226,9 @@ pub struct SessionState {
     /// `command_end` path (fired at stabilization, or cancelled by Ctrl+C), so the
     /// marker must not extract and fire it again.
     span_settled: bool,
+    /// Dogfooding event log (design 0007); inert by default, so tests and callers
+    /// that never inject one log nothing.
+    event_log: EventLog,
 }
 
 impl SessionState {
@@ -229,7 +245,13 @@ impl SessionState {
             last_output_at: None,
             captured_since_output: false,
             span_settled: false,
+            event_log: EventLog::default(),
         }
+    }
+
+    /// Injects the session's event log; emit points stay inert without one.
+    pub fn set_event_log(&mut self, event_log: EventLog) {
+        self.event_log = event_log;
     }
 
     /// Whether the alternate screen is active (a full-screen program owns the
@@ -265,7 +287,7 @@ impl SessionState {
                     if self.command_active {
                         self.span_settled = true;
                     }
-                    actions.extend(self.cancel_all_pending("^C"));
+                    actions.extend(self.cancel_all_pending("^C", now));
                 }
                 // Submit-time capture is armed inside command spans (REPLs, remote
                 // shells) and in shells without integration hooks. At the integrated
@@ -298,19 +320,33 @@ impl SessionState {
         } else {
             PendingOrigin::PromptLine
         };
+        let form = question_form(&split.left);
+        self.event_log.emit(Event::QuestionSubmitted {
+            question: split.question.clone(),
+            origin: origin.as_str(),
+            form: form.as_str(),
+        });
         self.pending.push_back(PendingQuestion {
             question: split.question,
-            form: question_form(&split.left),
+            form,
             origin,
             submitted_at: now,
             receipt_notified: false,
         });
     }
 
-    fn cancel_all_pending(&mut self, reason: &str) -> Vec<Action> {
+    fn cancel_all_pending(&mut self, reason: &str, now: Instant) -> Vec<Action> {
         self.pending
             .drain(..)
-            .map(|pending| Action::Notice(format!("#? cancelled ({reason}): {}", pending.question)))
+            .map(|pending| {
+                self.event_log.emit(Event::QuestionCancelled {
+                    question: pending.question.clone(),
+                    pending_for_ms: now
+                        .saturating_duration_since(pending.submitted_at)
+                        .as_millis() as u64,
+                });
+                Action::Notice(format!("#? cancelled ({reason}): {}", pending.question))
+            })
             .collect()
     }
 
@@ -413,6 +449,7 @@ impl SessionState {
                 completion,
                 None,
                 still_running,
+                pending.submitted_at,
             ));
         }
         for pending in &mut self.pending {
@@ -482,9 +519,15 @@ impl SessionState {
                     if let Some(command) = &marker.command
                         && let Some(split) = extract_question(command)
                     {
+                        let form = question_form(&split.left);
+                        self.event_log.emit(Event::QuestionSubmitted {
+                            question: split.question.clone(),
+                            origin: PendingOrigin::PromptLine.as_str(),
+                            form: form.as_str(),
+                        });
                         self.pending.push_back(PendingQuestion {
                             question: split.question,
-                            form: question_form(&split.left),
+                            form,
                             origin: PendingOrigin::PromptLine,
                             submitted_at: now,
                             receipt_notified: false,
@@ -525,6 +568,7 @@ impl SessionState {
                             CompletionKind::CommandEnd,
                             marker.exit_code,
                             false,
+                            now,
                         ));
                     }
                 } else {
@@ -536,6 +580,7 @@ impl SessionState {
                             CompletionKind::CommandEnd,
                             marker.exit_code,
                             false,
+                            pending.submitted_at,
                         ));
                     }
                 }
@@ -604,6 +649,7 @@ impl SessionState {
         completion: CompletionKind,
         exit_code: Option<i32>,
         still_running: bool,
+        submitted_at: Instant,
     ) -> Action {
         let context_package =
             self.build_context_package(&question, form, completion, exit_code, still_running);
@@ -616,6 +662,7 @@ impl SessionState {
             question,
             completion,
             still_running,
+            submitted_at,
             context_package,
         })
     }
@@ -1138,5 +1185,69 @@ mod tests {
         state.record_input(b"#? is this armed\r", t0);
         assert!(!state.has_pending());
         assert!(state.poll(t0 + Duration::from_secs(60)).is_empty());
+    }
+
+    /// Drains every event line captured so far and parses each as JSON.
+    fn drain_events(rx: &std::sync::mpsc::Receiver<String>) -> Vec<serde_json::Value> {
+        rx.try_iter()
+            .map(|line| serde_json::from_str(&line).expect("event lines are valid JSON"))
+            .collect()
+    }
+
+    #[test]
+    fn submission_event_carries_the_question_but_not_the_command() {
+        let (log, rx) = EventLog::capture();
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, false);
+        state.set_event_log(log);
+        state.record_output(b"ls -la #? why did this fail", t0);
+        state.record_input(b"\r", t0);
+
+        let events = drain_events(&rx);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "question_submitted");
+        assert_eq!(events[0]["question"], "why did this fail");
+        assert_eq!(events[0]["origin"], "prompt_line");
+        assert_eq!(events[0]["form"], "inline");
+        // The privacy invariant: the command text left of `#?` never reaches
+        // the log, in any field.
+        let raw = serde_json::to_string(&events[0]).unwrap();
+        assert!(!raw.contains("ls -la"), "command text leaked: {raw}");
+    }
+
+    #[test]
+    fn ctrl_c_emits_question_cancelled_with_the_pending_duration() {
+        let (log, rx) = EventLog::capture();
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, false);
+        state.set_event_log(log);
+        state.record_output(b"#? is this slow", t0);
+        state.record_input(b"\r", t0);
+        state.record_input(&[0x03], t0 + Duration::from_millis(500));
+
+        let events = drain_events(&rx);
+        assert_eq!(events.len(), 2, "submitted then cancelled: {events:?}");
+        assert_eq!(events[1]["event"], "question_cancelled");
+        assert_eq!(events[1]["question"], "is this slow");
+        assert_eq!(events[1]["pending_for_ms"], 500);
+    }
+
+    #[test]
+    fn fired_triggers_carry_their_submission_instant() {
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        assert!(
+            state
+                .handle_marker(start_marker("sleep 1 #? why"), t0)
+                .is_empty()
+        );
+        let t1 = t0 + Duration::from_millis(800);
+        let actions = state.handle_marker(end_marker("sleep 1 #? why", 0), t1);
+        let fired = fires(&actions);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(
+            fired[0].submitted_at, t0,
+            "submit-to-dispatch latency needs the original submission instant"
+        );
     }
 }

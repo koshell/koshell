@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 use koshell_proto::{ClientMessage, ServerMessage};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
+use crate::event_log::{self, Event, EventLog};
 use crate::ipc::{self, IpcClient};
 use crate::presentation::Presentation;
 use crate::shell;
@@ -147,6 +148,19 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
     // submit-time mirror capture is confined to command spans (see `trigger.rs`).
     let shell_integrated = launch.kind.is_some();
 
+    // Dogfooding event log (design 0007): local JSONL, fail-silent, inert when
+    // disabled. The writer is joined after the child is reaped so the final
+    // `session_end` is drained before the process exits.
+    let (event_log, event_log_writer) = event_log::open();
+    let session_started = Instant::now();
+    event_log.emit(Event::SessionStart {
+        shell: meta.shell.clone(),
+        integrated: shell_integrated,
+        cols,
+        rows,
+        version: env!("CARGO_PKG_VERSION"),
+    });
+
     // Whether a Ctrl+C currently belongs to the AI response instead of the child: a
     // stream-mode response is in flight (the triggering command already ended, so no
     // foreground program is waiting for the interrupt) and the alternate screen is
@@ -162,12 +176,15 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
     let interrupt_window_proc = interrupt_window.clone();
     let writer_proc = writer.clone();
     let tx_daemon = tx.clone();
+    let event_log_proc = event_log.clone();
     let processor = thread::spawn(move || {
         let mut state = SessionState::new(cols, rows, shell_integrated);
+        state.set_event_log(event_log_proc.clone());
         let mut scanner = MarkerScanner::new();
         let mut stdout = std::io::stdout();
         let mut ipc_client: Option<IpcClient> = None;
         let mut presentation = Presentation::new();
+        presentation.set_event_log(event_log_proc.clone());
         let mut request_seq: u64 = 0;
         loop {
             // Trigger deadlines (receipt notice, stabilization tier, max-wait) and
@@ -212,6 +229,12 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
                     presentation.handle_server_message(&message, &mut stdout, &mut state, now);
                 }
                 Some(Msg::Input(bytes)) => {
+                    // Mid-stream typing metric (design 0007): a chunk with any
+                    // content beyond a bare Ctrl+C counts as typing while an
+                    // answer streams; the bytes themselves are never logged.
+                    if bytes.iter().any(|&byte| byte != 0x03) {
+                        presentation.note_mid_stream_input();
+                    }
                     actions.extend(state.record_input(&bytes, now));
                     // A forwarded Ctrl+C (command still running, or the swallow
                     // window was stale) also withdraws the in-flight response:
@@ -262,6 +285,7 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
                             &meta,
                             request_seq,
                             &trigger,
+                            &event_log_proc,
                         );
                     }
                 }
@@ -366,7 +390,19 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
     let _ = reader_handle.join();
     let _ = processor.join();
 
-    Ok(status.exit_code() as i32)
+    let exit_code = status.exit_code() as i32;
+    event_log.emit(Event::SessionEnd {
+        exit_code,
+        duration_ms: session_started.elapsed().as_millis() as u64,
+    });
+    // The processor's clones died with its join; dropping the last handle
+    // disconnects the channel so the writer drains and exits.
+    drop(event_log);
+    if let Some(writer) = event_log_writer {
+        writer.join();
+    }
+
+    Ok(exit_code)
 }
 
 /// Prints a dim one-line presentation notice and feeds it to the mirror, keeping screen
@@ -407,6 +443,7 @@ fn dispatch_trigger(
     meta: &SessionMeta,
     request_seq: u64,
     trigger: &Trigger,
+    event_log: &EventLog,
 ) {
     if ipc_client.is_none()
         && let Ok(mut client) = IpcClient::connect(socket_path)
@@ -448,10 +485,20 @@ fn dispatch_trigger(
     } else {
         false
     };
+    let now = Instant::now();
     if sent {
+        event_log.emit(Event::Dispatched {
+            request_id: request_id.clone(),
+            question: trigger.question.clone(),
+            fire_reason: trigger.completion.as_str(),
+            still_running: trigger.still_running,
+            submit_to_dispatch_ms: now
+                .saturating_duration_since(trigger.submitted_at)
+                .as_millis() as u64,
+        });
         // The streamed response (or the delayed waiting notice) is the user-facing
         // receipt; the dispatch itself is only worth a log line.
-        presentation.note_dispatch(&request_id, trigger.still_running, state, Instant::now());
+        presentation.note_dispatch(&request_id, trigger.still_running, state, now);
         log::info!(
             "#? [{request_id}] dispatched (completion: {:?}, still running: {}): {}",
             trigger.completion,
@@ -459,6 +506,12 @@ fn dispatch_trigger(
             trigger.question
         );
     } else {
+        event_log.emit(Event::DispatchFailed {
+            request_id: request_id.clone(),
+            question: trigger.question.clone(),
+            fire_reason: trigger.completion.as_str(),
+            reason: "daemon_unavailable",
+        });
         // Explicit degradation stays on the terminal: the question will get no
         // answer, and the user must know why (and in what completion state it fired).
         log::warn!(

@@ -42,6 +42,7 @@ use std::time::{Duration, Instant};
 
 use koshell_proto::ServerMessage;
 
+use crate::event_log::{Event, EventLog};
 use crate::mirror::LiveRegionSnapshot;
 use crate::trigger::SessionState;
 
@@ -115,6 +116,16 @@ struct ActiveResponse {
     anchored: bool,
     /// Anchored streaming: the AI resume point; `None` until the first delta.
     ai_end: Option<AiEnd>,
+    /// Dogfooding bookkeeping (design 0007): whether the response began anchored
+    /// (`anchored` flips off on degrade), when the first delta arrived, how many
+    /// deltas arrived, why the response degraded to block (if it did), whether the
+    /// degrade event was emitted, and how many stdin chunks arrived mid-stream.
+    began_anchored: bool,
+    first_delta_at: Option<Instant>,
+    delta_count: u32,
+    degrade_reason: Option<&'static str>,
+    degrade_emitted: bool,
+    mid_stream_input_chunks: u32,
 }
 
 impl ActiveResponse {
@@ -131,6 +142,30 @@ impl ActiveResponse {
             interleaved: false,
             anchored: false,
             ai_end: None,
+            began_anchored: false,
+            first_delta_at: None,
+            delta_count: 0,
+            degrade_reason: None,
+            degrade_emitted: false,
+            mid_stream_input_chunks: 0,
+        }
+    }
+
+    /// The `response_end` dogfooding event for this response's bookkeeping.
+    fn end_event(&self, status: &'static str, now: Instant) -> Event {
+        Event::ResponseEnd {
+            request_id: self.request_id.clone(),
+            status,
+            total_ms: now
+                .saturating_duration_since(self.dispatched_at)
+                .as_millis() as u64,
+            first_delta_ms: self
+                .first_delta_at
+                .map(|at| at.saturating_duration_since(self.dispatched_at).as_millis() as u64),
+            delta_count: self.delta_count,
+            began_anchored: self.began_anchored,
+            degraded_to_block: self.degrade_reason.is_some(),
+            mid_stream_input_chunks: self.mid_stream_input_chunks,
         }
     }
 
@@ -158,6 +193,8 @@ pub struct Presentation {
     /// so late deltas and the daemon's terminal marker are dropped silently. The
     /// local stop is authoritative — the daemon-side cancel is only best-effort.
     aborted: HashSet<String>,
+    /// Dogfooding event log (design 0007); inert by default.
+    event_log: EventLog,
 }
 
 /// Normalizes `\n` to `\r\n` for a terminal in raw mode. `last_was_cr` carries the
@@ -245,12 +282,12 @@ fn anchored_delta<W: Write>(
 ) {
     let region = match state.live_region() {
         Some(region) => region,
-        None => return degrade_to_block(active, delta),
+        None => return degrade_to_block(active, delta, "live_region_unavailable"),
     };
     if let Some(ai_end) = &active.ai_end
         && region.row_above.as_deref() != Some(ai_end.tail.as_str())
     {
-        return degrade_to_block(active, delta);
+        return degrade_to_block(active, delta, "tail_mismatch");
     }
 
     // Phase 1: lift the live region and resume the AI text.
@@ -291,10 +328,12 @@ fn anchored_delta<W: Write>(
 
 /// Switches the rest of an anchored response to block accumulation (the already
 /// streamed part stays in the free zone; the remainder is inserted as one block at
-/// response end).
-fn degrade_to_block(active: &mut ActiveResponse, delta: &str) {
+/// response end). The reason is bookkeeping for the dogfooding degrade-frequency
+/// metric; the caller emits the event (this function has no log access).
+fn degrade_to_block(active: &mut ActiveResponse, delta: &str, reason: &'static str) {
     active.mode = Mode::Block;
     active.anchored = false;
+    active.degrade_reason = Some(reason);
     active.accumulated.push_str(delta);
 }
 
@@ -325,6 +364,23 @@ impl Presentation {
             dispatched: HashMap::new(),
             active: None,
             aborted: HashSet::new(),
+            event_log: EventLog::default(),
+        }
+    }
+
+    /// Injects the session's event log; emit points stay inert without one.
+    pub fn set_event_log(&mut self, event_log: EventLog) {
+        self.event_log = event_log;
+    }
+
+    /// Counts a stdin chunk that arrived while a stream-mode response was in
+    /// flight — the mid-stream typing usage metric (design 0007). The bytes
+    /// themselves are never recorded.
+    pub fn note_mid_stream_input(&mut self) {
+        if let Some(active) = self.active.as_mut()
+            && active.mode == Mode::Stream
+        {
+            active.mid_stream_input_chunks += 1;
         }
     }
 
@@ -353,6 +409,7 @@ impl Presentation {
         let active = self.active.take()?;
         self.dispatched.remove(&active.request_id);
         self.aborted.insert(active.request_id.clone());
+        self.event_log.emit(active.end_event("interrupted", now));
         match active.mode {
             Mode::Stream if active.anchored => {
                 // The streamed part stays in the free zone; close it with an
@@ -413,6 +470,7 @@ impl Presentation {
     fn begin_response(&mut self, request_id: &str, mode: Mode, state: &SessionState, now: Instant) {
         let mut active = ActiveResponse::new(request_id.to_string(), mode, now);
         active.anchored = mode == Mode::Stream && state.resting_prompt();
+        active.began_anchored = active.anchored;
         self.active = Some(active);
     }
 
@@ -545,6 +603,21 @@ impl Presentation {
             self.begin_response(request_id, mode, state, now);
         }
         let active = self.active.as_mut().expect("active response just ensured");
+        active.delta_count += 1;
+        if active.first_delta_at.is_none() {
+            active.first_delta_at = Some(now);
+            self.event_log.emit(Event::FirstDelta {
+                request_id: active.request_id.clone(),
+                dispatch_to_first_delta_ms: now
+                    .saturating_duration_since(active.dispatched_at)
+                    .as_millis() as u64,
+                mode: match active.mode {
+                    Mode::Stream => "stream",
+                    Mode::Block => "block",
+                },
+                anchored: active.anchored,
+            });
+        }
         match active.mode {
             Mode::Stream if active.anchored => anchored_delta(active, delta, out, state),
             Mode::Stream => {
@@ -560,6 +633,19 @@ impl Presentation {
                 state.record_presentation_output(&bytes);
             }
             Mode::Block => active.accumulated.push_str(delta),
+        }
+        if let Some(reason) = active.degrade_reason
+            && !active.degrade_emitted
+        {
+            active.degrade_emitted = true;
+            self.event_log.emit(Event::DegradeToBlock {
+                request_id: active.request_id.clone(),
+                reason,
+                ms_since_dispatch: now
+                    .saturating_duration_since(active.dispatched_at)
+                    .as_millis() as u64,
+                deltas_so_far: active.delta_count,
+            });
         }
     }
 
@@ -588,6 +674,8 @@ impl Presentation {
                 return;
             }
         };
+        let status = if error.is_some() { "error" } else { "ok" };
+        self.event_log.emit(active.end_event(status, now));
 
         match active.mode {
             Mode::Stream if active.anchored => {
@@ -1431,5 +1519,145 @@ mod tests {
             screen.contains("Fresh answer"),
             "the next response must render normally: {screen}"
         );
+    }
+
+    /// Drains every event line captured so far and parses each as JSON.
+    fn drain_events(rx: &std::sync::mpsc::Receiver<String>) -> Vec<serde_json::Value> {
+        rx.try_iter()
+            .map(|line| serde_json::from_str(&line).expect("event lines are valid JSON"))
+            .collect()
+    }
+
+    #[test]
+    fn anchored_flow_emits_first_delta_and_response_end() {
+        let (log, rx) = EventLog::capture();
+        let mut presentation = Presentation::new();
+        presentation.set_event_log(log);
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        state.record_output(b">>> ", now);
+        presentation.note_dispatch("r1", false, &state, now);
+        let first = now + Duration::from_millis(300);
+        presentation.handle_server_message(&delta("r1", "One"), &mut out, &mut state, first);
+        presentation.handle_server_message(&delta("r1", " two"), &mut out, &mut state, first);
+        let done = now + Duration::from_millis(1200);
+        presentation.handle_server_message(&end("r1"), &mut out, &mut state, done);
+
+        let events = drain_events(&rx);
+        assert_eq!(events.len(), 2, "first_delta then response_end: {events:?}");
+        assert_eq!(events[0]["event"], "first_delta");
+        assert_eq!(events[0]["request_id"], "r1");
+        assert_eq!(events[0]["dispatch_to_first_delta_ms"], 300);
+        assert_eq!(events[0]["mode"], "stream");
+        assert_eq!(events[0]["anchored"], true);
+        assert_eq!(events[1]["event"], "response_end");
+        assert_eq!(events[1]["status"], "ok");
+        assert_eq!(events[1]["total_ms"], 1200);
+        assert_eq!(events[1]["first_delta_ms"], 300);
+        assert_eq!(events[1]["delta_count"], 2);
+        assert_eq!(events[1]["began_anchored"], true);
+        assert_eq!(events[1]["degraded_to_block"], false);
+        assert_eq!(events[1]["mid_stream_input_chunks"], 0);
+    }
+
+    #[test]
+    fn degrade_emits_its_reason_and_marks_the_response_end() {
+        let (log, rx) = EventLog::capture();
+        let mut presentation = Presentation::new();
+        presentation.set_event_log(log);
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        state.record_output(b">>> ", now);
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.handle_server_message(&delta("r1", "Part one."), &mut out, &mut state, now);
+        // A mid-stream command's output breaks the free-zone adjacency.
+        presentation.pty_output(b"\r\n2\r\n>>> ", &mut out, &mut state, now);
+        presentation.handle_server_message(&delta("r1", "Part two."), &mut out, &mut state, now);
+        presentation.handle_server_message(&end("r1"), &mut out, &mut state, now);
+
+        let events = drain_events(&rx);
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|event| event["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["first_delta", "degrade_to_block", "response_end"]);
+        assert_eq!(events[1]["reason"], "tail_mismatch");
+        assert_eq!(events[1]["deltas_so_far"], 2);
+        assert_eq!(events[2]["began_anchored"], true);
+        assert_eq!(events[2]["degraded_to_block"], true);
+    }
+
+    #[test]
+    fn interrupt_emits_response_end_and_the_late_finish_emits_nothing() {
+        let (log, rx) = EventLog::capture();
+        let mut presentation = Presentation::new();
+        presentation.set_event_log(log);
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        state.record_output(b">>> ", now);
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.handle_server_message(&delta("r1", "Old"), &mut out, &mut state, now);
+        presentation.user_interrupt(&mut out, &mut state, now);
+        presentation.handle_server_message(&delta("r1", "late"), &mut out, &mut state, now);
+        presentation.handle_server_message(&end("r1"), &mut out, &mut state, now);
+
+        let events = drain_events(&rx);
+        let kinds: Vec<&str> = events
+            .iter()
+            .map(|event| event["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            ["first_delta", "response_end"],
+            "the aborted tail must not emit anything: {events:?}"
+        );
+        assert_eq!(events[1]["status"], "interrupted");
+    }
+
+    #[test]
+    fn mid_stream_input_chunks_land_on_response_end() {
+        let (log, rx) = EventLog::capture();
+        let mut presentation = Presentation::new();
+        presentation.set_event_log(log);
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        state.record_output(b">>> ", now);
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.handle_server_message(&delta("r1", "Thinking"), &mut out, &mut state, now);
+        presentation.note_mid_stream_input();
+        presentation.note_mid_stream_input();
+        presentation.handle_server_message(&end("r1"), &mut out, &mut state, now);
+
+        let events = drain_events(&rx);
+        assert_eq!(events.last().unwrap()["event"], "response_end");
+        assert_eq!(events.last().unwrap()["mid_stream_input_chunks"], 2);
+    }
+
+    #[test]
+    fn block_mode_never_counts_mid_stream_input() {
+        let (log, rx) = EventLog::capture();
+        let mut presentation = Presentation::new();
+        presentation.set_event_log(log);
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        presentation.note_dispatch("r1", true, &state, now);
+        presentation.handle_server_message(&delta("r1", "block"), &mut out, &mut state, now);
+        // Typing while a command runs is ordinary shell use, not the metric.
+        presentation.note_mid_stream_input();
+        presentation.handle_server_message(&end("r1"), &mut out, &mut state, now);
+
+        let events = drain_events(&rx);
+        assert_eq!(events.last().unwrap()["event"], "response_end");
+        assert_eq!(events.last().unwrap()["mid_stream_input_chunks"], 0);
     }
 }
