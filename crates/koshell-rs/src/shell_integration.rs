@@ -42,6 +42,10 @@ pub enum ShellIntegrationKind {
 pub enum MarkerKind {
     CommandStart,
     CommandEnd,
+    /// The inner shell's working directory, reported from `precmd` on every prompt so the
+    /// foreground wrapper can mirror it onto its own process (see the working-directory
+    /// mirroring handling in `session.rs`). Carries `cwd`, never `command`/`exit_code`.
+    Cwd,
 }
 
 /// A parsed command-boundary marker.
@@ -50,6 +54,8 @@ pub struct ShellIntegrationMarker {
     pub kind: MarkerKind,
     pub command: Option<String>,
     pub exit_code: Option<i32>,
+    /// The absolute working directory, present only on [`MarkerKind::Cwd`] markers.
+    pub cwd: Option<String>,
 }
 
 /// How to launch the child shell, including any generated rc file.
@@ -100,6 +106,7 @@ pub fn parse_marker_payload(payload: &[u8]) -> Option<ShellIntegrationMarker> {
     let kind = match value.get("type")?.as_str()? {
         "command_start" => MarkerKind::CommandStart,
         "command_end" => MarkerKind::CommandEnd,
+        "cwd" => MarkerKind::Cwd,
         _ => return None,
     };
     let command = value
@@ -110,6 +117,10 @@ pub fn parse_marker_payload(payload: &[u8]) -> Option<ShellIntegrationMarker> {
         .get("exitCode")
         .and_then(serde_json::Value::as_i64)
         .map(|c| c as i32);
+    let cwd = value
+        .get("cwd")
+        .and_then(|c| c.as_str())
+        .map(str::to_string);
     Some(ShellIntegrationMarker {
         kind,
         command,
@@ -118,6 +129,7 @@ pub fn parse_marker_payload(payload: &[u8]) -> Option<ShellIntegrationMarker> {
         } else {
             None
         },
+        cwd: if kind == MarkerKind::Cwd { cwd } else { None },
     })
 }
 
@@ -126,6 +138,7 @@ pub fn format_marker(marker: &ShellIntegrationMarker) -> Vec<u8> {
     let type_str = match marker.kind {
         MarkerKind::CommandStart => "command_start",
         MarkerKind::CommandEnd => "command_end",
+        MarkerKind::Cwd => "cwd",
     };
     let mut json = serde_json::json!({ "type": type_str });
     if let Some(command) = &marker.command {
@@ -133,6 +146,9 @@ pub fn format_marker(marker: &ShellIntegrationMarker) -> Vec<u8> {
     }
     if let Some(exit_code) = marker.exit_code {
         json["exitCode"] = serde_json::Value::Number(exit_code.into());
+    }
+    if let Some(cwd) = &marker.cwd {
+        json["cwd"] = serde_json::Value::String(cwd.clone());
     }
     let payload = BASE64.encode(serde_json::to_vec(&json).unwrap_or_default());
     let mut out = Vec::new();
@@ -344,6 +360,12 @@ __koshell_emit_start() {
 __koshell_emit_end() {
   __koshell_emit_marker "command_end" "$2" "$1"
 }
+__koshell_emit_cwd() {
+  local escaped_cwd
+  escaped_cwd=$(__koshell_json_escape "$PWD")
+  __koshell_payload='{"type":"cwd","cwd":"'"$escaped_cwd"'"}'
+  printf '\033]777;koshell;%s\007' "$(__koshell_base64 "$__koshell_payload")"
+}
 "#;
 
 const BASH_HOOKS: &str = r#"__koshell_last_history_number=""
@@ -377,6 +399,9 @@ __koshell_debug_trap() {
 __koshell_prompt_command() {
   local exit_status=$?
   __koshell_in_prompt_command=1
+  # Report the working directory on every prompt so koshell mirrors the inner shell's
+  # cwd onto its own process (tmux pane_current_path, OSC 7 consumers).
+  __koshell_emit_cwd
   # Dedup by the history entry NUMBER, not its text: re-running an identical
   # command (e.g. asking the same `#?` question twice) advances the number and
   # is detected each time, while an empty Enter or prompt redraw adds no history
@@ -519,6 +544,9 @@ __koshell_zsh_preexec() {
 }
 __koshell_zsh_precmd() {
   local exit_status=$?
+  # Report the working directory on every prompt so koshell mirrors the inner shell's
+  # cwd onto its own process (tmux pane_current_path, OSC 7 consumers).
+  __koshell_emit_cwd
   if [ -n "$__koshell_zsh_command_active" ]; then
     __koshell_emit_end "$exit_status" "$__koshell_zsh_current_command"
   else
@@ -548,6 +576,7 @@ mod tests {
             kind: MarkerKind::CommandStart,
             command: Some("ls #? explain".to_string()),
             exit_code: None,
+            cwd: None,
         };
         let bytes = format_marker(&marker);
         assert!(bytes.starts_with(MARKER_PREFIX));
@@ -562,6 +591,20 @@ mod tests {
             kind: MarkerKind::CommandEnd,
             command: Some("false".to_string()),
             exit_code: Some(1),
+            cwd: None,
+        };
+        let bytes = format_marker(&marker);
+        let payload = &bytes[MARKER_PREFIX.len()..bytes.len() - 1];
+        assert_eq!(parse_marker_payload(payload), Some(marker));
+    }
+
+    #[test]
+    fn round_trips_cwd_marker() {
+        let marker = ShellIntegrationMarker {
+            kind: MarkerKind::Cwd,
+            command: None,
+            exit_code: None,
+            cwd: Some("/home/user/project".to_string()),
         };
         let bytes = format_marker(&marker);
         let payload = &bytes[MARKER_PREFIX.len()..bytes.len() - 1];
@@ -582,6 +625,7 @@ mod tests {
             kind: MarkerKind::CommandStart,
             command: Some("ls".to_string()),
             exit_code: None,
+            cwd: None,
         });
         let mut stream = b"before".to_vec();
         stream.extend_from_slice(&marker);
@@ -596,6 +640,7 @@ mod tests {
                     kind: MarkerKind::CommandStart,
                     command: Some("ls".to_string()),
                     exit_code: None,
+                    cwd: None,
                 }),
                 Segment::Visible(b"after".to_vec()),
             ]
@@ -609,6 +654,7 @@ mod tests {
             kind: MarkerKind::CommandEnd,
             command: Some("ls #? explain".to_string()),
             exit_code: Some(0),
+            cwd: None,
         });
         // Split the marker in the middle of the prefix.
         let split = 5;

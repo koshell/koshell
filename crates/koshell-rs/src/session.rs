@@ -27,7 +27,7 @@ use crate::event_log::{self, Event, EventLog};
 use crate::ipc::{self, IpcClient};
 use crate::presentation::Presentation;
 use crate::shell;
-use crate::shell_integration::{MarkerScanner, Segment, create_shell_launch_config};
+use crate::shell_integration::{MarkerKind, MarkerScanner, Segment, create_shell_launch_config};
 use crate::trigger::{Action, CompletionKind, SessionState, Trigger};
 
 /// Immutable per-session metadata used for the IPC handshake.
@@ -67,6 +67,24 @@ fn sane_size((columns, rows): (u16, u16)) -> (u16, u16) {
     (columns, rows)
 }
 
+/// Reads the terminal's pixel dimensions (`ws_xpixel`/`ws_ypixel`) from stdout so the
+/// inner PTY advertises the same geometry that pixel-addressed image protocols (sixel,
+/// kitty graphics) size against. Returns `(0, 0)` when the terminal reports no pixel
+/// size — the same "unknown" value a bare shell would see, so nothing regresses.
+fn terminal_pixel_size() -> (u16, u16) {
+    use std::os::unix::io::AsRawFd;
+    // Safety: `ws` is a valid, owned `winsize` for the duration of the ioctl, and the
+    // stdout fd is valid while this process holds it.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let fd = std::io::stdout().as_raw_fd();
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+    if rc == 0 {
+        (ws.ws_xpixel, ws.ws_ypixel)
+    } else {
+        (0, 0)
+    }
+}
+
 /// Restores the terminal out of raw mode when dropped, including on panic.
 struct RawModeGuard;
 
@@ -98,12 +116,13 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
 
     let (cols, rows) =
         sane_size(crossterm::terminal::size().unwrap_or((DEFAULT_COLUMNS, DEFAULT_ROWS)));
+    let (pixel_width, pixel_height) = terminal_pixel_size();
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
         rows,
         cols,
-        pixel_width: 0,
-        pixel_height: 0,
+        pixel_width,
+        pixel_height,
     })?;
 
     let mut cmd = CommandBuilder::new(&launch.command);
@@ -123,6 +142,9 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
         .spawn_command(cmd)
         .with_context(|| format!("failed to spawn shell {:?}", launch.command))?;
     drop(pair.slave);
+    // The inner shell's pid, for forwarding termination signals to it (see the signal
+    // thread below). The shell is a session leader on its own controlling PTY.
+    let child_pid = child.process_id();
 
     let mut reader = pair.master.try_clone_reader()?;
     // Shared with the processor thread, which forwards a swallowed Esc when the cancel
@@ -220,6 +242,19 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
                         match segment {
                             Segment::Visible(visible) => {
                                 presentation.pty_output(&visible, &mut stdout, &mut state, now);
+                            }
+                            Segment::Marker(marker) if marker.kind == MarkerKind::Cwd => {
+                                // Mirror the inner shell's working directory onto
+                                // koshell's own process so external tooling that reads
+                                // the pane process (tmux `pane_current_path`, OSC 7
+                                // consumers) sees the real directory instead of the
+                                // wrapper's startup cwd. koshell's own paths are all
+                                // absolute (XDG runtime/cache, temp rc dirs), so moving
+                                // the process cwd has no side effects; a stale directory
+                                // (since removed) just fails the chdir and is ignored.
+                                if let Some(dir) = &marker.cwd {
+                                    let _ = std::env::set_current_dir(dir);
+                                }
                             }
                             Segment::Marker(marker) => {
                                 actions.extend(state.handle_marker(marker, now));
@@ -369,20 +404,40 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
         }
     });
 
-    // SIGWINCH -> PTY resize and -> channel.
+    // SIGWINCH -> PTY resize and -> channel; SIGHUP/SIGTERM/SIGINT -> forward to the
+    // inner shell. Without forwarding, koshell would die by its own default disposition
+    // and the shell would only ever see a hang-up from the master closing; forwarding
+    // the original signal lets the shell run its real TERM/INT/HUP traps, as if it owned
+    // the TTY directly.
     let tx_resize = tx.clone();
-    let mut signals = signal_hook::iterator::Signals::new([signal_hook::consts::SIGWINCH])?;
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGWINCH,
+        signal_hook::consts::SIGHUP,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+    ])?;
     thread::spawn(move || {
-        for _ in signals.forever() {
-            if let Ok(size) = crossterm::terminal::size() {
-                let (columns, lines) = sane_size(size);
-                let _ = master.resize(PtySize {
-                    rows: lines,
-                    cols: columns,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                });
-                let _ = tx_resize.send(Msg::Resize(columns, lines));
+        for signo in signals.forever() {
+            if signo == signal_hook::consts::SIGWINCH {
+                if let Ok(size) = crossterm::terminal::size() {
+                    let (columns, lines) = sane_size(size);
+                    let (pixel_width, pixel_height) = terminal_pixel_size();
+                    let _ = master.resize(PtySize {
+                        rows: lines,
+                        cols: columns,
+                        pixel_width,
+                        pixel_height,
+                    });
+                    let _ = tx_resize.send(Msg::Resize(columns, lines));
+                }
+            } else if let Some(pid) = child_pid {
+                // The shell's exit then closes the PTY, the reader hits EOF, and the main
+                // thread's `child.wait()` reaps it; a shell that traps and survives keeps
+                // koshell alive with it, which is the transparent outcome. A failed kill
+                // (already reaped) is ignored.
+                unsafe {
+                    libc::kill(pid as libc::pid_t, signo);
+                }
             }
         }
     });

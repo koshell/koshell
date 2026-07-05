@@ -587,6 +587,10 @@ impl SessionState {
                 self.span_settled = false;
                 actions
             }
+            // Working-directory markers are process-level, not trigger state: the session
+            // loop intercepts them and mirrors the directory onto koshell's own process
+            // before ever reaching here, so this arm is only for match exhaustiveness.
+            MarkerKind::Cwd => Vec::new(),
         }
     }
 
@@ -755,6 +759,7 @@ mod tests {
             kind: MarkerKind::CommandEnd,
             command: Some(command.to_string()),
             exit_code: Some(exit_code),
+            cwd: None,
         }
     }
 
@@ -763,6 +768,7 @@ mod tests {
             kind: MarkerKind::CommandStart,
             command: Some(command.to_string()),
             exit_code: None,
+            cwd: None,
         }
     }
 

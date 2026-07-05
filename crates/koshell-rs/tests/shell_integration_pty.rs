@@ -127,6 +127,33 @@ fn feedback_count(output: &str) -> usize {
     output.matches("[koshell] #?").count()
 }
 
+/// Reads a live process's working directory by pid, cross-platform. Returns `None` when
+/// it cannot be determined (unsupported platform, missing `lsof`, or the process is gone),
+/// in which case the caller skips rather than failing.
+fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // `-Fn` prints field-tagged records; the current-directory path is the line that
+        // starts with the `n` (name) field tag.
+        let output = std::process::Command::new("lsof")
+            .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix('n').map(std::path::PathBuf::from))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// Extracts the value printed after `tag` (e.g. `ZD:`). Terminal escape sequences may
 /// share the line with the value (bracketed-paste toggles), so this matches the tag
 /// anywhere in a line; the echoed `printf` command line itself is skipped because its
@@ -267,6 +294,117 @@ fn zsh_does_not_leak_integration_zdotdir_into_the_session() {
         Some("unset"),
         "KOSHELL_USER_ZDOTDIR was not cleaned out of the session.\n\
          --- captured PTY output ---\n{output}"
+    );
+}
+
+#[test]
+fn zsh_cwd_mirrors_the_inner_shell_working_directory() {
+    let Some(zsh) = find_shell(&["/bin/zsh", "/usr/bin/zsh", "/opt/homebrew/bin/zsh"]) else {
+        eprintln!("skipping cwd test: no zsh interpreter found");
+        return;
+    };
+    assert_cwd_mirrors(zsh, ".zshrc", "setopt interactive_comments\n");
+}
+
+#[test]
+fn bash_cwd_mirrors_the_inner_shell_working_directory() {
+    let Some(bash) = find_shell(&[
+        "/opt/homebrew/bin/bash",
+        "/usr/local/bin/bash",
+        "/bin/bash",
+        "/usr/bin/bash",
+    ]) else {
+        eprintln!("skipping cwd test: no bash interpreter found");
+        return;
+    };
+    assert_cwd_mirrors(bash, ".bashrc", "HISTCONTROL=\n");
+}
+
+/// Drives an interactive shell to `cd` into a fresh directory and asserts koshell mirrors
+/// it onto its own process cwd.
+///
+/// The reported tmux bug: after the inner shell `cd`s, koshell's own process cwd stayed
+/// frozen at startup, so `pane_current_path` (which reads the pane process) split into the
+/// wrong directory. The precmd cwd marker must move koshell's process cwd to match.
+fn assert_cwd_mirrors(shell: &str, rc_name: &str, rc_contents: &str) {
+    let home = tempfile::tempdir().expect("create temp HOME");
+    std::fs::write(home.path().join(rc_name), rc_contents).expect("write rc");
+    let runtime = tempfile::tempdir().expect("create temp XDG_RUNTIME_DIR");
+    // A distinct destination directory, canonicalized because macOS resolves temp paths
+    // through /private and lsof reports the resolved form.
+    let target = tempfile::tempdir().expect("create target dir");
+    let target_canonical = std::fs::canonicalize(target.path()).expect("canonicalize target");
+
+    let pty = native_pty_system();
+    let pair = pty
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open pty");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_koshell"));
+    cmd.env_clear();
+    cmd.env("KOSHELL_NO_DAEMON_SPAWN", "1");
+    cmd.env("SHELL", shell);
+    cmd.env("HOME", home.path());
+    cmd.env("XDG_RUNTIME_DIR", runtime.path());
+    cmd.env("PATH", "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin");
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("HISTFILE", home.path().join(".shell_history"));
+
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn koshell");
+    drop(pair.slave);
+    let koshell_pid = child.process_id().expect("koshell pid");
+
+    if process_cwd(koshell_pid).is_none() {
+        eprintln!("skipping cwd test: cannot read a process cwd on this platform");
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    }
+
+    // Drain PTY output so the shell never blocks on a full pty buffer.
+    let mut reader = pair.master.try_clone_reader().expect("clone pty reader");
+    let drain = thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+        }
+    });
+    let mut writer = pair.master.take_writer().expect("take pty writer");
+
+    let cd_line = format!("cd {}\n", target_canonical.display());
+    writer.write_all(cd_line.as_bytes()).expect("write cd");
+    writer.flush().expect("flush cd");
+
+    // Poll koshell's process cwd until it mirrors the inner shell's `cd`, or time out.
+    let deadline = Instant::now() + OVERALL_TIMEOUT;
+    let mut mirrored = false;
+    while Instant::now() < deadline {
+        if process_cwd(koshell_pid).is_some_and(|cwd| cwd == target_canonical) {
+            mirrored = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let observed = process_cwd(koshell_pid);
+    writer.write_all(b"exit\n").expect("write exit");
+    writer.flush().expect("flush exit");
+    drop(writer);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = drain.join();
+
+    assert!(
+        mirrored,
+        "koshell did not mirror the inner shell's cwd: expected {target_canonical:?}, \
+         observed {observed:?}"
     );
 }
 

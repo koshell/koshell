@@ -1327,6 +1327,7 @@ mod tests {
                 kind: MarkerKind::CommandStart,
                 command: Some("python3".to_string()),
                 exit_code: None,
+                cwd: None,
             },
             now,
         );
