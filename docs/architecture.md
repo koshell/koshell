@@ -8,9 +8,12 @@ terminal operator while AI assists from beside the shell.
 - **`koshell-rs` (Rust, foreground)** — one process per terminal window. Owns:
   - PTY spawn, stdin/stdout forwarding, resize (rows/cols and pixel geometry), signal
     forwarding (`SIGHUP`/`SIGTERM`/`SIGINT` relayed to the inner shell), nested-start
-    guard, and working-directory mirroring (a `precmd` cwd marker moves koshell's own
-    process cwd so `tmux pane_current_path` reads the inner shell's directory; see
-    `fix-0005-pty-wrapper-transparency.md`);
+    guard, faithful exit-code propagation (a signal death surfaces as `128 + signo` via a
+    direct `waitpid`), fail-open startup safety (a `preflight` gate plus exec-into-the-real-shell
+    on any pre-takeover error, so the `exec koshell` auto-wrap cannot lock out a terminal),
+    and working-directory mirroring (a `precmd` cwd marker moves koshell's own process cwd
+    so `tmux pane_current_path` reads the inner shell's directory; see
+    `fix-0005-pty-wrapper-transparency.md` and `fix-0006-exit-code-fidelity-and-fail-open.md`);
   - CLI launch modes: `koshell` wraps the default shell; `koshell <command> [args...]`
     launches that program directly (explicit bash/zsh still gets integration, appended
     before user arguments; any other program runs without integration, so `#?` uses the

@@ -94,6 +94,50 @@ impl Drop for RawModeGuard {
     }
 }
 
+/// Cheap, TTY-free readiness probe backing `koshell preflight`. The auto-wrap snippet
+/// runs it as `koshell preflight && exec koshell`, on the *outer* shell — the safe side
+/// of the `exec`. It confirms the two preconditions a fail-open cannot recover from on
+/// its own: that the binary loads and runs at all (implied by reaching this code, so a
+/// binary too broken to start makes `koshell preflight` itself fail and the snippet keep
+/// the current shell), and that a real shell is resolvable so any later fail-open has
+/// somewhere to land. Returns a process exit code: `0` ready, non-zero not.
+pub fn preflight() -> i32 {
+    let env: HashMap<String, String> = std::env::vars().collect();
+    // Already inside koshell: the snippet guards this too, but never green-light a nested
+    // exec (which `run_interactive_shell` would reject anyway).
+    if shell::is_nested_koshell(&env) {
+        return 1;
+    }
+    match shell::resolve_shell(&env) {
+        Ok(_) => 0,
+        Err(error) => {
+            log::warn!("koshell preflight: no shell resolvable: {error}");
+            1
+        }
+    }
+}
+
+/// Fails open to the user's real shell after a startup failure under the `exec koshell`
+/// auto-wrap. Replacing koshell's process image with a bare shell is strictly safer than
+/// exiting: an `exec`-ed koshell that dies would otherwise close the terminal, and on a
+/// Linux login TTY that can be the user's only way in. `KOSHELL_NO_AUTO=1` stops the
+/// fresh shell's rc snippet from re-`exec`-ing koshell, which would loop the crash. This
+/// returns only if no shell could be resolved or the `exec` itself failed; the caller
+/// then exits non-zero.
+pub fn exec_fallback_shell() {
+    use std::os::unix::process::CommandExt;
+    let env: HashMap<String, String> = std::env::vars().collect();
+    let Ok(shell) = shell::resolve_shell(&env) else {
+        log::error!("koshell fail-open: no shell resolvable, cannot recover");
+        return;
+    };
+    // `exec` never returns on success; a returned error falls through to the caller.
+    let error = std::process::Command::new(&shell)
+        .env("KOSHELL_NO_AUTO", "1")
+        .exec();
+    log::error!("koshell fail-open exec of {shell} failed: {error}");
+}
+
 /// Runs an interactive session wrapped in a PTY and returns the child's exit code.
 /// With an empty `command`, launches the default shell (with integration for
 /// bash/zsh); otherwise launches `command[0]` with the remaining elements as its
@@ -444,11 +488,10 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
 
     drop(tx);
 
-    let status = child.wait()?;
+    let exit_code = reap_child(&mut *child, child_pid);
     let _ = reader_handle.join();
     let _ = processor.join();
 
-    let exit_code = status.exit_code() as i32;
     event_log.emit(Event::SessionEnd {
         exit_code,
         duration_ms: session_started.elapsed().as_millis() as u64,
@@ -461,6 +504,51 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
     }
 
     Ok(exit_code)
+}
+
+/// Reaps the inner shell and computes its exit code with faithful signal semantics: a
+/// process killed by signal N reports `128 + N`, the same value a shell reports in `$?`
+/// for its own children and the value a parent shell would see for koshell had koshell
+/// been killed directly. `portable_pty`'s `ExitStatus` collapses every signal death to
+/// code 1 (it renders the numeric signal to a localized string and drops the number), so
+/// we reap the pid ourselves via `waitpid` and read `WIFSIGNALED`/`WTERMSIG` directly.
+///
+/// This direct `waitpid` is the only reaper and cannot double-reap: the concrete Unix
+/// `Child` behind portable-pty is a `std::process::Child` (its `Drop` does not reap) and
+/// portable-pty installs no `SIGCHLD` handler in the parent. The wait targets the shell's
+/// specific pid, so it never reaps the AI daemon or any other child. When the pid is
+/// unknown (the API is fallible, though Unix always yields one for a spawned child) or the
+/// `waitpid` fails, we fall back to portable-pty's own wait, which returns immediately if
+/// the child was already reaped.
+fn reap_child(child: &mut (dyn portable_pty::Child + Send + Sync), child_pid: Option<u32>) -> i32 {
+    if let Some(pid) = child_pid {
+        let pid = pid as libc::pid_t;
+        let mut status: libc::c_int = 0;
+        loop {
+            // Safety: `status` is a valid, owned out-param for the duration of the call.
+            let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if rc == -1 {
+                // A forwarded signal (e.g. SIGWINCH on resize) can interrupt the wait;
+                // retry. Any other error falls through to portable-pty's wait.
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if libc::WIFSIGNALED(status) {
+                return 128 + libc::WTERMSIG(status);
+            }
+            if libc::WIFEXITED(status) {
+                return libc::WEXITSTATUS(status);
+            }
+            // Stopped/continued (untraced without WUNTRACED shouldn't occur): keep waiting
+            // for the terminal state.
+        }
+    }
+    child
+        .wait()
+        .map(|status| status.exit_code() as i32)
+        .unwrap_or(1)
 }
 
 /// Prints a dim one-line presentation notice and feeds it to the mirror, keeping screen

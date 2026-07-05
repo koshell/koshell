@@ -9,8 +9,8 @@
 //! `--` allows a program whose name starts with a dash. Unknown dashed arguments before
 //! the program are rejected so the option namespace stays reserved for future flags.
 //!
-//! `shell-init` and `daemon` shadow programs literally named that; launching such
-//! a program requires a path form (for example `koshell ./shell-init` or
+//! `shell-init`, `daemon`, and `preflight` shadow programs literally named that;
+//! launching such a program requires a path form (for example `koshell ./shell-init` or
 //! `koshell ./daemon`). Accepted residual of reserving the names.
 
 use clap::{Parser, Subcommand};
@@ -49,6 +49,12 @@ pub enum Command {
         #[arg(value_enum, value_name = "SHELL")]
         shell: InitShell,
     },
+
+    /// Fast, TTY-free readiness probe used by the auto-wrap snippet as
+    /// `koshell preflight && exec koshell`: it exits 0 only when koshell can start and a
+    /// real shell is resolvable, so the snippet keeps the current shell instead of
+    /// `exec`-ing into a koshell that would immediately fail and close the terminal.
+    Preflight,
 
     /// Inspect or control the AI daemon (status, start, stop, restart). The
     /// terminal auto-starts the daemon on demand; these are for manual control.
@@ -170,6 +176,17 @@ mod tests {
         // A path spelling still launches a real program of that name.
         let cli = parse(&["./shell-init", "zsh"]).unwrap();
         assert_eq!(launch(&cli), ["./shell-init", "zsh"]);
+    }
+
+    #[test]
+    fn preflight_parses_and_a_program_named_preflight_needs_a_path_form() {
+        assert_eq!(
+            parse(&["preflight"]).unwrap().command,
+            Some(Command::Preflight)
+        );
+        // A path spelling still launches a real program of that name.
+        let cli = parse(&["./preflight", "--check"]).unwrap();
+        assert_eq!(launch(&cli), ["./preflight", "--check"]);
     }
 
     #[test]

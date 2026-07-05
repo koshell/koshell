@@ -50,10 +50,32 @@ Guards, in order:
 - stdin and stdout are TTYs (`-t 0 && -t 1`) — excludes `ssh host cmd`, scp, and IDE
   background shells;
 - `TERM != dumb` — excludes Emacs TRAMP and similar;
-- `command -v koshell` — never `exec` a missing binary.
+- `command -v koshell` — never `exec` a missing binary;
+- `koshell preflight` — a fast, TTY-free readiness probe (`crates/koshell-rs/src/
+session.rs`) that exits 0 only when koshell can start and a real shell is resolvable.
+  It runs on the outer shell, the safe side of the `exec`, so a binary too broken to
+  start (or an environment with no resolvable shell) fails the probe and the shell is
+  kept instead of `exec`-ed into a koshell that would immediately die and close the
+  terminal. See "Fail-open on startup failure" below.
 
 The snippet is `eval`-safe: the guard path falls through without `exit`/`return`, so a
 shell that fails the guard continues its rc unaffected.
+
+## Fail-open on startup failure
+
+`preflight` guards the failures visible _before_ the `exec` (binary won't load, no shell
+resolvable). Failures that surface only inside the real run — a panic or error during
+koshell's own startup after `exec` has already replaced the shell — are handled by
+koshell itself failing open (`crates/koshell-rs/src/main.rs`): every startup step before
+koshell takes over the terminal (`enable_raw_mode`) is recoverable, and on any such error
+or panic koshell `exec`s the user's real shell instead of `exit`-ing. `RawModeGuard`
+restores cooked mode while unwinding, so the fallback shell lands on a usable terminal.
+The fallback shell is started with `KOSHELL_NO_AUTO=1` so its rc snippet does not
+re-`exec` koshell straight back into the same crash. This fail-open applies only to the
+bare `exec koshell` (auto-wrap) form; an explicit `koshell <command>` still has its parent
+shell to return to, so it exits non-zero as before. Together, `preflight` (pre-`exec`) and
+the koshell-side fallback (post-`exec`) close the Linux-login-TTY lock-out that made the
+`exec` install risky (audit obligation 16).
 
 ## File placement guidance
 
@@ -77,24 +99,36 @@ unknown dashed options are rejected. Accepted residual: a program literally name
 ## Tests
 
 - `crates/koshell-rs/src/shell_init.rs` — snippet syntax checks via `bash -n` /
-  `zsh -n` (skip when the interpreter is missing) and guard-presence assertions.
-- `crates/koshell-rs/src/cli.rs` — subcommand parsing plus regression tests for the
-  pre-existing launch semantics.
+  `zsh -n` (skip when the interpreter is missing) and guard-presence assertions,
+  including the `koshell preflight` gate.
+- `crates/koshell-rs/src/cli.rs` — subcommand parsing (including `preflight`) plus
+  regression tests for the pre-existing launch semantics.
 - `crates/koshell-rs/tests/shell_init_pty.rs` — end-to-end: spawns the real shell in a
   PTY with the built `koshell` on `PATH` and the `eval` line in an isolated rc, then
   asserts the probe answers from inside the wrap (`KOSHELL=1`), and that
   `KOSHELL_NO_AUTO=1` leaves the original shell in place.
+- `crates/koshell-rs/tests/fail_open_pty.rs` — end-to-end: drives koshell into a
+  deterministic pre-takeover failure (the nested-koshell guard) and asserts it falls open
+  to a live shell carrying `KOSHELL_NO_AUTO=1`, proving the terminal is not left dead.
 
 ## Open issues
 
-- **Startup-crash lock-out UX**: if koshell starts and dies before the PTY session is
-  usable, the window closes too fast to read the error. The escape hatches mitigate;
-  a friendlier option would be a "hold and show the error for N seconds when launched
-  via auto-wrap" mode (the snippet could pass a flag once the option namespace grows).
+- **Startup-crash lock-out**: resolved. A `koshell preflight` gate in the snippet plus
+  koshell's own fail-open (exec the real shell on any pre-takeover error or panic) mean a
+  startup crash now falls through to a working shell rather than closing the terminal (see
+  "Fail-open on startup failure"). The remaining rough edge is UX, not safety: the error
+  text scrolls past quickly. A "hold and show the error for N seconds" mode is still a
+  possible refinement (the snippet could pass a flag once the option namespace grows).
 - **tmux topology**: tmux started outside koshell gets one koshell per pane
   (auto-wrap in each pane shell); tmux started inside koshell inherits `KOSHELL=1`
   and its panes stay unwrapped. Both are coherent, but the difference is undocumented
   for users beyond this note.
-- **`SHLVL` off by one** in the wrapped shell. Cosmetic; no action planned.
+- **`SHLVL` is accurate** (corrected 2026-07-05). An earlier note here claimed the
+  wrapped shell's `SHLVL` was off by one; empirical PTY probing disproved it. koshell
+  never touches `SHLVL`: the shell increments it on startup and decrements it before any
+  `exec`, so `exec koshell` hands koshell an already-decremented value and the inner shell
+  re-increments back to the correct level. A shell launched under the wrap reports the
+  same `SHLVL` as a bare one; a non-shell (`koshell vim`) inherits the value unchanged, as
+  it should. No code path modifies `SHLVL`, and none should.
 - The no-auto flag file is checked only by the snippet, not by koshell itself;
   running `koshell` manually ignores it. Intentional for now.
