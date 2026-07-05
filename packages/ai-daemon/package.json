@@ -1,7 +1,7 @@
 {
   "name": "@koshell/ai-daemon",
   "version": "0.1.0",
-  "description": "Koshell AI daemon: receives terminal #? requests over IPC (pi integration lands next stage).",
+  "description": "Koshell AI daemon (Bun): receives terminal #? requests over IPC and answers them through a pi-backed agent session.",
   "private": true,
   "type": "module",
   "license": "Apache-2.0",
@@ -9,19 +9,22 @@
     "koshell-ai-daemon": "src/index.ts"
   },
   "scripts": {
-    "start": "node src/index.ts",
+    "start": "bun src/index.ts",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --passWithNoTests"
+    "test": "bun test",
+    "build:binary": "bun build --compile src/index.ts --outfile dist/koshell-ai-daemon",
+    "smoke": "bun scripts/smoke.ts bun src/index.ts",
+    "smoke:binary": "bun run build:binary && bun scripts/smoke.ts ./dist/koshell-ai-daemon"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@types/bun": "^1.3.14",
     "@types/node": "^26.0.1",
     "eslint": "^10.5.0",
     "eslint-config-prettier": "^10.1.8",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.62.0",
-    "vitest": "^4.1.9"
+    "typescript-eslint": "^8.62.0"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.80.3"

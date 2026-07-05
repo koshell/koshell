@@ -27,11 +27,14 @@ terminal operator while AI assists from beside the shell.
     `design-0001-repl-command-completion.md` for the trigger semantics and detector
     design.
   - It remains usable as a transparent shell wrapper when the AI daemon is absent.
-- **`koshell-ai-daemon` (Node.js, shared)** — one process per user session. Receives
+- **`koshell-ai-daemon` (Bun, shared)** — one process per user session. Receives
   `#?` requests over IPC and answers them through pi-backed agent conversations, one
   persistent conversation per terminal session, discarded on disconnect (see
   `design-0002-ai-output-and-context-boundaries.md`). Requests are serialized FIFO per
-  conversation; responses stream back as `ai_delta` messages. Provider/model/auth
+  conversation; responses stream back as `ai_delta` messages. The terminal auto-spawns
+  the daemon on demand and it is single-instance per user (the socket is the lock),
+  exiting itself after an idle period; lifecycle and the Bun runtime choice are owned by
+  `design-0008-daemon-lifecycle-auto-spawn-and-bun-runtime.md`. Provider/model/auth
   resolution currently delegates to pi's own default chain (`~/.pi/agent/auth.json`,
   then provider environment variables such as `ANTHROPIC_API_KEY`); Koshell-owned
   XDG/TOML provider configuration and the read-only terminal tool loop are later
@@ -40,7 +43,9 @@ terminal operator while AI assists from beside the shell.
 ## Dependency boundaries
 
 - Terminal-core (Rust) must not depend on any LLM provider or the pi packages.
-- Provider/model/auth and the pi agent session live only in the Node daemon.
+- Provider/model/auth and the pi agent session live only in the AI daemon.
+- The daemon's source uses `node:` APIs only; Bun is its runtime and packager, not an
+  API surface, so the runtime choice stays reversible.
 - The two runtimes communicate only through `koshell-proto` messages.
 
 ## IPC

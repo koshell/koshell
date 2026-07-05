@@ -23,8 +23,10 @@ pub fn resolve_filter(cli_level: Option<&str>) -> String {
     }
 }
 
-/// The log file path under the XDG state directory.
-pub fn log_file_path() -> PathBuf {
+/// The koshell state directory: `$XDG_STATE_HOME/koshell`, falling back to
+/// `~/.local/state/koshell`. Shared by the terminal log and the auto-spawned
+/// daemon log.
+pub fn state_dir() -> PathBuf {
     let base = match std::env::var("XDG_STATE_HOME") {
         Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
         _ => {
@@ -32,7 +34,12 @@ pub fn log_file_path() -> PathBuf {
             PathBuf::from(home).join(".local").join("state")
         }
     };
-    base.join("koshell").join("koshell.log")
+    base.join("koshell")
+}
+
+/// The log file path under the XDG state directory.
+pub fn log_file_path() -> PathBuf {
+    state_dir().join("koshell.log")
 }
 
 /// Initializes the global logger. Failing to open the log file disables logging

@@ -70,6 +70,11 @@ pub enum ClientMessage {
     },
     /// Graceful shutdown of a terminal session.
     Bye { terminal_session_id: String },
+    /// Diagnostics request for `koshell daemon status`; answered with
+    /// [`ServerMessage::Status`] regardless of the `hello` handshake (asking a
+    /// version-mismatched daemon for its identity is exactly the use case).
+    /// Additive: a daemon that does not know this type ignores it.
+    StatusRequest {},
 }
 
 /// A message sent from the AI daemon back to the terminal process.
@@ -90,6 +95,16 @@ pub enum ServerMessage {
     AiResponseEnd { request_id: String },
     /// Terminal failure marker: no further messages follow for this request.
     AiError { request_id: String, message: String },
+    /// Reply to [`ClientMessage::StatusRequest`]: the daemon's identity and load.
+    /// `version` is the daemon package version; `connections` is the live terminal
+    /// count at reply time. Additive: an older terminal's IPC reader ignores it.
+    Status {
+        pid: u32,
+        version: String,
+        protocol_version: u32,
+        uptime_ms: u64,
+        connections: u32,
+    },
 }
 
 #[cfg(test)]

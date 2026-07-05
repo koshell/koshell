@@ -1,7 +1,7 @@
 {
   "name": "koshell",
   "version": "0.1.0",
-  "description": "Human-centric shared terminal: Rust terminal-core beside a Node AI daemon.",
+  "description": "Human-centric shared terminal: Rust terminal-core beside a Bun AI daemon.",
   "private": true,
   "type": "module",
   "license": "Apache-2.0",
@@ -9,17 +9,19 @@
     "type": "git",
     "url": "git+https://github.com/koshell/koshell.git"
   },
+  "workspaces": [
+    "packages/*"
+  ],
   "engines": {
-    "node": ">=24",
-    "pnpm": ">=11"
+    "bun": ">=1.3"
   },
   "scripts": {
     "format": "prettier . --write --list-different",
     "format:check": "prettier . --check",
-    "lint": "pnpm -r lint",
-    "typecheck": "pnpm -r typecheck",
-    "test": "pnpm -r test",
-    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test",
+    "lint": "bun run --filter './packages/*' lint",
+    "typecheck": "bun run --filter './packages/*' typecheck",
+    "test": "bun run --filter './packages/*' test",
+    "check": "bun run format:check && bun run lint && bun run typecheck && bun run test",
     "prepare": "husky"
   },
   "lint-staged": {

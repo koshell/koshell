@@ -9,9 +9,9 @@
 //! `--` allows a program whose name starts with a dash. Unknown dashed arguments before
 //! the program are rejected so the option namespace stays reserved for future flags.
 //!
-//! `shell-init` shadows a program literally named `shell-init`; launching such a
-//! program requires a path form (for example `koshell ./shell-init`). Accepted
-//! residual of reserving the name.
+//! `shell-init` and `daemon` shadow programs literally named that; launching such
+//! a program requires a path form (for example `koshell ./shell-init` or
+//! `koshell ./daemon`). Accepted residual of reserving the names.
 
 use clap::{Parser, Subcommand};
 
@@ -50,9 +50,29 @@ pub enum Command {
         shell: InitShell,
     },
 
+    /// Inspect or control the AI daemon (status, start, stop, restart). The
+    /// terminal auto-starts the daemon on demand; these are for manual control.
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+
     /// Program to launch instead of the default shell, with its arguments.
     #[command(external_subcommand)]
     Launch(Vec<String>),
+}
+
+/// Manual lifecycle actions for the AI daemon.
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum DaemonAction {
+    /// Report whether the daemon is running, and its identity if so.
+    Status,
+    /// Start the daemon if it is not already running.
+    Start,
+    /// Stop the running daemon.
+    Stop,
+    /// Restart the daemon (stop if running, then start).
+    Restart,
 }
 
 #[cfg(test)]
@@ -150,5 +170,37 @@ mod tests {
         // A path spelling still launches a real program of that name.
         let cli = parse(&["./shell-init", "zsh"]).unwrap();
         assert_eq!(launch(&cli), ["./shell-init", "zsh"]);
+    }
+
+    #[test]
+    fn daemon_subcommand_parses_each_action() {
+        for (arg, expected) in [
+            ("status", DaemonAction::Status),
+            ("start", DaemonAction::Start),
+            ("stop", DaemonAction::Stop),
+            ("restart", DaemonAction::Restart),
+        ] {
+            let cli = parse(&["daemon", arg]).unwrap();
+            assert_eq!(cli.command, Some(Command::Daemon { action: expected }));
+        }
+    }
+
+    #[test]
+    fn daemon_requires_an_action() {
+        assert!(parse(&["daemon"]).is_err());
+        let error = parse(&["daemon", "bogus"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn a_program_named_daemon_needs_a_path_form() {
+        // Reserved name: plain `daemon` is the subcommand.
+        assert!(matches!(
+            parse(&["daemon", "status"]).unwrap().command,
+            Some(Command::Daemon { .. })
+        ));
+        // A path spelling still launches a real program of that name.
+        let cli = parse(&["./daemon", "status"]).unwrap();
+        assert_eq!(launch(&cli), ["./daemon", "status"]);
     }
 }

@@ -14,9 +14,33 @@ import {
   serializeServerMessage,
 } from "./protocol.ts";
 
+// A snapshot of the daemon's identity and load, for `status_request`.
+export interface DaemonStatus {
+  pid: number;
+  version: string;
+  protocol_version: number;
+  uptime_ms: number;
+  connections: number;
+}
+
+// What one TerminalConnection needs. `status` is injected by startDaemon (which
+// owns the connection counter and the start time); its absence just makes
+// status_request a no-op, which keeps unit tests that never exercise status
+// free of the plumbing.
+export interface ConnectionOptions {
+  createAgent: AgentFactory;
+  log: Logger;
+  status?: () => DaemonStatus;
+}
+
+// What index.ts passes to startDaemon. `version` is the daemon package version
+// reported by status; the idle knobs let a terminal-less daemon exit itself.
 export interface DaemonOptions {
   createAgent: AgentFactory;
   log: Logger;
+  version: string;
+  idleTimeoutMs?: number;
+  onIdle?: () => void;
 }
 
 // Where a connection's server messages are written. Abstracted from net.Socket so
@@ -40,7 +64,7 @@ function errorText(error: unknown): string {
 // the reason inline instead of failing on a message-shape mismatch later.
 export class TerminalConnection {
   private readonly sink: MessageSink;
-  private readonly options: DaemonOptions;
+  private readonly options: ConnectionOptions;
   private hello: HelloMessage | undefined;
   // Why ai_requests cannot be served yet; cleared by a version-matching hello.
   private helloRejection: string | undefined =
@@ -54,7 +78,7 @@ export class TerminalConnection {
   private runningRequestId: string | undefined;
   private closed = false;
 
-  constructor(sink: MessageSink, options: DaemonOptions) {
+  constructor(sink: MessageSink, options: ConnectionOptions) {
     this.sink = sink;
     this.options = options;
   }
@@ -126,6 +150,13 @@ export class TerminalConnection {
         this.options.log.info(`bye from ${message.terminal_session_id}`);
         this.dispose();
         break;
+      case "status_request": {
+        const status = this.options.status?.();
+        if (status !== undefined) {
+          this.send({ type: "status", ...status });
+        }
+        break;
+      }
     }
   }
 
@@ -213,12 +244,60 @@ export class TerminalConnection {
   }
 }
 
-// Starts the JSONL Unix-socket daemon on the given path.
+// Starts the JSONL Unix-socket daemon on the given path. Tracks the live
+// connection count so `status` can report it and so a terminal-less daemon can
+// exit itself after `idleTimeoutMs` — the idle timer is armed at listen time
+// too, so a daemon whose terminal died before connecting does not linger.
 export function startDaemon(
   socketPath: string,
   options: DaemonOptions,
 ): net.Server {
+  const startedAt = Date.now();
+  let connections = 0;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const armIdle = (): void => {
+    if (options.idleTimeoutMs === undefined || options.onIdle === undefined) {
+      return;
+    }
+    // Never arm while a terminal is attached. This guards the listen-time arm
+    // against a connection that raced in before the listen callback ran: without
+    // it, the timer would arm despite the live connection and exit the daemon
+    // out from under a terminal it is serving.
+    if (connections > 0) {
+      return;
+    }
+    if (idleTimer !== undefined) {
+      clearTimeout(idleTimer);
+    }
+    idleTimer = setTimeout(() => {
+      options.onIdle?.();
+    }, options.idleTimeoutMs);
+  };
+  const cancelIdle = (): void => {
+    if (idleTimer !== undefined) {
+      clearTimeout(idleTimer);
+      idleTimer = undefined;
+    }
+  };
+
+  const status = (): DaemonStatus => ({
+    pid: process.pid,
+    version: options.version,
+    protocol_version: PROTOCOL_VERSION,
+    uptime_ms: Date.now() - startedAt,
+    connections,
+  });
+
+  const connectionOptions: ConnectionOptions = {
+    createAgent: options.createAgent,
+    log: options.log,
+    status,
+  };
+
   const server = net.createServer((socket) => {
+    connections += 1;
+    cancelIdle();
     const decoder = new NdjsonDecoder();
     options.log.info("terminal connected");
 
@@ -229,7 +308,7 @@ export function startDaemon(
         }
       },
     };
-    const connection = new TerminalConnection(sink, options);
+    const connection = new TerminalConnection(sink, connectionOptions);
 
     socket.on("data", (chunk: Buffer) => {
       for (const line of decoder.push(chunk.toString("utf8"))) {
@@ -242,12 +321,17 @@ export function startDaemon(
     });
     socket.on("close", () => {
       connection.dispose();
+      connections -= 1;
+      if (connections === 0) {
+        armIdle();
+      }
       options.log.info("terminal disconnected");
     });
   });
 
   server.listen(socketPath, () => {
     options.log.info(`listening on ${socketPath}`);
+    armIdle();
   });
 
   return server;

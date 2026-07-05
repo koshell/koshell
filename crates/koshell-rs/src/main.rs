@@ -16,6 +16,9 @@ fn main() {
             print!("{}", koshell_rs::shell_init::snippet(shell));
             return;
         }
+        Some(Command::Daemon { action }) => {
+            std::process::exit(koshell_rs::daemon_cli::run(action));
+        }
         Some(Command::Launch(command)) => command,
         None => Vec::new(),
     };

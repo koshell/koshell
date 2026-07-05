@@ -3,6 +3,8 @@
 
 pub mod cli;
 pub mod context;
+pub mod daemon_cli;
+pub mod daemon_spawn;
 pub mod event_log;
 pub mod ipc;
 pub mod logging;

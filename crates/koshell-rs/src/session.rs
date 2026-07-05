@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 use koshell_proto::{ClientMessage, ServerMessage};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
+use crate::daemon_spawn::{CONNECT_RETRY_BUDGET, CONNECT_RETRY_STEP, DaemonSpawner};
 use crate::event_log::{self, Event, EventLog};
 use crate::ipc::{self, IpcClient};
 use crate::presentation::Presentation;
@@ -183,6 +184,7 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
         let mut scanner = MarkerScanner::new();
         let mut stdout = std::io::stdout();
         let mut ipc_client: Option<IpcClient> = None;
+        let mut spawner = DaemonSpawner::new();
         let mut presentation = Presentation::new();
         presentation.set_event_log(event_log_proc.clone());
         let mut request_seq: u64 = 0;
@@ -279,6 +281,7 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
                             &mut stdout,
                             &mut state,
                             &mut ipc_client,
+                            &mut spawner,
                             &mut presentation,
                             &tx_daemon,
                             &socket_path,
@@ -428,15 +431,44 @@ fn send_ai_cancel(ipc_client: &mut Option<IpcClient>, request_id: &str) {
     }
 }
 
+/// Sends the `hello` handshake and spawns a dedicated reader thread that forwards
+/// streamed daemon replies into the processor channel; it exits on EOF or a broken
+/// socket. Returns the connected client, or `None` if the read half could not be
+/// cloned.
+fn attach_daemon(
+    mut client: IpcClient,
+    meta: &SessionMeta,
+    tx: &mpsc::Sender<Msg>,
+) -> Option<IpcClient> {
+    let _ = client.send(&ipc::hello(
+        meta.cwd.clone(),
+        meta.shell.clone(),
+        meta.rows,
+        meta.cols,
+    ));
+    let Ok(mut reader) = client.reader() else {
+        return None;
+    };
+    let tx_reader = tx.clone();
+    thread::spawn(move || {
+        while let Ok(Some(message)) = reader.recv() {
+            if tx_reader.send(Msg::Daemon(message)).is_err() {
+                break;
+            }
+        }
+    });
+    Some(client)
+}
+
 /// Sends a `#?` request to the AI daemon (connecting lazily), and acknowledges it inline.
-/// If the daemon is unavailable the terminal degrades gracefully. On a fresh connection
-/// a dedicated reader thread is spawned that forwards streamed daemon replies into the
-/// processor channel; it exits on EOF or a broken socket.
+/// If no daemon is reachable the terminal auto-spawns one (design 0008) and retries the
+/// connect briefly; if it still cannot reach a daemon the terminal degrades gracefully.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_trigger(
     stdout: &mut std::io::Stdout,
     state: &mut SessionState,
     ipc_client: &mut Option<IpcClient>,
+    spawner: &mut DaemonSpawner,
     presentation: &mut Presentation,
     tx: &mpsc::Sender<Msg>,
     socket_path: &std::path::PathBuf,
@@ -445,25 +477,24 @@ fn dispatch_trigger(
     trigger: &Trigger,
     event_log: &EventLog,
 ) {
-    if ipc_client.is_none()
-        && let Ok(mut client) = IpcClient::connect(socket_path)
-    {
-        let _ = client.send(&ipc::hello(
-            meta.cwd.clone(),
-            meta.shell.clone(),
-            meta.rows,
-            meta.cols,
-        ));
-        if let Ok(mut reader) = client.reader() {
-            let tx_reader = tx.clone();
-            thread::spawn(move || {
-                while let Ok(Some(message)) = reader.recv() {
-                    if tx_reader.send(Msg::Daemon(message)).is_err() {
-                        break;
-                    }
+    if ipc_client.is_none() {
+        if let Ok(client) = IpcClient::connect(socket_path) {
+            *ipc_client = attach_daemon(client, meta, tx);
+        } else if spawner.try_spawn(Instant::now()) {
+            // The daemon is connectable in ~200ms; retry within a bounded budget.
+            // The PTY reader keeps draining into the channel, so this only delays
+            // rendering — at the moment the user is already waiting on `#?`.
+            let deadline = Instant::now() + CONNECT_RETRY_BUDGET;
+            loop {
+                thread::sleep(CONNECT_RETRY_STEP);
+                if let Ok(client) = IpcClient::connect(socket_path) {
+                    *ipc_client = attach_daemon(client, meta, tx);
+                    break;
                 }
-            });
-            *ipc_client = Some(client);
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
         }
     }
 

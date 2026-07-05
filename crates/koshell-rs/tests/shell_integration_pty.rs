@@ -63,6 +63,9 @@ fn drive_koshell(shell: &str, files: &[(&str, &str)], script: &[u8]) -> String {
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_koshell"));
     cmd.env_clear();
+    // Disable daemon auto-spawn so the no-daemon scenarios stay hermetic (an
+    // installed koshell-ai-daemon on PATH would otherwise be launched).
+    cmd.env("KOSHELL_NO_DAEMON_SPAWN", "1");
     cmd.env("SHELL", shell);
     cmd.env("HOME", home.path());
     cmd.env("XDG_RUNTIME_DIR", runtime.path());

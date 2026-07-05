@@ -15,16 +15,17 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
-  node:
+  bun:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      # Bun is the whole JS toolchain: package manager, task runner, test runner,
+      # daemon runtime, and packager. It drives tsc/eslint/prettier too.
+      - uses: oven-sh/setup-bun@v2
         with:
-          version: 11
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .node-version
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm check
+          bun-version: "1.3"
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      # Protocol smoke against both the TS source under Bun and the compiled binary.
+      - run: bun run --filter '@koshell/ai-daemon' smoke
+      - run: bun run --filter '@koshell/ai-daemon' smoke:binary

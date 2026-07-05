@@ -35,8 +35,19 @@ export interface ByeMessage {
   terminal_session_id: string;
 }
 
+// Diagnostics for `koshell daemon status`. Answered with `status` regardless of
+// the hello handshake — asking a version-mismatched daemon for its identity is
+// exactly the point. Additive (design 0004): no protocol version bump.
+export interface StatusRequestMessage {
+  type: "status_request";
+}
+
 export type ClientMessage =
-  HelloMessage | AiRequestMessage | AiCancelMessage | ByeMessage;
+  | HelloMessage
+  | AiRequestMessage
+  | AiCancelMessage
+  | ByeMessage
+  | StatusRequestMessage;
 
 // Per request, the daemon sends `ack` first (parsed and enqueued), then zero or
 // more `ai_delta` chunks, then exactly one of `ai_response_end` or `ai_error`.
@@ -62,8 +73,23 @@ export interface AiErrorMessage {
   message: string;
 }
 
+// Reply to `status_request`. `version` is the daemon package version;
+// `connections` is the live terminal count at reply time.
+export interface StatusMessage {
+  type: "status";
+  pid: number;
+  version: string;
+  protocol_version: number;
+  uptime_ms: number;
+  connections: number;
+}
+
 export type ServerMessage =
-  AckMessage | AiDeltaMessage | AiResponseEndMessage | AiErrorMessage;
+  | AckMessage
+  | AiDeltaMessage
+  | AiResponseEndMessage
+  | AiErrorMessage
+  | StatusMessage;
 
 // Encodes one server message as a newline-terminated JSONL line.
 export function serializeServerMessage(message: ServerMessage): string {
@@ -139,6 +165,8 @@ export function parseClientMessage(line: string): ClientMessage | null {
         };
       }
       return null;
+    case "status_request":
+      return { type: "status_request" };
     default:
       return null;
   }

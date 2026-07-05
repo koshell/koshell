@@ -58,6 +58,9 @@ fn drive_shell_init(
 
     let mut cmd = CommandBuilder::new(shell);
     cmd.env_clear();
+    // Disable daemon auto-spawn so the no-daemon scenarios stay hermetic (an
+    // installed koshell-ai-daemon on PATH would otherwise be launched).
+    cmd.env("KOSHELL_NO_DAEMON_SPAWN", "1");
     cmd.env("SHELL", shell);
     cmd.env("HOME", home.path());
     cmd.env("XDG_RUNTIME_DIR", runtime.path());

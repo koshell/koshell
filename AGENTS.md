@@ -6,7 +6,10 @@ This repository is the Koshell product source workspace. It is a hybrid monorepo
 
 - Rust crates under `crates/` implement the foreground terminal process
   (`koshell-rs`, binary `koshell`) and the shared IPC types (`koshell-proto`).
-- Node.js packages under `packages/` implement the AI daemon (`@koshell/ai-daemon`).
+- Bun packages under `packages/` implement the AI daemon (`@koshell/ai-daemon`). Bun is
+  the whole JS toolchain (package manager, task runner, test runner, runtime, packager);
+  the daemon source uses `node:` APIs only, so Bun stays a packaging choice, not an API
+  dependency.
 - `reference/` is a frozen snapshot of the pre-rewrite TypeScript prototype, kept for
   algorithm and behavior reference only. It is excluded from the build, lint, and format.
   Do not add new work there.
@@ -25,7 +28,7 @@ change. Those live in the internal organization workspace.
   run or inspect the product.
 - Terminal-core (PTY, mirror, snapshots, timeline, local context) lives in Rust and must
   not depend on any LLM provider or the pi packages.
-- Provider/model/auth, the pi-backed agent session, and the tool loop live in the Node AI
+- Provider/model/auth, the pi-backed agent session, and the tool loop live in the AI
   daemon, behind the IPC boundary.
 - The two runtimes communicate only through `koshell-proto` messages over the JSONL Unix
   socket. Do not introduce hidden coupling across the boundary.
@@ -36,4 +39,4 @@ change. Those live in the internal organization workspace.
 ## Validation
 
 - Rust: `cargo test`, `cargo clippy`, `cargo fmt --check`.
-- Node: `pnpm check` (format check, lint, typecheck, tests).
+- JS (Bun): `bun run check` (format check, lint, typecheck, tests).

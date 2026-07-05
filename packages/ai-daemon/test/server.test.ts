@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it } from "bun:test";
 
 import type {
   AgentFactory,
@@ -383,5 +383,33 @@ describe("TerminalConnection", () => {
       "ai_delta",
       "ai_response_end",
     ]);
+  });
+
+  it("answers status_request without a hello handshake", async () => {
+    const { sink, lines } = collectingSink();
+    const factory: AgentFactory = () => {
+      throw new Error("status must not create an agent");
+    };
+    const connection = new TerminalConnection(sink, {
+      createAgent: factory,
+      log: NOOP_LOGGER,
+      status: () => ({
+        pid: 4321,
+        version: "9.9.9",
+        protocol_version: PROTOCOL_VERSION,
+        uptime_ms: 1234,
+        connections: 2,
+      }),
+    });
+
+    connection.handleLine(JSON.stringify({ type: "status_request" }));
+    await settle();
+
+    expect(types(lines)).toEqual(["status"]);
+    const status = JSON.parse(lines[0] ?? "{}") as Record<string, unknown>;
+    expect(status.pid).toBe(4321);
+    expect(status.version).toBe("9.9.9");
+    expect(status.protocol_version).toBe(PROTOCOL_VERSION);
+    expect(status.connections).toBe(2);
   });
 });

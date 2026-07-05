@@ -1,7 +1,0 @@
-packages:
-  - "packages/*"
-# Transitive dependencies of @earendil-works/pi-coding-agent whose install
-# scripts are not needed (pi ships compiled JS; these scripts are optional).
-allowBuilds:
-  "@google/genai": false
-  protobufjs: false

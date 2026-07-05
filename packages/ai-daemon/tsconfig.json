@@ -4,7 +4,8 @@
     "lib": ["ES2024"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "types": ["node"],
+    "types": ["node", "bun"],
+    "resolveJsonModule": true,
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
@@ -17,7 +18,7 @@
   "include": [
     "src/**/*.ts",
     "test/**/*.ts",
-    "eslint.config.js",
-    "vitest.config.ts"
+    "scripts/**/*.ts",
+    "eslint.config.js"
   ]
 }

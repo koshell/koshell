@@ -1,21 +1,22 @@
 # Contributing to koshell
 
 Thanks for your interest in contributing! koshell is a human-centric shared terminal:
-a Rust foreground terminal process (`koshell-rs`) beside a Node.js AI daemon
+a Rust foreground terminal process (`koshell-rs`) beside a Bun AI daemon
 (`koshell-ai-daemon`). This guide covers how to build, test, and submit changes.
 
 ## Ground rules
 
 - Be respectful. This project follows our [Code of Conduct](CODE_OF_CONDUCT.md).
 - Keep terminal-core (Rust) free of any LLM provider or AI SDK dependency; AI concerns
-  live in the Node daemon behind the IPC boundary. See [`docs/architecture.md`](docs/architecture.md).
+  live in the AI daemon behind the IPC boundary. See [`docs/architecture.md`](docs/architecture.md).
+- The daemon's source uses `node:` APIs only — Bun is its runtime and packager, not an
+  API surface.
 - All code, configuration, and comments are in English.
 
 ## Prerequisites
 
 - Rust 1.96 or newer (pinned via `rust-toolchain.toml`)
-- Node.js 24 or newer
-- pnpm 11 or newer
+- Bun 1.3 or newer (the entire JS toolchain — no Node or pnpm needed)
 
 ## Development
 
@@ -28,14 +29,14 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
 
-Node:
+JS (Bun):
 
 ```bash
-pnpm install
-pnpm check   # format check, lint, typecheck, and tests across packages
+bun install
+bun run check   # format check, lint, typecheck, and tests across packages
 ```
 
-Please make sure both `cargo test` / `cargo clippy` / `cargo fmt --check` and `pnpm check`
+Please make sure both `cargo test` / `cargo clippy` / `cargo fmt --check` and `bun run check`
 pass before opening a pull request. CI runs the same checks.
 
 ## Submitting changes
@@ -51,7 +52,7 @@ pass before opening a pull request. CI runs the same checks.
 ```
 crates/koshell-rs      Rust foreground terminal process (binary `koshell`)
 crates/koshell-proto   Shared IPC message types
-packages/ai-daemon     Node.js AI daemon
+packages/ai-daemon     Bun AI daemon
 docs/                  Architecture and change records
 reference/             Frozen pre-rewrite TypeScript prototype (not built)
 ```
