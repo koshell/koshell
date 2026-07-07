@@ -23,7 +23,9 @@ terminal operator while AI assists from beside the shell.
     `design-0003-shell-init-auto-wrap.md`);
   - the terminal mirror (via `alacritty_terminal`), screen snapshots, alternate-screen
     detection, and line-level screen diffs;
-  - the append-only terminal timeline and local terminal context;
+  - the bounded in-memory terminal timeline (age-tiered snapshot downsampling plus a
+    recent-character budget for raw text, so a long-lived session stays bounded; see
+    `fix-0007-timeline-memory-retention.md`) and local terminal context;
   - shell integration (temporary rc files emitting OSC command-boundary markers) and
     `#?` trigger detection — the marker layer owns `#?` at the integrated shell prompt
     (start markers carry the full typed line, `command_end` is authoritative);

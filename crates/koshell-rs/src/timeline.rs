@@ -1,5 +1,7 @@
-//! Append-only terminal timeline and in-memory store, ported from
-//! `reference/src/timeline.ts`. Pure data plus queries; no I/O.
+//! Bounded in-memory terminal timeline, ported from `reference/src/timeline.ts`. Pure
+//! data plus queries; no I/O. Events are appended in order, but a long-lived session is
+//! kept bounded by age-tiered snapshot downsampling and a recent-character budget for
+//! raw text (see [`InMemoryTimelineStore`] and `fix-0007-timeline-memory-retention.md`).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -80,11 +82,82 @@ pub struct ScreenSnapshotDiff {
 
 type Clock = Box<dyn Fn() -> i64 + Send + Sync>;
 
-/// In-memory, append-only timeline store with injectable clock.
+/// One age band of the screen-snapshot retention policy: within `max_age_ms` of now,
+/// keep at most one snapshot per `min_spacing_ms`. Bands are consulted newest-first, so
+/// a snapshot lands in the first band whose `max_age_ms` covers its age.
+struct RetentionTier {
+    max_age_ms: i64,
+    min_spacing_ms: i64,
+}
+
+/// Age-tiered downsampling for [`TerminalEvent::ScreenSnapshot`], a GFS-style rotation:
+/// dense for the last minute, thinning out to hourly across a week, then dropped.
+///
+/// Without it the store leaked gigabytes — a tmux session running `btop` repaints the
+/// whole screen every second, so an unbounded store accrued millions of full-screen
+/// snapshot strings over a day (tens of GB of compressed/swapped memory). Keeping a
+/// coarse multi-scale history instead of every per-second repaint bounds memory to a
+/// few MB while preserving a browsable visual timeline.
+///
+/// In-memory only — nothing here is ever written to disk, upholding the privacy
+/// invariant of `design-0007-dogfooding-event-log.md`.
+const SNAPSHOT_TIERS: &[RetentionTier] = &[
+    RetentionTier {
+        max_age_ms: 60_000,
+        min_spacing_ms: 0,
+    }, // <= 1 min: keep all
+    RetentionTier {
+        max_age_ms: 300_000,
+        min_spacing_ms: 5_000,
+    }, // <= 5 min: 1 / 5s
+    RetentionTier {
+        max_age_ms: 1_800_000,
+        min_spacing_ms: 30_000,
+    }, // <= 30 min: 1 / 30s
+    RetentionTier {
+        max_age_ms: 3_600_000,
+        min_spacing_ms: 60_000,
+    }, // <= 1 h: 1 / min
+    RetentionTier {
+        max_age_ms: 43_200_000,
+        min_spacing_ms: 300_000,
+    }, // <= 12 h: 1 / 5min
+    RetentionTier {
+        max_age_ms: 86_400_000,
+        min_spacing_ms: 900_000,
+    }, // <= 24 h: 1 / 15min
+    RetentionTier {
+        max_age_ms: 604_800_000,
+        min_spacing_ms: 3_600_000,
+    }, // <= 7 d: 1 / h
+];
+
+/// The horizon past which any event is dropped: the oldest snapshot tier's `max_age_ms`
+/// (7 days). Reused as the cap for the low-volume bookkeeping events (command/AI/mode
+/// changes) that are neither snapshots nor recent-window text.
+const MAX_AGE_MS: i64 = 604_800_000;
+
+/// Retained-character budget, per raw-text event kind, for the events that feed the
+/// recent-window context queries (`PtyOutput`, `VisibleOutput`, visible `HumanInput`;
+/// see `context.rs`). Compaction keeps the most recent events of each kind until their
+/// combined text reaches this many characters, then drops the older ones. Set well
+/// above the largest query budget (8000 chars) so recent context is always intact.
+const RAW_TEXT_RETENTION_CHARS: usize = 32_000;
+
+/// Run compaction once this many events have been recorded since the last pass. Bounds
+/// the between-compaction overshoot to a handful of entries while amortizing the O(n)
+/// pass so it does not run on every `record`.
+const COMPACT_EVERY: usize = 256;
+
+/// In-memory, bounded terminal timeline store with an injectable clock. Screen
+/// snapshots are downsampled by age ([`SNAPSHOT_TIERS`]); raw-text events are held to a
+/// recent-character budget ([`RAW_TEXT_RETENTION_CHARS`]); everything else ages out at
+/// [`MAX_AGE_MS`]. Compaction runs every [`COMPACT_EVERY`] records.
 pub struct InMemoryTimelineStore {
     entries: Vec<TimelineEntry>,
     now: Clock,
     next_id: u64,
+    records_since_compaction: usize,
 }
 
 impl Default for InMemoryTimelineStore {
@@ -105,11 +178,16 @@ impl InMemoryTimelineStore {
             entries: Vec::new(),
             now: Box::new(now),
             next_id: 1,
+            records_since_compaction: 0,
         }
     }
 
     /// Records an event, assigning it a deterministic id and the current timestamp.
-    /// Returns the created entry.
+    /// Returns the created entry. Compaction (age-tiered snapshot downsampling plus the
+    /// recent-character budget) runs every [`COMPACT_EVERY`] records, so the store stays
+    /// bounded across a long-lived session. Ids keep climbing monotonically, so a
+    /// compacted-away snapshot's id simply becomes unknown to the on-demand snapshot
+    /// lookups (which already degrade to "not found").
     pub fn record(&mut self, event: TerminalEvent) -> TimelineEntry {
         let id = format!("event-{}", self.next_id);
         self.next_id += 1;
@@ -119,7 +197,60 @@ impl InMemoryTimelineStore {
             event,
         };
         self.entries.push(entry.clone());
+        self.records_since_compaction += 1;
+        if self.records_since_compaction >= COMPACT_EVERY {
+            self.compact();
+        }
         entry
+    }
+
+    /// Applies the retention policy, keeping the newest entries and discarding the rest.
+    /// Walks newest-to-oldest so "keep the most recent" decisions are a single pass:
+    /// snapshots thin against the last one kept ([`SNAPSHOT_TIERS`]), raw-text events
+    /// draw down a per-kind character budget ([`RAW_TEXT_RETENTION_CHARS`]), and the
+    /// low-volume bookkeeping events simply age out at [`MAX_AGE_MS`]. Retains entries in
+    /// place (no snapshot-string clones) via an index-keyed `retain`.
+    fn compact(&mut self) {
+        self.records_since_compaction = 0;
+        let now = (self.now)();
+
+        // Decide keep/drop newest-first; `keep[i]` mirrors `entries[i]`.
+        let mut keep = vec![false; self.entries.len()];
+        let mut last_snapshot_ts: Option<i64> = None;
+        let mut pty_budget = RAW_TEXT_RETENTION_CHARS;
+        let mut visible_budget = RAW_TEXT_RETENTION_CHARS;
+        let mut input_budget = RAW_TEXT_RETENTION_CHARS;
+
+        for (idx, entry) in self.entries.iter().enumerate().rev() {
+            let age = now.saturating_sub(entry.ts);
+            keep[idx] = match &entry.event {
+                TerminalEvent::ScreenSnapshot { .. } => {
+                    keep_snapshot(age, entry.ts, &mut last_snapshot_ts)
+                }
+                TerminalEvent::PtyOutput { data } => {
+                    take_from_budget(&mut pty_budget, data.chars().count())
+                }
+                TerminalEvent::VisibleOutput { text } => {
+                    take_from_budget(&mut visible_budget, text.chars().count())
+                }
+                TerminalEvent::HumanInput { data, visible } => {
+                    if *visible {
+                        take_from_budget(&mut input_budget, data.chars().count())
+                    } else {
+                        // Hidden input carries no context text; keep it only as history.
+                        age <= MAX_AGE_MS
+                    }
+                }
+                _ => age <= MAX_AGE_MS,
+            };
+        }
+
+        let mut idx = 0;
+        self.entries.retain(|_| {
+            let keep_this = keep[idx];
+            idx += 1;
+            keep_this
+        });
     }
 
     pub fn list_entries(&self) -> &[TimelineEntry] {
@@ -224,6 +355,45 @@ fn default_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// The retention spacing for a snapshot of the given age, or `None` when it is older
+/// than the last tier and must be dropped. Tiers are ordered youngest-first, so the
+/// first match is the tightest band that still covers the age.
+fn snapshot_spacing_for_age(age_ms: i64) -> Option<i64> {
+    SNAPSHOT_TIERS
+        .iter()
+        .find(|tier| age_ms <= tier.max_age_ms)
+        .map(|tier| tier.min_spacing_ms)
+}
+
+/// Downsampling decision for one snapshot, called newest-first. `last_kept_ts` is the
+/// timestamp of the most recent snapshot already kept; this one is kept when it sits at
+/// least its tier's spacing before that neighbour (and always when it is the newest, or
+/// its band keeps all). Updates `last_kept_ts` on a keep.
+fn keep_snapshot(age_ms: i64, ts: i64, last_kept_ts: &mut Option<i64>) -> bool {
+    let Some(spacing) = snapshot_spacing_for_age(age_ms) else {
+        return false;
+    };
+    let keep = match *last_kept_ts {
+        None => true,
+        Some(newer_ts) => newer_ts.saturating_sub(ts) >= spacing,
+    };
+    if keep {
+        *last_kept_ts = Some(ts);
+    }
+    keep
+}
+
+/// Draws `cost` characters from a retained-text budget, returning whether the entry is
+/// kept. The entry that straddles the budget boundary is kept (the budget saturates at
+/// zero), so retention never cuts an event in half; everything older is dropped.
+fn take_from_budget(budget: &mut usize, cost: usize) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget = budget.saturating_sub(cost);
+    true
+}
+
 /// Maps an event to its contribution to recent human-visible text.
 fn event_to_text(event: &TerminalEvent) -> &str {
     match event {
@@ -257,6 +427,9 @@ pub(crate) fn trim_start_to_max_characters(text: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
     use super::*;
 
     fn snapshot(snapshot_id: &str, rows: u16, alt_screen: bool, screen: &str) -> TerminalEvent {
@@ -269,6 +442,103 @@ mod tests {
             previous_snapshot_id: None,
             diff: None,
         }
+    }
+
+    /// A store whose clock is a settable `AtomicI64` (epoch ms), so tests can advance
+    /// wall time and exercise the age-tiered retention.
+    fn clocked() -> (InMemoryTimelineStore, Arc<AtomicI64>) {
+        let clock = Arc::new(AtomicI64::new(0));
+        let handle = clock.clone();
+        let store = InMemoryTimelineStore::with_clock(move || handle.load(Ordering::SeqCst));
+        (store, clock)
+    }
+
+    fn snapshot_count(timeline: &InMemoryTimelineStore) -> usize {
+        timeline.list_screen_snapshots().len()
+    }
+
+    #[test]
+    fn downsamples_old_snapshots_by_age_tier() {
+        let (mut timeline, clock) = clocked();
+        // 40 minutes of one snapshot per second: without retention this is 2400 entries.
+        let total_seconds = 40 * 60;
+        for sec in 0..total_seconds {
+            clock.store(sec as i64 * 1_000, Ordering::SeqCst);
+            timeline.record(snapshot(&format!("s{sec}"), 24, false, "x"));
+        }
+        // "Now" is the last recorded timestamp; compact to apply age-based thinning.
+        timeline.compact();
+
+        let now = (total_seconds - 1) as i64 * 1_000;
+        let snapshots = timeline.list_screen_snapshots();
+
+        // The last minute stays dense (one per second), older bands thin out.
+        let last_minute = snapshots
+            .iter()
+            .filter(|e| now.saturating_sub(e.ts) <= 60_000)
+            .count();
+        assert!(last_minute >= 55, "dense last minute, got {last_minute}");
+
+        // 2400 raw snapshots collapse to a couple hundred across the tiers.
+        assert!(
+            snapshots.len() < 300,
+            "downsampled well below the raw count, got {}",
+            snapshots.len()
+        );
+
+        // Retained snapshots get sparser with age: no two beyond the 5-minute band sit
+        // closer than that band's 30s spacing.
+        let mut older_than_5min: Vec<i64> = snapshots
+            .iter()
+            .map(|e| e.ts)
+            .filter(|ts| now.saturating_sub(*ts) > 300_000)
+            .collect();
+        older_than_5min.sort_unstable();
+        for pair in older_than_5min.windows(2) {
+            assert!(
+                pair[1] - pair[0] >= 30_000,
+                "aged snapshots respect >= 30s spacing, got gap {}",
+                pair[1] - pair[0]
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_recent_raw_text_within_budget_and_drops_older() {
+        let (mut timeline, clock) = clocked();
+        // 100 bursts of 1000 chars each; only the most recent ~32000 chars survive.
+        for i in 0..100 {
+            clock.store(i as i64 * 1_000, Ordering::SeqCst);
+            timeline.record(TerminalEvent::PtyOutput {
+                data: "a".repeat(1_000),
+            });
+        }
+        timeline.compact();
+
+        let kept = timeline
+            .list_events()
+            .filter(|e| matches!(e, TerminalEvent::PtyOutput { .. }))
+            .count();
+        assert_eq!(
+            kept,
+            RAW_TEXT_RETENTION_CHARS / 1_000,
+            "keeps exactly the budget's worth of recent bursts"
+        );
+        // The recent-window query is still fully served.
+        assert_eq!(timeline.get_recent_pty_output(8_000).chars().count(), 8_000);
+    }
+
+    #[test]
+    fn small_store_is_left_untouched_by_compaction() {
+        let (mut timeline, clock) = clocked();
+        clock.store(1_000, Ordering::SeqCst);
+        timeline.record(snapshot("s1", 24, false, "one"));
+        timeline.record(TerminalEvent::PtyOutput {
+            data: "hello".to_string(),
+        });
+        timeline.compact();
+        assert_eq!(timeline.list_entries().len(), 2);
+        assert_eq!(snapshot_count(&timeline), 1);
     }
 
     #[test]

@@ -32,6 +32,13 @@ pub const MARKER_PREFIX: &[u8] = b"\x1b]777;koshell;";
 /// BEL terminator for the marker.
 pub const MARKER_SUFFIX: u8 = 0x07;
 
+/// Cap on the bytes held while waiting for a marker's terminator. A real marker (even
+/// one carrying a long command line) is far under this; past it, a `MARKER_PREFIX` in
+/// the byte stream was not ours (program output, binary data, a file containing the
+/// prefix) and its terminator may never come, so the buffered bytes are flushed as
+/// literal output instead of growing the scanner buffer without bound.
+const MAX_PENDING_MARKER_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellIntegrationKind {
     Bash,
@@ -199,8 +206,17 @@ impl MarkerScanner {
                     self.buf.drain(..payload_end + 1);
                     continue;
                 }
-                // Incomplete marker: keep it buffered until the suffix arrives.
+                // Incomplete marker: keep it buffered until the suffix arrives, but
+                // cap the wait so a spurious prefix with a missing terminator cannot
+                // grow the buffer without bound. Past the cap, flush the buffer as
+                // literal output, keeping only a possible partial-prefix tail.
                 self.buf.drain(..pos);
+                if self.buf.len() > MAX_PENDING_MARKER_BYTES {
+                    let keep = partial_prefix_len(&self.buf, MARKER_PREFIX);
+                    let emit_upto = self.buf.len() - keep;
+                    visible.extend_from_slice(&self.buf[..emit_upto]);
+                    self.buf.drain(..emit_upto);
+                }
                 break;
             }
 
@@ -684,6 +700,40 @@ mod tests {
             .collect();
         assert_eq!(markers.len(), 1);
         assert_eq!(markers[0].command.as_deref(), Some("ls #? explain"));
+    }
+
+    #[test]
+    fn incomplete_marker_buffer_is_capped_against_a_spurious_prefix() {
+        let mut scanner = MarkerScanner::new();
+        // A marker prefix that program output happened to emit, followed by a large
+        // blob with no BEL terminator — the terminator may never come.
+        let mut stream = MARKER_PREFIX.to_vec();
+        stream.extend(std::iter::repeat_n(b'x', MAX_PENDING_MARKER_BYTES + 1_024));
+        let segments = scanner.feed(&stream);
+
+        // The bytes are flushed as literal output rather than held forever, and no
+        // marker is fabricated from the unterminated prefix.
+        let visible_len: usize = segments
+            .iter()
+            .map(|s| match s {
+                Segment::Visible(bytes) => bytes.len(),
+                Segment::Marker(_) => 0,
+            })
+            .sum();
+        assert!(
+            segments.iter().all(|s| matches!(s, Segment::Visible(_))),
+            "no marker fabricated from an unterminated prefix"
+        );
+        assert!(
+            visible_len >= MAX_PENDING_MARKER_BYTES,
+            "buffered bytes flushed as visible output, got {visible_len}"
+        );
+        // The pending buffer did not grow without bound.
+        assert!(
+            scanner.buf.len() <= MARKER_PREFIX.len(),
+            "scanner buffer stayed bounded, got {}",
+            scanner.buf.len()
+        );
     }
 
     #[test]
