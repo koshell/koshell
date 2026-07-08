@@ -17,6 +17,7 @@
         "koshell-ai-daemon": "src/index.ts",
       },
       "dependencies": {
+        "@earendil-works/pi-ai": "^0.80.3",
         "@earendil-works/pi-coding-agent": "^0.80.3",
         "smol-toml": "^1.7.0",
         "zod": "^4.4.3",

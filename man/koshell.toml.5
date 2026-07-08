@@ -68,7 +68,9 @@ variables:
 .BR ANTHROPIC_API_KEY ,
 or
 .B ANTHROPIC_OAUTH_TOKEN
-for a Claude Pro/Max subscription token.
+for a Claude Pro/Max subscription token; a subscription can also sign in
+interactively with
+.BR "koshell auth login anthropic" .
 .TP
 .B openai
 .BR OPENAI_API_KEY .
@@ -80,7 +82,9 @@ for a Claude Pro/Max subscription token.
 .BR OPENROUTER_API_KEY .
 .TP
 .B github-copilot
-.BR COPILOT_GITHUB_TOKEN .
+.BR COPILOT_GITHUB_TOKEN ,
+or sign in with
+.BR "koshell auth login github-copilot" .
 .TP
 .BR deepseek ", " groq ", " mistral ", " xai ", " moonshotai ", " zai
 .BR DEEPSEEK_API_KEY ", " GROQ_API_KEY ", " MISTRAL_API_KEY ", "
@@ -103,8 +107,8 @@ and
 .B GOOGLE_CLOUD_API_KEY
 key).
 .B openai-codex
-only authenticates via an OAuth login flow, which koshell does not support
-yet.
+(ChatGPT Plus/Pro subscription) authenticates only via OAuth: run
+.BR "koshell auth login openai-codex" .
 .PP
 This page does not enumerate the full catalog: referencing an unknown
 provider name makes
@@ -121,10 +125,17 @@ block only carries authentication and optional endpoint overrides:
 .B api_key
 Credential for the provider (see
 .BR CREDENTIALS ).
-When omitted, the provider's conventional environment variable (for
-example
-.BR ANTHROPIC_API_KEY )
+When omitted, a credential stored by
+.BR "koshell auth login" ,
+or the provider's conventional environment variable (for example
+.BR ANTHROPIC_API_KEY ),
 is used.
+A stored login takes precedence over a config
+.B api_key
+until
+.BR "koshell auth logout" ;
+config keys are held in memory only and never written to the credential
+store.
 .TP
 .B base_url
 Optional endpoint override.

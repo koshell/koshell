@@ -1,13 +1,18 @@
-// Adapts a validated Koshell config into pi's in-memory auth/model objects.
+// Adapts a validated Koshell config into pi's auth/model objects.
 //
-// Everything stays in memory: AuthStorage.inMemory and ModelRegistry.inMemory never
-// touch pi's ~/.pi/agent files, so Koshell owns credential and model resolution
-// end to end. A stranger with only a Koshell config.toml (and no pi setup) can run
-// `#?`. AgentRuntime passes the single resolved model to the pi session factory —
-// a catalog of one — so pi's wider model capability never leaks into product
+// The model registry stays in memory and never touches pi's ~/.pi/agent files,
+// so Koshell owns credential and model resolution end to end. A stranger with
+// only a Koshell config.toml (and no pi setup) can run `#?`. Credentials come
+// from Koshell's own store ($XDG_DATA_HOME/koshell/auth.json, written by
+// `koshell auth login` — design 0014) plus the config and the environment;
+// config-supplied api_key values are registered in memory and never persisted.
+// AgentRuntime passes the single resolved model to the pi session factory — a
+// catalog of one — so pi's wider model capability never leaks into product
 // behavior.
 import { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { getOAuthProviders } from "@earendil-works/pi-ai/oauth";
 
+import { openAuthStorage } from "./auth-store.ts";
 import {
   ConfigError,
   splitModelRef,
@@ -57,7 +62,6 @@ function toPiModel(def: ModelDef): PiModelConfig {
 
 function applyProvider(
   registry: ModelRegistry,
-  authStorage: AuthStorage,
   name: string,
   provider: ProviderConfig,
 ): void {
@@ -86,14 +90,20 @@ function applyProvider(
     return;
   }
 
-  // Builtin provider: use pi's builtin catalog for this name. Credentials go on
-  // authStorage (api_key value or, when absent, pi's provider env-var fallback);
-  // an endpoint or header override is registered without touching the models.
-  if (provider.api_key !== undefined) {
-    authStorage.set(name, { type: "api_key", key: provider.api_key });
-  }
-  if (provider.base_url !== undefined || provider.headers !== undefined) {
+  // Builtin provider: use pi's builtin catalog for this name. A config api_key
+  // is registered in memory (pi resolves $ENV/!command/literal syntax and both
+  // hasConfiguredAuth and the request path honor it) — never written to the
+  // persistent auth store, which holds only `koshell auth login` credentials.
+  // An endpoint or header override rides the same registration.
+  if (
+    provider.api_key !== undefined ||
+    provider.base_url !== undefined ||
+    provider.headers !== undefined
+  ) {
     const config: RegisterProviderConfig = {};
+    if (provider.api_key !== undefined) {
+      config.apiKey = provider.api_key;
+    }
     if (provider.base_url !== undefined) {
       config.baseUrl = provider.base_url;
     }
@@ -133,7 +143,9 @@ export const ENV_KEY_HINTS: Record<string, readonly string[]> = {
 
 // Guidance for a "no credentials" failure, per provider. Ambient-credential
 // providers (AWS/GCP) and the OAuth-only openai-codex get dedicated hints;
-// everything else points at api_key and the provider's env-var convention.
+// providers with a login flow (derived from pi's live OAuth registry) offer
+// `koshell auth login`; everything else points at api_key and the provider's
+// env-var convention.
 function credentialsHint(provider: string): string {
   if (provider === "amazon-bedrock") {
     return "configure AWS credentials (AWS_PROFILE, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or AWS_BEARER_TOKEN_BEDROCK).";
@@ -142,23 +154,33 @@ function credentialsHint(provider: string): string {
     return "set up Application Default Credentials (GOOGLE_APPLICATION_CREDENTIALS or `gcloud auth application-default login`) plus GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION, or export GOOGLE_CLOUD_API_KEY.";
   }
   if (provider === "openai-codex") {
-    return `provider "${provider}" only authenticates via OAuth login, which Koshell does not support yet.`;
+    return `provider "${provider}" authenticates via OAuth: run \`koshell auth login ${provider}\`.`;
   }
+  const login = getOAuthProviders().some((p) => p.id === provider)
+    ? `, or run \`koshell auth login ${provider}\``
+    : "";
   const envKeys = ENV_KEY_HINTS[provider];
   if (envKeys !== undefined) {
-    return `set providers.${provider}.api_key in the config, or export ${envKeys.join(" or ")}.`;
+    return `set providers.${provider}.api_key in the config, or export ${envKeys.join(" or ")}${login}.`;
   }
-  return `set providers.${provider}.api_key in the config, or export the provider's API key environment variable.`;
+  return `set providers.${provider}.api_key in the config, or export the provider's API key environment variable${login}.`;
 }
 
-// Builds the in-memory auth/model objects and resolves the single active model.
-// Throws ConfigError when the model is unknown or has no configured credentials.
-export function resolveProvider(config: KoshellConfig): ResolvedProvider {
-  const authStorage = AuthStorage.inMemory();
+// Builds the auth/model objects and resolves the single active model. Throws
+// ConfigError when the model is unknown or has no configured credentials.
+// `authStorage` defaults to Koshell's persistent store so `koshell auth login`
+// credentials apply; tests inject AuthStorage.inMemory(). Reading the store is
+// best-effort: a corrupt auth.json degrades to "no credentials" and its read
+// error is appended to that ConfigError instead of failing resolution outright.
+export function resolveProvider(
+  config: KoshellConfig,
+  authStorage: AuthStorage = openAuthStorage(),
+): ResolvedProvider {
+  const storeErrors = authStorage.drainErrors();
   const modelRegistry = ModelRegistry.inMemory(authStorage);
 
   for (const [name, provider] of Object.entries(config.providers)) {
-    applyProvider(modelRegistry, authStorage, name, provider);
+    applyProvider(modelRegistry, name, provider);
   }
 
   const { provider, id } = splitModelRef(config.model);
@@ -181,8 +203,12 @@ export function resolveProvider(config: KoshellConfig): ResolvedProvider {
     );
   }
   if (!modelRegistry.hasConfiguredAuth(model)) {
+    const storeNote =
+      storeErrors.length > 0
+        ? ` (note: reading the credential store failed: ${storeErrors.map((e) => e.message).join("; ")})`
+        : "";
     throw new ConfigError(
-      `no credentials for provider "${provider}": ${credentialsHint(provider)}`,
+      `no credentials for provider "${provider}": ${credentialsHint(provider)}${storeNote}`,
     );
   }
 

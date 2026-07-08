@@ -119,6 +119,11 @@ model = "anthropic/claude-sonnet-4-5"
 api_key = "sk-ant-..."       # literal, "$ENV_VAR", or "!command" (e.g. a keychain read)
 ```
 
+Subscription providers sign in interactively instead: `koshell auth login anthropic`
+(Claude Pro/Max), `github-copilot`, or `openai-codex` (ChatGPT Plus/Pro) runs the
+provider's OAuth flow and stores the token in `$XDG_DATA_HOME/koshell/auth.json`;
+`koshell auth status` shows what is configured and from where.
+
 A custom provider is a full block (`api`, `base_url`, `api_key`, and at least one
 model); this is also how you pin a non-default API type such as `openai-responses`:
 

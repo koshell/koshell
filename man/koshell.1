@@ -18,6 +18,10 @@ koshell \- human-centric shared terminal: AI beside your terminal, not above it
 .br
 .B koshell daemon
 .BR status | start | stop | restart
+.br
+.B koshell auth
+.BR login | logout | status
+.RI [ provider ]
 .SH DESCRIPTION
 .B koshell
 is a transparent PTY wrapper that keeps the human as the primary terminal
@@ -99,6 +103,32 @@ executable next to the
 binary, then one on
 .BR PATH .
 .TP
+.B auth \fBlogin\fR|\fBlogout\fR|\fBstatus\fR [\fIprovider\fR]
+Manage AI provider credentials.
+.B login
+runs the provider's interactive OAuth flow (subscription sign-in for
+providers such as
+.BR anthropic ,
+.BR github-copilot ,
+and
+.BR openai-codex )
+and stores the resulting token in koshell's credential store; the flow
+opens the authorization URL in a browser when possible and always prints
+it, and Ctrl-C aborts.
+.B logout
+removes the stored credential.
+.B status
+reports, per provider, whether a usable credential was found and where it
+comes from (a stored login, an environment variable, or
+.IR config.toml );
+with a provider argument it exits 0 only when that provider is configured.
+The commands talk to the AI daemon and start it on demand like the first
+.BR #? .
+API-key providers do not need
+.BR login ;
+see
+.BR koshell.toml (5).
+.TP
 .I program \fR[\fIargs\fR...]
 Any other leading positional launches that program in the PTY instead of
 the default shell, with
@@ -110,8 +140,9 @@ allows a program whose name starts with a dash.
 The names
 .BR shell-init ,
 .BR preflight ,
+.BR daemon ,
 and
-.B daemon
+.B auth
 are reserved for the subcommands above; to launch a program literally named
 that, use a path form (for example
 .BR "koshell ./daemon" ).
@@ -213,6 +244,17 @@ Daemon socket; the directory falls back to
 and then
 .IR ~/.cache/koshell .
 The socket doubles as the single-instance lock.
+.TP
+.I $XDG_DATA_HOME/koshell/auth.json
+Credential store written by
+.B koshell auth login
+(mode 0600, default under
+.IR ~/.local/share ).
+It holds OAuth tokens only;
+.B api_key
+values from
+.I config.toml
+are never written here.
 .TP
 .I $XDG_DATA_HOME/koshell/events.jsonl
 Local dogfooding event log (append-only JSONL, metadata only); disable with

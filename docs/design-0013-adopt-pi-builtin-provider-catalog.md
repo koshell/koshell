@@ -70,7 +70,7 @@ point.
 No schema change; `config.ts` is untouched. Custom provider blocks remain
 the escape hatch for endpoints pi does not ship.
 
-## Phase 2 (designed, not implemented): interactive OAuth login
+## Phase 2 (implemented by design-0014): interactive OAuth login
 
 pi's login machinery is cleanly embeddable, so `koshell auth login |
 logout | status <provider>` can be a follow-up without re-architecture:
@@ -106,7 +106,8 @@ logout | status <provider>` can be a follow-up without re-architecture:
 
 ## Open issues
 
-- `openai-codex` is unusable until phase 2 ships the OAuth login flow.
+- `openai-codex` was unusable until phase 2 shipped the OAuth login flow
+  (design-0014); it now works via `koshell auth login openai-codex`.
 - The catalog is pinned by the locked pi version; new upstream providers
   arrive only with a dependency bump.
 

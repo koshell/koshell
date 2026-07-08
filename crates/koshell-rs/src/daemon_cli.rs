@@ -22,13 +22,14 @@ const TRANSITION_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_STEP: Duration = Duration::from_millis(50);
 
 /// The daemon's reachability, mirroring the daemon-side `probeSocket`.
-enum Probe {
+/// Shared with `auth_cli`, which needs the same connect-or-spawn dance.
+pub(crate) enum Probe {
     Alive,
     Stale,
     Absent,
 }
 
-fn probe(path: &Path) -> Probe {
+pub(crate) fn probe(path: &Path) -> Probe {
     if !path.exists() {
         return Probe::Absent;
     }
@@ -101,7 +102,7 @@ fn print_running_details(socket_path: &Path) {
 }
 
 /// Polls until the daemon is reachable, or the transition timeout elapses.
-fn wait_until_alive(path: &Path) -> bool {
+pub(crate) fn wait_until_alive(path: &Path) -> bool {
     let deadline = Instant::now() + TRANSITION_TIMEOUT;
     loop {
         if matches!(probe(path), Probe::Alive) {

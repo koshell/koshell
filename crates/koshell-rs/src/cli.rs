@@ -9,7 +9,7 @@
 //! `--` allows a program whose name starts with a dash. Unknown dashed arguments before
 //! the program are rejected so the option namespace stays reserved for future flags.
 //!
-//! `shell-init`, `daemon`, and `preflight` shadow programs literally named that;
+//! `shell-init`, `daemon`, `auth`, and `preflight` shadow programs literally named that;
 //! launching such a program requires a path form (for example `koshell ./shell-init` or
 //! `koshell ./daemon`). Accepted residual of reserving the names.
 
@@ -63,6 +63,12 @@ pub enum Command {
         action: DaemonAction,
     },
 
+    /// Manage AI provider credentials: OAuth login/logout and status.
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+
     /// Program to launch instead of the default shell, with its arguments.
     #[command(external_subcommand)]
     Launch(Vec<String>),
@@ -79,6 +85,27 @@ pub enum DaemonAction {
     Stop,
     /// Restart the daemon (stop if running, then start).
     Restart,
+}
+
+/// Credential actions for `koshell auth`.
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum AuthAction {
+    /// Sign in to an OAuth provider (for example anthropic, github-copilot,
+    /// openai-codex). Ctrl-C aborts the flow.
+    Login {
+        /// Provider id to sign in to.
+        provider: String,
+    },
+    /// Remove the stored credential for a provider.
+    Logout {
+        /// Provider id to sign out of.
+        provider: String,
+    },
+    /// Show credential status, for all known providers or one.
+    Status {
+        /// Provider id to report on; omit for all.
+        provider: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -219,5 +246,64 @@ mod tests {
         // A path spelling still launches a real program of that name.
         let cli = parse(&["./daemon", "status"]).unwrap();
         assert_eq!(launch(&cli), ["./daemon", "status"]);
+    }
+
+    #[test]
+    fn auth_subcommand_parses_each_action() {
+        let cli = parse(&["auth", "login", "anthropic"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::Auth {
+                action: AuthAction::Login {
+                    provider: "anthropic".to_string()
+                }
+            })
+        );
+        let cli = parse(&["auth", "logout", "github-copilot"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::Auth {
+                action: AuthAction::Logout {
+                    provider: "github-copilot".to_string()
+                }
+            })
+        );
+        let cli = parse(&["auth", "status"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::Auth {
+                action: AuthAction::Status { provider: None }
+            })
+        );
+        let cli = parse(&["auth", "status", "openai-codex"]).unwrap();
+        assert_eq!(
+            cli.command,
+            Some(Command::Auth {
+                action: AuthAction::Status {
+                    provider: Some("openai-codex".to_string())
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn auth_requires_an_action_and_login_requires_a_provider() {
+        assert!(parse(&["auth"]).is_err());
+        assert!(parse(&["auth", "login"]).is_err());
+        assert!(parse(&["auth", "logout"]).is_err());
+        let error = parse(&["auth", "bogus"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn a_program_named_auth_needs_a_path_form() {
+        // Reserved name: plain `auth` is the subcommand.
+        assert!(matches!(
+            parse(&["auth", "status"]).unwrap().command,
+            Some(Command::Auth { .. })
+        ));
+        // A path spelling still launches a real program of that name.
+        let cli = parse(&["./auth", "status"]).unwrap();
+        assert_eq!(launch(&cli), ["./auth", "status"]);
     }
 }

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -31,10 +31,15 @@ function unsetEnv(name: string): void {
   delete process.env[name];
 }
 
-function resolve(contents: string): ReturnType<typeof resolveProvider> {
+// resolveProvider defaults to the persistent store; tests always inject one so
+// the developer's real ~/.local/share/koshell/auth.json never leaks in.
+function resolve(
+  contents: string,
+  authStorage: AuthStorage = AuthStorage.inMemory(),
+): ReturnType<typeof resolveProvider> {
   const path = join(dir, "config.toml");
   writeFileSync(path, contents);
-  return resolveProvider(loadConfig(path));
+  return resolveProvider(loadConfig(path), authStorage);
 }
 
 beforeEach(() => {
@@ -146,6 +151,91 @@ describe("resolveProvider", () => {
     expect(() => resolve(`model = "anthropic/${id}"\n`)).toThrow(
       /no credentials/,
     );
+    // anthropic has an OAuth login flow, so the error offers it.
+    expect(() => resolve(`model = "anthropic/${id}"\n`)).toThrow(
+      /koshell auth login anthropic/,
+    );
+  });
+
+  it("points the OAuth-only openai-codex at koshell auth login", () => {
+    const id = anyBuiltinId("openai-codex");
+    expect(() => resolve(`model = "openai-codex/${id}"\n`)).toThrow(
+      /koshell auth login openai-codex/,
+    );
+  });
+
+  it("keeps a config api_key out of the persistent credential store", () => {
+    const authPath = join(dir, "auth.json");
+    const id = anyBuiltinId("anthropic");
+    const resolved = resolve(
+      [
+        `model = "anthropic/${id}"`,
+        "[providers.anthropic]",
+        'api_key = "sk-ant-secret"',
+        "",
+      ].join("\n"),
+      AuthStorage.create(authPath),
+    );
+    expect(resolved.model.id).toBe(id);
+    expect(readFileSync(authPath, "utf8")).not.toContain("sk-ant-secret");
+  });
+
+  it("resolves with a stored OAuth credential and nothing else", () => {
+    const authPath = join(dir, "auth.json");
+    writeFileSync(
+      authPath,
+      JSON.stringify({
+        anthropic: {
+          type: "oauth",
+          refresh: "r",
+          access: "sk-ant-oat-stored",
+          expires: Date.now() + 3_600_000,
+        },
+      }),
+    );
+    delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_OAUTH_TOKEN;
+    const id = anyBuiltinId("anthropic");
+    const resolved = resolve(
+      `model = "anthropic/${id}"\n`,
+      AuthStorage.create(authPath),
+    );
+    expect(resolved.model.provider).toBe("anthropic");
+  });
+
+  it("prefers a stored credential over a config api_key at request time", async () => {
+    const authPath = join(dir, "auth.json");
+    writeFileSync(
+      authPath,
+      JSON.stringify({
+        anthropic: {
+          type: "oauth",
+          refresh: "r",
+          access: "sk-ant-oat-stored",
+          expires: Date.now() + 3_600_000,
+        },
+      }),
+    );
+    const id = anyBuiltinId("anthropic");
+    const resolved = resolve(
+      [
+        `model = "anthropic/${id}"`,
+        "[providers.anthropic]",
+        'api_key = "sk-ant-config"',
+        "",
+      ].join("\n"),
+      AuthStorage.create(authPath),
+    );
+    // Documented in design-0014: pi's request path consults the auth store
+    // before the registered config key, so a login outranks the config until
+    // `koshell auth logout`.
+    const auth = await resolved.modelRegistry.getApiKeyAndHeaders(
+      resolved.model,
+    );
+    if (!auth.ok) {
+      throw new Error(`request auth failed: ${auth.error}`);
+    }
+    expect(auth.apiKey).toBe("sk-ant-oat-stored");
   });
 
   it("names the provider's API key environment variable in the error", () => {

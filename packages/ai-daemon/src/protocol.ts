@@ -42,12 +42,52 @@ export interface StatusRequestMessage {
   type: "status_request";
 }
 
+// Interactive OAuth login for `koshell auth login` (design 0014). The daemon
+// replies `ack`, streams auth display/prompt events, and terminates with
+// exactly one `auth_result`. Dropping the connection aborts the flow.
+// Additive (design 0004): no protocol version bump.
+export interface AuthLoginMessage {
+  type: "auth_login";
+  request_id: string;
+  provider: string;
+}
+
+// Removes the stored credential for a provider (`koshell auth logout`).
+// Answered with `ack` then one `auth_result`.
+export interface AuthLogoutMessage {
+  type: "auth_logout";
+  request_id: string;
+  provider: string;
+}
+
+// Per-provider credential status (`koshell auth status`); `provider` limits
+// the report to one entry. Answered with `ack` then one `auth_status`.
+export interface AuthStatusRequestMessage {
+  type: "auth_status_request";
+  request_id: string;
+  provider?: string;
+}
+
+// Answers a daemon-initiated `auth_prompt` or `auth_select`. `value` is the
+// typed text (prompt) or the chosen option id (select); null means the user
+// declined (EOF).
+export interface AuthPromptResponseMessage {
+  type: "auth_prompt_response";
+  request_id: string;
+  prompt_id: string;
+  value: string | null;
+}
+
 export type ClientMessage =
   | HelloMessage
   | AiRequestMessage
   | AiCancelMessage
   | ByeMessage
-  | StatusRequestMessage;
+  | StatusRequestMessage
+  | AuthLoginMessage
+  | AuthLogoutMessage
+  | AuthStatusRequestMessage
+  | AuthPromptResponseMessage;
 
 // Per request, the daemon sends `ack` first (parsed and enqueued), then zero or
 // more `ai_delta` chunks, then exactly one of `ai_response_end` or `ai_error`.
@@ -84,12 +124,98 @@ export interface StatusMessage {
   connections: number;
 }
 
+// Login display event: "open this URL to authorize".
+export interface AuthUrlMessage {
+  type: "auth_url";
+  request_id: string;
+  url: string;
+  instructions?: string;
+}
+
+// Login display event: enter `user_code` at `verification_uri` (device-code
+// flows: github-copilot, openai-codex).
+export interface AuthDeviceCodeMessage {
+  type: "auth_device_code";
+  request_id: string;
+  user_code: string;
+  verification_uri: string;
+  interval_seconds?: number;
+  expires_in_seconds?: number;
+}
+
+// Login display event: free-form progress line.
+export interface AuthProgressMessage {
+  type: "auth_progress";
+  request_id: string;
+  message: string;
+}
+
+// Daemon-initiated free-text prompt; answered by `auth_prompt_response` with
+// the same `prompt_id`.
+export interface AuthPromptMessage {
+  type: "auth_prompt";
+  request_id: string;
+  prompt_id: string;
+  message: string;
+  placeholder?: string;
+  allow_empty: boolean;
+}
+
+export interface AuthSelectOption {
+  id: string;
+  label: string;
+}
+
+// Daemon-initiated selection; answered by `auth_prompt_response` with the
+// chosen option id.
+export interface AuthSelectMessage {
+  type: "auth_select";
+  request_id: string;
+  prompt_id: string;
+  message: string;
+  options: AuthSelectOption[];
+}
+
+// Terminal marker for `auth_login` and `auth_logout`: exactly one per request.
+export interface AuthResultMessage {
+  type: "auth_result";
+  request_id: string;
+  ok: boolean;
+  message?: string;
+}
+
+// One provider row in `auth_status`. `source` is a koshell-defined label
+// ("stored", "environment", "config"), free-form on the wire so a new label
+// never breaks an older client.
+export interface AuthStatusEntry {
+  provider: string;
+  name: string;
+  oauth: boolean;
+  configured: boolean;
+  source?: string;
+  label?: string;
+}
+
+// Terminal reply to `auth_status_request`.
+export interface AuthStatusMessage {
+  type: "auth_status";
+  request_id: string;
+  entries: AuthStatusEntry[];
+}
+
 export type ServerMessage =
   | AckMessage
   | AiDeltaMessage
   | AiResponseEndMessage
   | AiErrorMessage
-  | StatusMessage;
+  | StatusMessage
+  | AuthUrlMessage
+  | AuthDeviceCodeMessage
+  | AuthProgressMessage
+  | AuthPromptMessage
+  | AuthSelectMessage
+  | AuthResultMessage
+  | AuthStatusMessage;
 
 // Encodes one server message as a newline-terminated JSONL line.
 export function serializeServerMessage(message: ServerMessage): string {
@@ -167,6 +293,47 @@ export function parseClientMessage(line: string): ClientMessage | null {
       return null;
     case "status_request":
       return { type: "status_request" };
+    case "auth_login":
+    case "auth_logout":
+      if (
+        typeof value.request_id === "string" &&
+        typeof value.provider === "string"
+      ) {
+        return {
+          type: value.type,
+          request_id: value.request_id,
+          provider: value.provider,
+        };
+      }
+      return null;
+    case "auth_status_request":
+      if (typeof value.request_id === "string") {
+        const message: AuthStatusRequestMessage = {
+          type: "auth_status_request",
+          request_id: value.request_id,
+        };
+        if (typeof value.provider === "string") {
+          message.provider = value.provider;
+        } else if (value.provider !== undefined && value.provider !== null) {
+          return null;
+        }
+        return message;
+      }
+      return null;
+    case "auth_prompt_response":
+      if (
+        typeof value.request_id === "string" &&
+        typeof value.prompt_id === "string" &&
+        (typeof value.value === "string" || value.value === null)
+      ) {
+        return {
+          type: "auth_prompt_response",
+          request_id: value.request_id,
+          prompt_id: value.prompt_id,
+          value: value.value,
+        };
+      }
+      return null;
     default:
       return null;
   }

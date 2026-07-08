@@ -1,12 +1,23 @@
 import net from "node:net";
 import process from "node:process";
 
+import type { AuthStorage } from "@earendil-works/pi-coding-agent";
+
 import type { AgentFactory, KoshellAgent } from "./agent-runtime.ts";
+import {
+  type AuthFlowIo,
+  buildAuthStatus,
+  runAuthLogin,
+  runAuthLogout,
+} from "./auth-flow.ts";
+import { openAuthStorage } from "./auth-store.ts";
+import { type KoshellConfig, loadConfig } from "./config.ts";
 import { NdjsonDecoder } from "./framing.ts";
 import type { Logger } from "./logging.ts";
 import { buildUserPrompt } from "./prompt.ts";
 import {
   type AiRequestMessage,
+  type AuthLoginMessage,
   type HelloMessage,
   PROTOCOL_VERSION,
   type ServerMessage,
@@ -26,12 +37,22 @@ export interface DaemonStatus {
 // What one TerminalConnection needs. `status` is injected by startDaemon (which
 // owns the connection counter and the start time); its absence just makes
 // status_request a no-op, which keeps unit tests that never exercise status
-// free of the plumbing.
+// free of the plumbing. `openAuthStorage` and `loadConfig` are injection seams
+// for the `koshell auth` handlers, defaulting to the real file-backed store and
+// config loader; the defaults are resolved lazily so tests that never send auth
+// messages stay off the filesystem.
 export interface ConnectionOptions {
   createAgent: AgentFactory;
   log: Logger;
   status?: () => DaemonStatus;
+  openAuthStorage?: () => AuthStorage;
+  loadConfig?: () => KoshellConfig;
 }
+
+// An interactive login flow can sit in pi's polling loops for as long as the
+// user takes to authorize; cap it so a wedged client cannot hold the
+// connection (and the daemon's idle timer) open forever.
+const LOGIN_TIMEOUT_MS = 15 * 60 * 1000;
 
 // What index.ts passes to startDaemon. `version` is the daemon package version
 // reported by status; the idle knobs let a terminal-less daemon exit itself.
@@ -76,6 +97,17 @@ export class TerminalConnection {
   // so a cancel that raced past its request's completion cannot linger.
   private readonly cancelled = new Set<string>();
   private runningRequestId: string | undefined;
+  // The one in-flight `koshell auth login` on this connection, with the
+  // resolvers of prompts the client has not answered yet. Aborting the
+  // controller resolves every pending prompt with null (see handleAuthLogin),
+  // which settles the login promise.
+  private activeLogin:
+    | {
+        requestId: string;
+        controller: AbortController;
+        pending: Map<string, (value: string | null) => void>;
+      }
+    | undefined;
   private closed = false;
 
   constructor(sink: MessageSink, options: ConnectionOptions) {
@@ -157,16 +189,208 @@ export class TerminalConnection {
         }
         break;
       }
+      case "auth_login":
+        this.handleAuthLogin(message);
+        break;
+      case "auth_logout": {
+        this.send({ type: "ack", request_id: message.request_id });
+        if (this.helloRejection !== undefined) {
+          this.sendAuthResult(message.request_id, {
+            ok: false,
+            message: this.helloRejection,
+          });
+          break;
+        }
+        this.options.log.info(
+          `auth logout [${message.request_id}] provider=${message.provider}`,
+        );
+        try {
+          const storage = this.openAuthStorage();
+          this.sendAuthResult(
+            message.request_id,
+            runAuthLogout(storage, message.provider),
+          );
+        } catch (error) {
+          this.sendAuthResult(message.request_id, {
+            ok: false,
+            message: errorText(error),
+          });
+        }
+        break;
+      }
+      case "auth_status_request": {
+        this.send({ type: "ack", request_id: message.request_id });
+        if (this.helloRejection !== undefined) {
+          this.sendAuthResult(message.request_id, {
+            ok: false,
+            message: this.helloRejection,
+          });
+          break;
+        }
+        try {
+          const storage = this.openAuthStorage();
+          this.send({
+            type: "auth_status",
+            request_id: message.request_id,
+            entries: buildAuthStatus(
+              storage,
+              message.provider,
+              this.loadConfigForStatus(),
+            ),
+          });
+        } catch (error) {
+          this.sendAuthResult(message.request_id, {
+            ok: false,
+            message: errorText(error),
+          });
+        }
+        break;
+      }
+      case "auth_prompt_response": {
+        const login = this.activeLogin;
+        const resolve = login?.pending.get(message.prompt_id);
+        if (
+          login === undefined ||
+          resolve === undefined ||
+          login.requestId !== message.request_id
+        ) {
+          // A response racing a finished (or aborted) login is expected; drop it.
+          this.options.log.warn(
+            `dropped auth_prompt_response for unknown prompt ${message.prompt_id}`,
+          );
+          break;
+        }
+        login.pending.delete(message.prompt_id);
+        resolve(message.value);
+        break;
+      }
+    }
+  }
+
+  // Runs one interactive login. The single auth_result is sent when the flow
+  // settles; prompts stay pending until the client answers, the connection
+  // drops, or the login timeout aborts the flow.
+  private handleAuthLogin(message: AuthLoginMessage): void {
+    this.send({ type: "ack", request_id: message.request_id });
+    if (this.helloRejection !== undefined) {
+      this.sendAuthResult(message.request_id, {
+        ok: false,
+        message: this.helloRejection,
+      });
+      return;
+    }
+    if (this.activeLogin !== undefined) {
+      this.sendAuthResult(message.request_id, {
+        ok: false,
+        message: "another login is already in progress on this connection",
+      });
+      return;
+    }
+    let storage: AuthStorage;
+    try {
+      storage = this.openAuthStorage();
+    } catch (error) {
+      this.sendAuthResult(message.request_id, {
+        ok: false,
+        message: errorText(error),
+      });
+      return;
+    }
+
+    const login = {
+      requestId: message.request_id,
+      controller: new AbortController(),
+      pending: new Map<string, (value: string | null) => void>(),
+    };
+    this.activeLogin = login;
+    const signal = AbortSignal.any([
+      login.controller.signal,
+      AbortSignal.timeout(LOGIN_TIMEOUT_MS),
+    ]);
+    // An abort must settle the login even while pi awaits a prompt answer:
+    // resolving the pending prompts with null makes onPrompt throw, which
+    // rejects pi's flow and lets runAuthLogin return its failure outcome.
+    signal.addEventListener("abort", () => {
+      for (const resolve of login.pending.values()) {
+        resolve(null);
+      }
+      login.pending.clear();
+    });
+    const io: AuthFlowIo = {
+      send: (event) => {
+        this.send(event);
+      },
+      prompt: (prompt) =>
+        new Promise((resolve) => {
+          if (signal.aborted) {
+            resolve(null);
+            return;
+          }
+          login.pending.set(prompt.prompt_id, resolve);
+          this.send(prompt);
+        }),
+      signal,
+    };
+    this.options.log.info(
+      `auth login [${message.request_id}] provider=${message.provider}`,
+    );
+    void runAuthLogin(storage, message.provider, message.request_id, io).then(
+      (outcome) => {
+        for (const resolve of login.pending.values()) {
+          resolve(null);
+        }
+        login.pending.clear();
+        if (this.activeLogin === login) {
+          this.activeLogin = undefined;
+        }
+        this.options.log.info(
+          `auth login [${message.request_id}] ${outcome.ok ? "succeeded" : "failed"}: ${outcome.message}`,
+        );
+        this.sendAuthResult(message.request_id, outcome);
+      },
+    );
+  }
+
+  private sendAuthResult(
+    requestId: string,
+    outcome: { ok: boolean; message: string },
+  ): void {
+    this.send({
+      type: "auth_result",
+      request_id: requestId,
+      ok: outcome.ok,
+      message: outcome.message,
+    });
+  }
+
+  private openAuthStorage(): AuthStorage {
+    return (this.options.openAuthStorage ?? openAuthStorage)();
+  }
+
+  // Best-effort config for the status report: an absent or invalid config
+  // must not break `koshell auth status` (its whole point is diagnosing an
+  // incomplete setup).
+  private loadConfigForStatus(): KoshellConfig | undefined {
+    try {
+      return (this.options.loadConfig ?? loadConfig)();
+    } catch (error) {
+      this.options.log.warn(
+        `auth status: config unavailable: ${errorText(error)}`,
+      );
+      return undefined;
     }
   }
 
   // Idempotent; called on bye and on socket close. An in-flight request keeps
   // running but its sends become no-ops and its errors are swallowed by run().
+  // An in-flight login is aborted: dropping the connection is the cancel
+  // gesture (Ctrl-C in `koshell auth login` simply exits the client).
   dispose(): void {
     if (this.closed) {
       return;
     }
     this.closed = true;
+    this.activeLogin?.controller.abort();
     void this.agent
       ?.then((agent) => {
         agent.dispose();

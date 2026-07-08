@@ -45,6 +45,99 @@ describe("parseClientMessage", () => {
     });
   });
 
+  it("parses auth_login and auth_logout", () => {
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "auth_login",
+          request_id: "auth-1",
+          provider: "anthropic",
+        }),
+      ),
+    ).toEqual({
+      type: "auth_login",
+      request_id: "auth-1",
+      provider: "anthropic",
+    });
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "auth_logout",
+          request_id: "auth-1",
+          provider: "anthropic",
+        }),
+      ),
+    ).toEqual({
+      type: "auth_logout",
+      request_id: "auth-1",
+      provider: "anthropic",
+    });
+  });
+
+  it("parses auth_status_request with and without a provider", () => {
+    expect(
+      parseClientMessage(
+        JSON.stringify({ type: "auth_status_request", request_id: "auth-1" }),
+      ),
+    ).toEqual({ type: "auth_status_request", request_id: "auth-1" });
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "auth_status_request",
+          request_id: "auth-1",
+          provider: "openai-codex",
+        }),
+      ),
+    ).toEqual({
+      type: "auth_status_request",
+      request_id: "auth-1",
+      provider: "openai-codex",
+    });
+    // Rust's Option<String> can serialize as an explicit null; treat it as absent.
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "auth_status_request",
+          request_id: "auth-1",
+          provider: null,
+        }),
+      ),
+    ).toEqual({ type: "auth_status_request", request_id: "auth-1" });
+  });
+
+  it("parses auth_prompt_response with a string or null value", () => {
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "auth_prompt_response",
+          request_id: "auth-1",
+          prompt_id: "prompt-1",
+          value: "code",
+        }),
+      ),
+    ).toEqual({
+      type: "auth_prompt_response",
+      request_id: "auth-1",
+      prompt_id: "prompt-1",
+      value: "code",
+    });
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "auth_prompt_response",
+          request_id: "auth-1",
+          prompt_id: "prompt-1",
+          value: null,
+        }),
+      ),
+    ).toEqual({
+      type: "auth_prompt_response",
+      request_id: "auth-1",
+      prompt_id: "prompt-1",
+      value: null,
+    });
+  });
+
   it("rejects malformed input", () => {
     expect(parseClientMessage("not json")).toBeNull();
     expect(parseClientMessage(JSON.stringify({ type: "unknown" }))).toBeNull();
@@ -53,6 +146,23 @@ describe("parseClientMessage", () => {
     ).toBeNull();
     expect(
       parseClientMessage(JSON.stringify({ type: "ai_cancel" })),
+    ).toBeNull();
+    expect(
+      parseClientMessage(JSON.stringify({ type: "auth_login" })),
+    ).toBeNull();
+    expect(
+      parseClientMessage(
+        JSON.stringify({ type: "auth_status_request", provider: "anthropic" }),
+      ),
+    ).toBeNull();
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "auth_prompt_response",
+          request_id: "auth-1",
+          prompt_id: "prompt-1",
+        }),
+      ),
     ).toBeNull();
   });
 });
@@ -85,6 +195,88 @@ describe("serializeServerMessage", () => {
       }),
     ).toBe(
       '{"type":"ai_error","request_id":"req-1","message":"no provider configured"}\n',
+    );
+  });
+
+  it("produces the exact auth JSONL wire lines", () => {
+    expect(
+      serializeServerMessage({
+        type: "auth_url",
+        request_id: "auth-1",
+        url: "https://example.test/authorize",
+      }),
+    ).toBe(
+      '{"type":"auth_url","request_id":"auth-1","url":"https://example.test/authorize"}\n',
+    );
+    expect(
+      serializeServerMessage({
+        type: "auth_device_code",
+        request_id: "auth-1",
+        user_code: "ABCD-1234",
+        verification_uri: "https://example.test/device",
+        interval_seconds: 5,
+      }),
+    ).toBe(
+      '{"type":"auth_device_code","request_id":"auth-1","user_code":"ABCD-1234","verification_uri":"https://example.test/device","interval_seconds":5}\n',
+    );
+    expect(
+      serializeServerMessage({
+        type: "auth_progress",
+        request_id: "auth-1",
+        message: "Waiting for authorization...",
+      }),
+    ).toBe(
+      '{"type":"auth_progress","request_id":"auth-1","message":"Waiting for authorization..."}\n',
+    );
+    expect(
+      serializeServerMessage({
+        type: "auth_prompt",
+        request_id: "auth-1",
+        prompt_id: "prompt-1",
+        message: "Paste the authorization code",
+        allow_empty: false,
+      }),
+    ).toBe(
+      '{"type":"auth_prompt","request_id":"auth-1","prompt_id":"prompt-1","message":"Paste the authorization code","allow_empty":false}\n',
+    );
+    expect(
+      serializeServerMessage({
+        type: "auth_select",
+        request_id: "auth-1",
+        prompt_id: "prompt-2",
+        message: "How do you want to sign in?",
+        options: [{ id: "browser", label: "Open a browser" }],
+      }),
+    ).toBe(
+      '{"type":"auth_select","request_id":"auth-1","prompt_id":"prompt-2","message":"How do you want to sign in?","options":[{"id":"browser","label":"Open a browser"}]}\n',
+    );
+    expect(
+      serializeServerMessage({
+        type: "auth_result",
+        request_id: "auth-1",
+        ok: true,
+        message: "logged in",
+      }),
+    ).toBe(
+      '{"type":"auth_result","request_id":"auth-1","ok":true,"message":"logged in"}\n',
+    );
+    expect(
+      serializeServerMessage({
+        type: "auth_status",
+        request_id: "auth-1",
+        entries: [
+          {
+            provider: "anthropic",
+            name: "Anthropic (Claude Pro/Max)",
+            oauth: true,
+            configured: true,
+            source: "environment",
+            label: "ANTHROPIC_API_KEY",
+          },
+        ],
+      }),
+    ).toBe(
+      '{"type":"auth_status","request_id":"auth-1","entries":[{"provider":"anthropic","name":"Anthropic (Claude Pro/Max)","oauth":true,"configured":true,"source":"environment","label":"ANTHROPIC_API_KEY"}]}\n',
     );
   });
 });

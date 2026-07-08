@@ -1,6 +1,7 @@
 //! koshell terminal-core library: PTY session, terminal mirror, timeline, screen
 //! diffing, and terminal context. The `koshell` binary is a thin wrapper over this.
 
+pub mod auth_cli;
 pub mod cli;
 pub mod context;
 pub mod daemon_cli;

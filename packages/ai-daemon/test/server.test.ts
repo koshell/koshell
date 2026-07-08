@@ -1,10 +1,18 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
+
+import { AuthStorage } from "@earendil-works/pi-coding-agent";
+import {
+  type OAuthLoginCallbacks,
+  registerOAuthProvider,
+  unregisterOAuthProvider,
+} from "@earendil-works/pi-ai/oauth";
 
 import type {
   AgentFactory,
   AskOptions,
   KoshellAgent,
 } from "../src/agent-runtime.ts";
+import type { KoshellConfig } from "../src/config.ts";
 import type { Logger } from "../src/logging.ts";
 import { PROTOCOL_VERSION } from "../src/protocol.ts";
 import { TerminalConnection, type MessageSink } from "../src/server.ts";
@@ -411,5 +419,375 @@ describe("TerminalConnection", () => {
     expect(status.version).toBe("9.9.9");
     expect(status.protocol_version).toBe(PROTOCOL_VERSION);
     expect(status.connections).toBe(2);
+  });
+});
+
+// The auth handlers run against a fake OAuth provider injected into pi-ai's
+// global registry (the same registry AuthStorage.login consults), so a full
+// login exchange runs without any network or real credentials.
+const FAKE_PROVIDER_ID = "fake-oauth";
+
+const NO_AGENT: AgentFactory = () => {
+  throw new Error("auth handling must not create an agent");
+};
+
+function registerFakeProvider(): void {
+  registerOAuthProvider({
+    id: FAKE_PROVIDER_ID,
+    name: "Fake Provider",
+    async login(callbacks: OAuthLoginCallbacks) {
+      callbacks.onAuth({
+        url: "https://example.test/authorize",
+        instructions: "authorize, then paste the code",
+      });
+      const code = await callbacks.onPrompt({ message: "Code" });
+      return { refresh: "r", access: code, expires: Date.now() + 3_600_000 };
+    },
+    refreshToken(credentials) {
+      return Promise.resolve(credentials);
+    },
+    getApiKey(credentials) {
+      return credentials.access;
+    },
+  });
+}
+
+function authConnection(options?: {
+  storage?: AuthStorage;
+  config?: KoshellConfig;
+}): { connection: TerminalConnection; lines: string[]; storage: AuthStorage } {
+  const { sink, lines } = collectingSink();
+  const storage = options?.storage ?? AuthStorage.inMemory();
+  const config = options?.config;
+  const connection = new TerminalConnection(sink, {
+    createAgent: NO_AGENT,
+    log: NOOP_LOGGER,
+    openAuthStorage: () => storage,
+    loadConfig: () => {
+      if (config === undefined) {
+        throw new Error("no config for this test");
+      }
+      return config;
+    },
+  });
+  return { connection, lines, storage };
+}
+
+function parsed(lines: string[], index: number): Record<string, unknown> {
+  return JSON.parse(lines[index] ?? "{}") as Record<string, unknown>;
+}
+
+describe("TerminalConnection auth", () => {
+  afterEach(() => {
+    unregisterOAuthProvider(FAKE_PROVIDER_ID);
+  });
+
+  it("runs a full login exchange and stores the credential", async () => {
+    registerFakeProvider();
+    const { connection, lines, storage } = authConnection();
+
+    connection.handleLine(HELLO_LINE);
+    connection.handleLine(
+      JSON.stringify({
+        type: "auth_login",
+        request_id: "a1",
+        provider: FAKE_PROVIDER_ID,
+      }),
+    );
+    await settle();
+
+    expect(types(lines)).toEqual(["ack", "auth_url", "auth_prompt"]);
+    expect(parsed(lines, 1).url).toBe("https://example.test/authorize");
+    const prompt = parsed(lines, 2);
+    expect(prompt.message).toBe("Code");
+
+    connection.handleLine(
+      JSON.stringify({
+        type: "auth_prompt_response",
+        request_id: "a1",
+        prompt_id: prompt.prompt_id,
+        value: "the-code",
+      }),
+    );
+    await settle();
+
+    expect(types(lines)).toEqual([
+      "ack",
+      "auth_url",
+      "auth_prompt",
+      "auth_result",
+    ]);
+    const result = parsed(lines, 3);
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("Fake Provider");
+    expect(storage.get(FAKE_PROVIDER_ID)).toMatchObject({
+      type: "oauth",
+      access: "the-code",
+    });
+  });
+
+  it("refuses a second login while one is in progress on the connection", async () => {
+    registerFakeProvider();
+    const { connection, lines } = authConnection();
+
+    connection.handleLine(HELLO_LINE);
+    connection.handleLine(
+      JSON.stringify({
+        type: "auth_login",
+        request_id: "a1",
+        provider: FAKE_PROVIDER_ID,
+      }),
+    );
+    await settle();
+    connection.handleLine(
+      JSON.stringify({
+        type: "auth_login",
+        request_id: "a2",
+        provider: FAKE_PROVIDER_ID,
+      }),
+    );
+    await settle();
+
+    expect(types(lines)).toEqual([
+      "ack",
+      "auth_url",
+      "auth_prompt",
+      "ack",
+      "auth_result",
+    ]);
+    const refusal = parsed(lines, 4);
+    expect(refusal.request_id).toBe("a2");
+    expect(refusal.ok).toBe(false);
+    expect(refusal.message).toContain("already in progress");
+
+    // Settle the first login so it cannot leak across tests.
+    connection.handleLine(
+      JSON.stringify({
+        type: "auth_prompt_response",
+        request_id: "a1",
+        prompt_id: parsed(lines, 2).prompt_id,
+        value: "the-code",
+      }),
+    );
+    await settle();
+  });
+
+  it("aborts a login mid-prompt when the connection is disposed", async () => {
+    registerFakeProvider();
+    const { connection, lines, storage } = authConnection();
+
+    connection.handleLine(HELLO_LINE);
+    connection.handleLine(
+      JSON.stringify({
+        type: "auth_login",
+        request_id: "a1",
+        provider: FAKE_PROVIDER_ID,
+      }),
+    );
+    await settle();
+    expect(types(lines)).toEqual(["ack", "auth_url", "auth_prompt"]);
+
+    connection.dispose();
+    await settle();
+
+    // The login settled as a failure, but the connection is closed so no
+    // auth_result reaches the wire; nothing was stored.
+    expect(types(lines)).toEqual(["ack", "auth_url", "auth_prompt"]);
+    expect(storage.list()).toEqual([]);
+  });
+
+  it("fails the login when the client declines a prompt", async () => {
+    registerFakeProvider();
+    const { connection, lines } = authConnection();
+
+    connection.handleLine(HELLO_LINE);
+    connection.handleLine(
+      JSON.stringify({
+        type: "auth_login",
+        request_id: "a1",
+        provider: FAKE_PROVIDER_ID,
+      }),
+    );
+    await settle();
+    connection.handleLine(
+      JSON.stringify({
+        type: "auth_prompt_response",
+        request_id: "a1",
+        prompt_id: parsed(lines, 2).prompt_id,
+        value: null,
+      }),
+    );
+    await settle();
+
+    const result = parsed(lines, 3);
+    expect(result.type).toBe("auth_result");
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("cancelled");
+  });
+
+  it("rejects a login for a provider without an OAuth flow", async () => {
+    const { connection, lines } = authConnection();
+
+    connection.handleLine(HELLO_LINE);
+    connection.handleLine(
+      JSON.stringify({
+        type: "auth_login",
+        request_id: "a1",
+        provider: "not-a-provider",
+      }),
+    );
+    await settle();
+
+    expect(types(lines)).toEqual(["ack", "auth_result"]);
+    const result = parsed(lines, 1);
+    expect(result.ok).toBe(false);
+    // The provider list derives from pi's live OAuth registry.
+    expect(result.message).toContain("anthropic");
+    expect(result.message).toContain("github-copilot");
+    expect(result.message).toContain("openai-codex");
+  });
+
+  it("refuses auth requests before a hello handshake", async () => {
+    const { connection, lines } = authConnection();
+
+    connection.handleLine(
+      JSON.stringify({
+        type: "auth_login",
+        request_id: "a1",
+        provider: FAKE_PROVIDER_ID,
+      }),
+    );
+    await settle();
+
+    expect(types(lines)).toEqual(["ack", "auth_result"]);
+    const result = parsed(lines, 1);
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain("hello handshake");
+  });
+
+  it("logs out a stored credential and stays idempotent", async () => {
+    const storage = AuthStorage.inMemory();
+    storage.set(FAKE_PROVIDER_ID, {
+      type: "oauth",
+      refresh: "r",
+      access: "a",
+      expires: Date.now() + 3_600_000,
+    });
+    const { connection, lines } = authConnection({ storage });
+
+    connection.handleLine(HELLO_LINE);
+    connection.handleLine(
+      JSON.stringify({
+        type: "auth_logout",
+        request_id: "a1",
+        provider: FAKE_PROVIDER_ID,
+      }),
+    );
+    await settle();
+    connection.handleLine(
+      JSON.stringify({
+        type: "auth_logout",
+        request_id: "a2",
+        provider: FAKE_PROVIDER_ID,
+      }),
+    );
+    await settle();
+
+    expect(types(lines)).toEqual(["ack", "auth_result", "ack", "auth_result"]);
+    expect(parsed(lines, 1)).toMatchObject({ ok: true });
+    expect(parsed(lines, 1).message).toContain("removed");
+    expect(parsed(lines, 3)).toMatchObject({ ok: true });
+    expect(parsed(lines, 3).message).toContain("no stored credentials");
+    expect(storage.has(FAKE_PROVIDER_ID)).toBe(false);
+  });
+
+  it("reports status with stored, environment, and config sources", async () => {
+    const storage = AuthStorage.inMemory();
+    storage.set("openai-codex", {
+      type: "oauth",
+      refresh: "r",
+      access: "a",
+      expires: Date.now() + 3_600_000,
+    });
+    const config: KoshellConfig = {
+      model: "groq/some-model",
+      providers: {
+        groq: { api_key: "gsk-config" },
+        mistral: { api_key: "sk-config" },
+      },
+    };
+    const savedGroq = process.env.GROQ_API_KEY;
+    const savedMistral = process.env.MISTRAL_API_KEY;
+    delete process.env.GROQ_API_KEY;
+    process.env.MISTRAL_API_KEY = "sk-env";
+    try {
+      const { connection, lines } = authConnection({ storage, config });
+
+      connection.handleLine(HELLO_LINE);
+      connection.handleLine(
+        JSON.stringify({ type: "auth_status_request", request_id: "a1" }),
+      );
+      await settle();
+
+      expect(types(lines)).toEqual(["ack", "auth_status"]);
+      const entries = parsed(lines, 1).entries as Record<string, unknown>[];
+      const byProvider = new Map(entries.map((e) => [e.provider, e]));
+
+      // Stored credential wins outright.
+      expect(byProvider.get("openai-codex")).toMatchObject({
+        oauth: true,
+        configured: true,
+        source: "stored",
+      });
+      // A set conventional env var counts as configured, and outranks the
+      // config api_key in the report.
+      expect(byProvider.get("mistral")).toMatchObject({
+        configured: true,
+        source: "environment",
+        label: "MISTRAL_API_KEY",
+      });
+      // A config api_key counts as configured (groq's env var is unset).
+      expect(byProvider.get("groq")).toMatchObject({
+        oauth: false,
+        configured: true,
+        source: "config",
+      });
+      // OAuth providers appear even with nothing configured.
+      expect(byProvider.get("github-copilot")).toMatchObject({ oauth: true });
+    } finally {
+      if (savedGroq === undefined) {
+        delete process.env.GROQ_API_KEY;
+      } else {
+        process.env.GROQ_API_KEY = savedGroq;
+      }
+      if (savedMistral === undefined) {
+        delete process.env.MISTRAL_API_KEY;
+      } else {
+        process.env.MISTRAL_API_KEY = savedMistral;
+      }
+    }
+  });
+
+  it("limits status to one provider when asked", async () => {
+    const { connection, lines } = authConnection();
+
+    connection.handleLine(HELLO_LINE);
+    connection.handleLine(
+      JSON.stringify({
+        type: "auth_status_request",
+        request_id: "a1",
+        provider: "openai-codex",
+      }),
+    );
+    await settle();
+
+    expect(types(lines)).toEqual(["ack", "auth_status"]);
+    const entries = parsed(lines, 1).entries as Record<string, unknown>[];
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      provider: "openai-codex",
+      oauth: true,
+      configured: false,
+    });
   });
 });

@@ -75,6 +75,66 @@ pub enum ClientMessage {
     /// version-mismatched daemon for its identity is exactly the use case).
     /// Additive: a daemon that does not know this type ignores it.
     StatusRequest {},
+    /// Starts an interactive OAuth login for `provider` on this connection
+    /// (`koshell auth login`). The daemon replies `ack`, streams display and
+    /// prompt events, and terminates with exactly one
+    /// [`ServerMessage::AuthResult`]. Dropping the connection aborts the flow.
+    /// Additive: a daemon that does not know this type ignores it (no `ack`),
+    /// which the client treats as "daemon too old".
+    AuthLogin {
+        request_id: String,
+        provider: String,
+    },
+    /// Removes the stored credential for `provider` (`koshell auth logout`).
+    /// Answered with `ack` then one [`ServerMessage::AuthResult`]. Additive.
+    AuthLogout {
+        request_id: String,
+        provider: String,
+    },
+    /// Asks for per-provider credential status (`koshell auth status`);
+    /// `provider` limits the report to one entry. Answered with `ack` then one
+    /// [`ServerMessage::AuthStatus`]. Additive.
+    AuthStatusRequest {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
+    /// Answers a daemon-initiated [`ServerMessage::AuthPrompt`] or
+    /// [`ServerMessage::AuthSelect`]. `value` is the typed text (prompt) or the
+    /// chosen option id (select); `None` means the user declined (EOF).
+    AuthPromptResponse {
+        request_id: String,
+        prompt_id: String,
+        value: Option<String>,
+    },
+}
+
+/// One choice offered by [`ServerMessage::AuthSelect`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthSelectOption {
+    pub id: String,
+    pub label: String,
+}
+
+/// One provider row in [`ServerMessage::AuthStatus`].
+///
+/// `source` is a koshell-defined label ("stored", "environment", "config"), kept
+/// as a free string on the wire so a new label never breaks an older client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthStatusEntry {
+    /// pi provider id, e.g. "github-copilot".
+    pub provider: String,
+    /// Display name, e.g. "GitHub Copilot".
+    pub name: String,
+    /// Whether `koshell auth login` applies to this provider.
+    pub oauth: bool,
+    /// Whether any usable credential was found (stored, environment, or config).
+    pub configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Human detail for the source, e.g. the environment variable name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// A message sent from the AI daemon back to the terminal process.
@@ -104,6 +164,58 @@ pub enum ServerMessage {
         protocol_version: u32,
         uptime_ms: u64,
         connections: u32,
+    },
+    /// Login display event: "open this URL to authorize".
+    AuthUrl {
+        request_id: String,
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<String>,
+    },
+    /// Login display event: enter `user_code` at `verification_uri` (device-code
+    /// flows: github-copilot, openai-codex).
+    AuthDeviceCode {
+        request_id: String,
+        user_code: String,
+        verification_uri: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interval_seconds: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_in_seconds: Option<u64>,
+    },
+    /// Login display event: free-form progress line ("Waiting for
+    /// authorization...").
+    AuthProgress { request_id: String, message: String },
+    /// Daemon-initiated free-text prompt; answered by
+    /// [`ClientMessage::AuthPromptResponse`] with the same `prompt_id`.
+    AuthPrompt {
+        request_id: String,
+        prompt_id: String,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placeholder: Option<String>,
+        allow_empty: bool,
+    },
+    /// Daemon-initiated selection; answered by
+    /// [`ClientMessage::AuthPromptResponse`] with the chosen option id.
+    AuthSelect {
+        request_id: String,
+        prompt_id: String,
+        message: String,
+        options: Vec<AuthSelectOption>,
+    },
+    /// Terminal marker for [`ClientMessage::AuthLogin`] and
+    /// [`ClientMessage::AuthLogout`]: exactly one per request.
+    AuthResult {
+        request_id: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// Terminal reply to [`ClientMessage::AuthStatusRequest`].
+    AuthStatus {
+        request_id: String,
+        entries: Vec<AuthStatusEntry>,
     },
 }
 
@@ -184,6 +296,208 @@ mod tests {
             ServerMessage::AiDelta { request_id, delta } => {
                 assert_eq!(request_id, "req-1");
                 assert_eq!(delta, "Hello");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_requests_round_trip_as_tagged_json() {
+        let login = serde_json::to_string(&ClientMessage::AuthLogin {
+            request_id: "auth-1".into(),
+            provider: "anthropic".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            login,
+            r#"{"type":"auth_login","request_id":"auth-1","provider":"anthropic"}"#
+        );
+
+        let logout = serde_json::to_string(&ClientMessage::AuthLogout {
+            request_id: "auth-1".into(),
+            provider: "anthropic".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            logout,
+            r#"{"type":"auth_logout","request_id":"auth-1","provider":"anthropic"}"#
+        );
+
+        let back: ClientMessage = serde_json::from_str(&login).unwrap();
+        match back {
+            ClientMessage::AuthLogin {
+                request_id,
+                provider,
+            } => {
+                assert_eq!(request_id, "auth-1");
+                assert_eq!(provider, "anthropic");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_status_request_omits_an_absent_provider() {
+        let all = serde_json::to_string(&ClientMessage::AuthStatusRequest {
+            request_id: "auth-1".into(),
+            provider: None,
+        })
+        .unwrap();
+        assert_eq!(
+            all,
+            r#"{"type":"auth_status_request","request_id":"auth-1"}"#
+        );
+
+        let back: ClientMessage = serde_json::from_str(&all).unwrap();
+        match back {
+            ClientMessage::AuthStatusRequest { provider, .. } => assert_eq!(provider, None),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let one = serde_json::to_string(&ClientMessage::AuthStatusRequest {
+            request_id: "auth-1".into(),
+            provider: Some("openai-codex".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            one,
+            r#"{"type":"auth_status_request","request_id":"auth-1","provider":"openai-codex"}"#
+        );
+    }
+
+    #[test]
+    fn auth_prompt_response_serializes_a_declined_value_as_null() {
+        let declined = serde_json::to_string(&ClientMessage::AuthPromptResponse {
+            request_id: "auth-1".into(),
+            prompt_id: "prompt-1".into(),
+            value: None,
+        })
+        .unwrap();
+        assert_eq!(
+            declined,
+            r#"{"type":"auth_prompt_response","request_id":"auth-1","prompt_id":"prompt-1","value":null}"#
+        );
+
+        let answered = serde_json::to_string(&ClientMessage::AuthPromptResponse {
+            request_id: "auth-1".into(),
+            prompt_id: "prompt-1".into(),
+            value: Some("code".into()),
+        })
+        .unwrap();
+        let back: ClientMessage = serde_json::from_str(&answered).unwrap();
+        match back {
+            ClientMessage::AuthPromptResponse { value, .. } => {
+                assert_eq!(value.as_deref(), Some("code"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_events_round_trip_as_tagged_json() {
+        let url = serde_json::to_string(&ServerMessage::AuthUrl {
+            request_id: "auth-1".into(),
+            url: "https://example.test/authorize".into(),
+            instructions: None,
+        })
+        .unwrap();
+        assert_eq!(
+            url,
+            r#"{"type":"auth_url","request_id":"auth-1","url":"https://example.test/authorize"}"#
+        );
+
+        let device = serde_json::to_string(&ServerMessage::AuthDeviceCode {
+            request_id: "auth-1".into(),
+            user_code: "ABCD-1234".into(),
+            verification_uri: "https://example.test/device".into(),
+            interval_seconds: Some(5),
+            expires_in_seconds: None,
+        })
+        .unwrap();
+        let back: ServerMessage = serde_json::from_str(&device).unwrap();
+        match back {
+            ServerMessage::AuthDeviceCode {
+                user_code,
+                interval_seconds,
+                expires_in_seconds,
+                ..
+            } => {
+                assert_eq!(user_code, "ABCD-1234");
+                assert_eq!(interval_seconds, Some(5));
+                assert_eq!(expires_in_seconds, None);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let result = serde_json::to_string(&ServerMessage::AuthResult {
+            request_id: "auth-1".into(),
+            ok: true,
+            message: Some("logged in".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            result,
+            r#"{"type":"auth_result","request_id":"auth-1","ok":true,"message":"logged in"}"#
+        );
+    }
+
+    #[test]
+    fn auth_prompts_and_status_round_trip_nested_structs() {
+        let select = serde_json::to_string(&ServerMessage::AuthSelect {
+            request_id: "auth-1".into(),
+            prompt_id: "prompt-2".into(),
+            message: "How do you want to sign in?".into(),
+            options: vec![
+                AuthSelectOption {
+                    id: "browser".into(),
+                    label: "Open a browser".into(),
+                },
+                AuthSelectOption {
+                    id: "device_code".into(),
+                    label: "Enter a device code".into(),
+                },
+            ],
+        })
+        .unwrap();
+        let back: ServerMessage = serde_json::from_str(&select).unwrap();
+        match back {
+            ServerMessage::AuthSelect { options, .. } => {
+                assert_eq!(options.len(), 2);
+                assert_eq!(options[0].id, "browser");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        let prompt = serde_json::to_string(&ServerMessage::AuthPrompt {
+            request_id: "auth-1".into(),
+            prompt_id: "prompt-1".into(),
+            message: "Paste the authorization code".into(),
+            placeholder: None,
+            allow_empty: false,
+        })
+        .unwrap();
+        assert_eq!(
+            prompt,
+            r#"{"type":"auth_prompt","request_id":"auth-1","prompt_id":"prompt-1","message":"Paste the authorization code","allow_empty":false}"#
+        );
+
+        let status = serde_json::to_string(&ServerMessage::AuthStatus {
+            request_id: "auth-1".into(),
+            entries: vec![AuthStatusEntry {
+                provider: "anthropic".into(),
+                name: "Anthropic (Claude Pro/Max)".into(),
+                oauth: true,
+                configured: true,
+                source: Some("environment".into()),
+                label: Some("ANTHROPIC_API_KEY".into()),
+            }],
+        })
+        .unwrap();
+        let back: ServerMessage = serde_json::from_str(&status).unwrap();
+        match back {
+            ServerMessage::AuthStatus { entries, .. } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].source.as_deref(), Some("environment"));
             }
             other => panic!("unexpected variant: {other:?}"),
         }

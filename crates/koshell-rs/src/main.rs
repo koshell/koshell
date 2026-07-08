@@ -22,6 +22,9 @@ fn main() {
         Some(Command::Daemon { action }) => {
             std::process::exit(koshell_rs::daemon_cli::run(action));
         }
+        Some(Command::Auth { action }) => {
+            std::process::exit(koshell_rs::auth_cli::run(action));
+        }
         Some(Command::Launch(command)) => command,
         None => Vec::new(),
     };

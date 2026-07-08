@@ -631,9 +631,10 @@ impl Presentation {
             } => {
                 self.finish(request_id, Some(message), out, state, now);
             }
-            // The interactive session never sends a status_request, so a status
-            // reply is not expected here; ignore it defensively.
-            ServerMessage::Status { .. } => {}
+            // The interactive session never sends a status_request or an auth
+            // request, so their replies are not expected here; ignore them (and
+            // any future additive message types) defensively.
+            _ => {}
         }
     }
 
