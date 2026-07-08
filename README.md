@@ -7,6 +7,29 @@ shared terminal context to explain, diagnose, and assist — without turning the
 into a separate chat room or an agent-owned execution loop. When the terminal raises a
 question, you type `#?` and ask in place.
 
+## Installation
+
+Build both binaries, then install them (with the man pages) under `/usr/local`:
+
+```bash
+make                   # cargo release build + Bun-compiled daemon binary
+sudo make install      # /usr/local/bin/{koshell,koshell-ai-daemon} + man pages
+```
+
+Run `make` and `make install` as two steps: installing does not rebuild, so
+nothing runs under sudo except the file copies. For a user install without sudo:
+
+```bash
+make && make install PREFIX=$HOME/.local
+```
+
+Installing the two binaries side by side is what lets the terminal find and
+auto-start the daemon with zero configuration (the daemon binary is a
+self-contained Bun executable, so it is large — tens of MB). After installing,
+`man koshell` and `man koshell.toml` document the CLI and the config format,
+and `sudo make uninstall` removes exactly what was installed. See
+`docs/design-0012-system-install-makefile-and-man-pages.md`.
+
 ## Usage
 
 ```bash
@@ -141,6 +164,7 @@ The two communicate over newline-delimited JSON (JSONL) on a Unix domain socket.
 crates/koshell-rs      Rust foreground terminal process (binary `koshell`)
 crates/koshell-proto   Shared IPC message types
 packages/ai-daemon     Bun AI daemon
+man/                   Hand-written man pages (koshell.1, koshell.toml.5)
 docs/                  Public docs
 reference/             Frozen pre-rewrite TypeScript prototype (not built)
 ```
@@ -171,3 +195,6 @@ JS (Bun):
 bun install
 bun run check          # format check, lint, typecheck, and tests across packages
 ```
+
+`make check` runs the full validation for both runtimes with the same commands
+as CI.

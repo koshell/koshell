@@ -1,0 +1,227 @@
+.TH KOSHELL 1 "2026-07-08" "koshell 0.1.0" "Koshell Manual"
+.SH NAME
+koshell \- human-centric shared terminal: AI beside your terminal, not above it
+.SH SYNOPSIS
+.B koshell
+.RI [ options ]
+.br
+.B koshell
+.RI [ options ]
+.RB [ \-\- ]
+.I program
+.RI [ args ...]
+.br
+.B koshell shell-init
+.BR bash | zsh
+.br
+.B koshell preflight
+.br
+.B koshell daemon
+.BR status | start | stop | restart
+.SH DESCRIPTION
+.B koshell
+is a transparent PTY wrapper that keeps the human as the primary terminal
+operator while giving an AI assistant enough shared terminal context to
+explain, diagnose, and assist.
+Instead of a separate chat window, you ask questions in place: type
+.B #?
+on the command line and the answer streams inline (see
+.BR "THE #? INTERACTION" ).
+.PP
+Run without arguments,
+.B koshell
+wraps your default shell; bash and zsh additionally get shell integration
+(precise command boundaries for
+.BR #? ).
+With a leading positional argument it launches that program instead
+.RB ( "koshell python3 -i" ),
+and everything after the program name belongs to the program.
+.PP
+Answers come from a per-user AI daemon
+.RB ( koshell-ai-daemon ),
+which the terminal starts automatically on the first
+.B #?
+and which exits on its own after 10 idle minutes.
+The terminal stays fully usable as a plain shell wrapper when the daemon or
+its configuration is unavailable; the failure is reported inline where the
+answer would have appeared.
+.SH SUBCOMMANDS
+.TP
+.B shell-init \fBbash\fR|\fBzsh\fR
+Print the startup snippet that makes new interactive shells exec into
+koshell.
+Install it at the top of the shell rc file:
+.RS
+.PP
+.nf
+eval "$(koshell shell-init zsh)"    # first line of ~/.zshrc
+eval "$(koshell shell-init bash)"   # first line of ~/.bashrc
+.fi
+.RE
+.IP
+The snippet is tty-scoped: the shell koshell spawns re-sources the rc file
+and skips the exec because it is already wrapped on this terminal, while a
+shell landing on a fresh terminal (for example a new tmux pane) wraps
+itself.
+It stays inert for non-interactive shells, non-TTY stdio, and
+.BR TERM=dumb .
+To opt one shell out, start it with
+.BR KOSHELL_NO_AUTO=1 ;
+to disable auto-wrap persistently, create
+.IR ~/.config/koshell/no-auto .
+.TP
+.B preflight
+Fast, TTY-free readiness probe used by the auto-wrap snippet as
+.BR "koshell preflight && exec koshell" :
+it exits 0 only when koshell can start and a real shell is resolvable, so
+the snippet keeps the current shell instead of exec-ing into a koshell that
+would immediately fail and close the terminal.
+.TP
+.B daemon \fBstatus\fR|\fBstart\fR|\fBstop\fR|\fBrestart\fR
+Inspect or control the AI daemon.
+.B status
+reports whether it is running (pid, version, uptime, connections);
+.B start
+starts it if not already running;
+.B stop
+stops it;
+.B restart
+stops it if running, then starts it.
+The terminal auto-starts the daemon on demand, so these are for manual
+control and debugging.
+.B start
+resolves the daemon the same way auto-spawn does: the
+.B KOSHELL_DAEMON_CMD
+environment variable, then a
+.B koshell-ai-daemon
+executable next to the
+.B koshell
+binary, then one on
+.BR PATH .
+.TP
+.I program \fR[\fIargs\fR...]
+Any other leading positional launches that program in the PTY instead of
+the default shell, with
+.B #?
+armed through the output-stabilization path.
+A leading
+.B \-\-
+allows a program whose name starts with a dash.
+The names
+.BR shell-init ,
+.BR preflight ,
+and
+.B daemon
+are reserved for the subcommands above; to launch a program literally named
+that, use a path form (for example
+.BR "koshell ./daemon" ).
+.SH OPTIONS
+.TP
+.BI \-\-log-level " LEVEL"
+Log level filter
+.RB ( error ", " warn ", " info ", " debug ", " trace ", " off ;
+env_logger module filters also work).
+Overrides the
+.B KOSHELL_LOG
+environment variable.
+Logs are written to a file under the XDG state directory, never to the
+terminal.
+Only recognized before the program name; after it, the flag belongs to the
+launched program.
+.TP
+.B \-\-help
+Print help and exit.
+.TP
+.B \-\-version
+Print the version and exit.
+.SH THE #? INTERACTION
+Type
+.B #? question
+alone, or append it to a command line as
+.BR "command #? question" .
+The question fires when the line's output completes (in integrated
+bash/zsh, using precise command boundaries) or stabilizes (directly
+launched programs), and the answer streams inline in the terminal.
+The first
+.B #?
+starts the AI daemon automatically if it is not running.
+The daemon answers using the model configured in
+.IR config.toml ;
+see
+.BR koshell.toml (5).
+.SH ENVIRONMENT
+.TP
+.B KOSHELL_LOG
+Log level filter for both processes;
+.B \-\-log-level
+wins when both are set.
+.TP
+.B KOSHELL_NO_DAEMON_SPAWN
+Any non-empty value disables daemon auto-spawn.
+The terminal then degrades inline until the daemon is started manually;
+the explicit
+.B koshell daemon start
+ignores this switch.
+.TP
+.B KOSHELL_DAEMON_CMD
+Overrides the daemon launch command entirely; the value is used verbatim
+(run through
+.BR "sh -c" ).
+Useful from a source checkout with no installed daemon binary:
+.RS
+.PP
+.nf
+export KOSHELL_DAEMON_CMD="bun $PWD/packages/ai-daemon/src/index.ts"
+.fi
+.RE
+.TP
+.B KOSHELL_NO_AUTO
+Any non-empty value makes the auto-wrap snippet keep the current shell
+unwrapped.
+.TP
+.B KOSHELL_NO_EVENT_LOG
+Any non-empty value disables the local dogfooding event log.
+.TP
+.BR XDG_CONFIG_HOME ", " XDG_STATE_HOME ", " XDG_DATA_HOME ", " XDG_RUNTIME_DIR ", " XDG_CACHE_HOME
+Standard XDG base directories; see
+.B FILES
+for what koshell places where.
+.SH FILES
+.TP
+.I $XDG_CONFIG_HOME/koshell/config.toml
+AI provider and model configuration (default
+.IR ~/.config/koshell/config.toml );
+see
+.BR koshell.toml (5).
+.TP
+.I $XDG_CONFIG_HOME/koshell/no-auto
+Presence disables the auto-wrap snippet.
+.TP
+.I $XDG_STATE_HOME/koshell/koshell.log
+Terminal log (default under
+.IR ~/.local/state ;
+default level
+.BR warn ).
+.TP
+.I $XDG_STATE_HOME/koshell/daemon.log
+Log of the auto-spawned daemon (default level
+.BR info ).
+.TP
+.I $XDG_RUNTIME_DIR/koshell/daemon.sock
+Daemon socket; the directory falls back to
+.I $XDG_CACHE_HOME/koshell
+and then
+.IR ~/.cache/koshell .
+The socket doubles as the single-instance lock.
+.TP
+.I $XDG_DATA_HOME/koshell/events.jsonl
+Local dogfooding event log (append-only JSONL, metadata only); disable with
+.BR KOSHELL_NO_EVENT_LOG .
+.SH EXIT STATUS
+.B koshell
+propagates the wrapped program's exit code faithfully, including
+signal-death codes.
+.B koshell preflight
+exits 0 only when koshell is ready to start.
+.SH SEE ALSO
+.BR koshell.toml (5)

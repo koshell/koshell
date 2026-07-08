@@ -1,0 +1,195 @@
+.TH KOSHELL.TOML 5 "2026-07-08" "koshell 0.1.0" "Koshell Manual"
+.SH NAME
+koshell.toml \- koshell AI provider and model configuration
+.SH SYNOPSIS
+.I $XDG_CONFIG_HOME/koshell/config.toml
+.PP
+Default:
+.IR ~/.config/koshell/config.toml .
+This page is named after the format; the file on disk is called
+.IR config.toml .
+.SH DESCRIPTION
+The config file tells koshell which AI model answers
+.B #?
+questions, and how to reach and authenticate against its provider.
+Koshell owns this configuration namespace end to end: nothing outside this
+file (and the documented environment-variable fallback for builtin
+providers) is consulted.
+.PP
+The config selects exactly one active model.
+There is no runtime model switching; the file is read when a conversation
+is created, so editing it takes effect on the next conversation (a new
+terminal), with no reload mechanism.
+.PP
+A missing or invalid config never breaks the terminal: it keeps working as
+a plain shell wrapper, and
+.B #?
+reports what to fix inline.
+There is no silent fallback to another configuration source.
+.PP
+The schema is strict: unknown keys anywhere in the file are rejected, so
+typos fail loudly at the file boundary instead of being ignored.
+.SH KEYS
+.TP
+.B model
+Required string of the form
+.BR \(dqprovider/id\(dq .
+Split on the
+.I first
+slash, so a provider whose model ids contain slashes keeps them in the id
+(for example
+.BR \(dqopenrouter/anthropic/claude-3.5-sonnet\(dq ).
+The provider part is either a builtin provider name or the name of a
+custom
+.B [providers.NAME]
+block below.
+.TP
+.B thinking_level
+Optional reasoning effort for models that support it.
+One of
+.BR off ", " minimal ", " low ", " medium ", " high ", " xhigh .
+.SH PROVIDERS
+A
+.B [providers.NAME]
+table takes one of two shapes, distinguished by whether it defines
+.BR models .
+.SS Builtin provider authentication
+For the builtin providers
+.RB ( anthropic ", " openai ", " openrouter )
+the model catalog is built in, and the block only carries authentication
+and optional endpoint overrides:
+.TP
+.B api_key
+Credential for the provider (see
+.BR CREDENTIALS ).
+When omitted, the provider's conventional environment variable (for
+example
+.BR ANTHROPIC_API_KEY )
+is used.
+.TP
+.B base_url
+Optional endpoint override.
+.TP
+.B headers
+Optional table of extra HTTP headers.
+.PP
+.B api
+is rejected on a builtin block: the wire format of a builtin provider is
+known.
+.SS Custom provider definition
+A block with a
+.B models
+array defines a provider from scratch and requires all of:
+.TP
+.B api
+The wire protocol the provider speaks.
+One of
+.BR anthropic-messages ,
+.BR openai-completions ,
+.BR openai-responses ,
+.BR azure-openai-responses ,
+.BR openai-codex-responses ,
+.BR mistral-conversations ,
+.BR google-generative-ai ,
+.BR google-vertex ,
+.BR bedrock-converse-stream .
+.TP
+.B base_url
+The provider endpoint.
+.TP
+.B api_key
+Credential (see
+.BR CREDENTIALS ).
+.TP
+.B models
+Array of model definitions,
+.BR [[providers.NAME.models]] :
+.RS
+.TP
+.B id
+Required model identifier.
+.TP
+.B name
+Display name; defaults to
+.BR id .
+.TP
+.BR api ", " base_url
+Optional per-model overrides of the provider values.
+.TP
+.B reasoning
+Whether the model supports reasoning/thinking; default
+.BR false .
+.TP
+.B input
+Accepted input kinds, an array of
+.B \(dqtext\(dq
+and
+.BR \(dqimage\(dq ;
+default
+.BR [\(dqtext\(dq] .
+.TP
+.B context_window
+Context window in tokens; default 128000.
+.TP
+.B max_tokens
+Maximum output tokens; default 4096.
+.TP
+.B cost
+Optional table of per-million-token prices used only for usage accounting:
+.BR input ", " output ", " cache_read ", " cache_write
+(each defaults to 0).
+.RE
+.SH CREDENTIALS
+.B api_key
+values take three forms:
+.TP
+.I literal
+The key itself, for example
+.BR \(dqsk-ant-...\(dq .
+.TP
+.BI $ ENV_VAR
+Read from the named environment variable at use time.
+.TP
+.BI ! command
+Run the command and use its output, for example a keychain or secret-store
+read.
+The command runs with the user's privileges \(em the same trust model as
+the shell profile.
+.SH ERRORS
+An absent file, a TOML parse error, a schema violation, an unknown model
+reference, or missing credentials all surface as an inline
+.B #?
+error with guidance on what to fix.
+Koshell never falls back to another provider or model.
+.SH EXAMPLES
+Minimal config, key from the environment
+.RB ( ANTHROPIC_API_KEY ):
+.PP
+.nf
+model = "anthropic/claude-sonnet-4-5"
+.fi
+.PP
+Key in the config instead:
+.PP
+.nf
+model = "anthropic/claude-sonnet-4-5"
+
+[providers.anthropic]
+api_key = "sk-ant-..."
+.fi
+.PP
+A custom provider \(em also how a non-default API type is pinned:
+.PP
+.nf
+model = "mycorp/mycorp-large"
+
+[providers.mycorp]
+api = "openai-completions"
+base_url = "https://api.mycorp.example/v1"
+api_key = "$MYCORP_API_KEY"
+
+  [[providers.mycorp.models]]
+  id = "mycorp-large"
+.fi
+.SH SEE ALSO
+.BR koshell (1)
