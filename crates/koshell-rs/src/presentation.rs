@@ -234,9 +234,24 @@ fn line_prefix(state: &SessionState) -> &'static str {
     if state.at_line_start() { "" } else { "\r\n" }
 }
 
-/// Prints a dim one-line presentation notice, mirror-fed like all output.
+/// Normalizes the embedded newlines of a self-contained notice body to `\r\n` so a
+/// multi-line message (e.g. the config-error example block) does not staircase in
+/// raw mode, where a lone `\n` drops a row without returning to column 0. Distinct
+/// from `normalize_newlines`, which threads CR state across streaming deltas; a
+/// notice is emitted whole, so the CR state starts fresh each call.
+fn notice_body(text: &str) -> String {
+    let mut last_was_cr = false;
+    // normalize_newlines only inserts a `\r` (0x0D) before a `\n` (0x0A), so the
+    // result stays valid UTF-8.
+    String::from_utf8(normalize_newlines(text, &mut last_was_cr))
+        .unwrap_or_else(|_| text.to_owned())
+}
+
+/// Prints a dim presentation notice (single- or multi-line), mirror-fed like all
+/// output. Internal newlines are CR-normalized so a multi-line body wraps cleanly.
 pub(crate) fn notice<W: Write>(text: &str, out: &mut W, state: &mut SessionState) {
-    let bytes = format!("{}\x1b[2m[koshell] {text}\x1b[0m\r\n", line_prefix(state));
+    let body = notice_body(text);
+    let bytes = format!("{}\x1b[2m[koshell] {body}\x1b[0m\r\n", line_prefix(state));
     let _ = out.write_all(bytes.as_bytes());
     let _ = out.flush();
     state.record_presentation_output(bytes.as_bytes());
@@ -383,7 +398,8 @@ fn degrade_to_block(active: &mut ActiveResponse, delta: &str, reason: &'static s
 /// restored below it), falling back to a plain notice when the live region cannot
 /// be sampled.
 fn notice_above_live<W: Write>(text: &str, out: &mut W, state: &mut SessionState) {
-    let line = format!("\x1b[2m[koshell] {text}\x1b[0m\r\n");
+    let body = notice_body(text);
+    let line = format!("\x1b[2m[koshell] {body}\x1b[0m\r\n");
     if !insert_above_live(line.as_bytes(), out, state) {
         notice(text, out, state);
     }
@@ -1208,6 +1224,38 @@ mod tests {
         presentation.handle_server_message(&delta("r1", "answer"), &mut out, &mut state, now);
         let text = String::from_utf8_lossy(&out).to_string();
         assert!(!text.contains("\r\n\r\n"), "no blank lines: {text:?}");
+    }
+
+    #[test]
+    fn multi_line_notice_does_not_staircase_in_raw_mode() {
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+
+        // A body with embedded newlines, like the missing-config error block whose
+        // lone `\n`s used to drop a row without returning to column 0.
+        notice(
+            "AI error: no config, e.g.:\nmodel = \"anthropic/claude-sonnet-4-5\"\n    api_key = \"sk-ant-...\"",
+            &mut out,
+            &mut state,
+        );
+
+        // Every embedded newline is CR-normalized: no lone `\n` survives.
+        for i in 0..out.len() {
+            if out[i] == b'\n' {
+                assert!(
+                    i > 0 && out[i - 1] == b'\r',
+                    "lone \\n at {i}: {:?}",
+                    String::from_utf8_lossy(&out)
+                );
+            }
+        }
+
+        // The replayed screen shows each line flush at column 0, no rightward drift.
+        let (screen, _) = replay_screen(80, b"", &out);
+        let lines: Vec<&str> = screen.lines().collect();
+        assert_eq!(lines[0], "[koshell] AI error: no config, e.g.:");
+        assert_eq!(lines[1], "model = \"anthropic/claude-sonnet-4-5\"");
+        assert_eq!(lines[2], "    api_key = \"sk-ant-...\"");
     }
 
     #[test]
