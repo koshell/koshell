@@ -27,11 +27,14 @@ eval "$(koshell shell-init bash)"   # first line of ~/.bashrc (on macOS, make su
 ```
 
 The snippet `exec`s the just-started interactive shell into koshell; the shell koshell
-spawns re-sources your rc and skips the exec (`KOSHELL=1`), so your configuration loads
-exactly once, inside the wrap. It stays inert for non-interactive shells, non-TTY
-stdio, and `TERM=dumb`. To opt out for one shell, start it with `KOSHELL_NO_AUTO=1`; to
-disable auto-wrap without a working shell, create `~/.config/koshell/no-auto` (see
-`docs/design-0003-shell-init-auto-wrap.md`).
+spawns re-sources your rc and skips the exec because it is already wrapped on this
+terminal (`KOSHELL_TTY` matches its `$(tty)`), so your configuration loads exactly once,
+inside the wrap. The marker is tty-scoped, so a shell that lands on a fresh terminal — a
+new tmux pane — wraps itself instead, and `#?` works in every pane (see
+`docs/design-0009-tty-scoped-nesting-marker.md`). It stays inert for non-interactive
+shells, non-TTY stdio, and `TERM=dumb`. To opt out for one shell, start it with
+`KOSHELL_NO_AUTO=1`; to disable auto-wrap without a working shell, create
+`~/.config/koshell/no-auto` (see `docs/design-0003-shell-init-auto-wrap.md`).
 
 `#?` works in every form: type `#? <question>` (or `command #? <question>`) and the
 question fires when the line's output completes or stabilizes. Directly launched

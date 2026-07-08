@@ -119,10 +119,12 @@ unknown dashed options are rejected. Accepted residual: a program literally name
   "Fail-open on startup failure"). The remaining rough edge is UX, not safety: the error
   text scrolls past quickly. A "hold and show the error for N seconds" mode is still a
   possible refinement (the snippet could pass a flag once the option namespace grows).
-- **tmux topology**: tmux started outside koshell gets one koshell per pane
-  (auto-wrap in each pane shell); tmux started inside koshell inherits `KOSHELL=1`
-  and its panes stay unwrapped. Both are coherent, but the difference is undocumented
-  for users beyond this note.
+- **tmux topology**: resolved (2026-07-08). The recursion guard became tty-scoped: the
+  child shell is branded with its own controlling tty (`KOSHELL_TTY`), and a shell wraps
+  unless that brand equals its own `$(tty)`. tmux started inside koshell no longer leaves
+  its panes unwrapped — each pane runs on a fresh pts, so it re-wraps and `#?` works there,
+  matching the tmux-started-outside-koshell case. `KOSHELL=1` remains as the public marker
+  and a fallback. See `docs/design-0009-tty-scoped-nesting-marker.md`.
 - **`SHLVL` is accurate** (corrected 2026-07-05). An earlier note here claimed the
   wrapped shell's `SHLVL` was off by one; empirical PTY probing disproved it. koshell
   never touches `SHLVL`: the shell increments it on startup and decrements it before any

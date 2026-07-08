@@ -72,25 +72,27 @@ impl IpcReader {
     }
 }
 
-/// The default daemon socket path, following XDG conventions:
-/// `$XDG_RUNTIME_DIR/koshell/daemon.sock`, then `$XDG_CACHE_HOME/koshell/daemon.sock`,
-/// falling back to `~/.cache/koshell/daemon.sock`.
-pub fn default_socket_path() -> PathBuf {
+/// The per-user koshell runtime directory, following XDG conventions and deliberately
+/// avoiding a world-writable `/tmp`: `$XDG_RUNTIME_DIR/koshell`, then
+/// `$XDG_CACHE_HOME/koshell`, falling back to `~/.cache/koshell`.
+pub fn runtime_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR")
         && !dir.is_empty()
     {
-        return PathBuf::from(dir).join("koshell").join("daemon.sock");
+        return PathBuf::from(dir).join("koshell");
     }
     if let Ok(dir) = std::env::var("XDG_CACHE_HOME")
         && !dir.is_empty()
     {
-        return PathBuf::from(dir).join("koshell").join("daemon.sock");
+        return PathBuf::from(dir).join("koshell");
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home)
-        .join(".cache")
-        .join("koshell")
-        .join("daemon.sock")
+    PathBuf::from(home).join(".cache").join("koshell")
+}
+
+/// The default daemon socket path: `<runtime_dir>/daemon.sock`.
+pub fn default_socket_path() -> PathBuf {
+    runtime_dir().join("daemon.sock")
 }
 
 /// Builds a `hello` handshake for a new connection.

@@ -103,9 +103,15 @@ impl Drop for RawModeGuard {
 /// somewhere to land. Returns a process exit code: `0` ready, non-zero not.
 pub fn preflight() -> i32 {
     let env: HashMap<String, String> = std::env::vars().collect();
-    // Already inside koshell: the snippet guards this too, but never green-light a nested
-    // exec (which `run_interactive_shell` would reject anyway).
-    if shell::is_nested_koshell(&env) {
+    // Already inside a live koshell on this same terminal: the snippet guards this too, but
+    // never green-light a nested exec (which `run_interactive_shell` would reject anyway). A
+    // marker inherited across a tty boundary (a new tmux pane), or onto a recycled pts whose
+    // koshell has died, is not nested, so preflight still passes there and the pane wraps.
+    let marker_live = shell::tty_marker_is_live(
+        env.get(shell::KOSHELL_TTY_MARKER_ENV_KEY)
+            .map(String::as_str),
+    );
+    if shell::is_nested_koshell(&env, shell::controlling_tty().as_deref(), marker_live) {
         return 1;
     }
     match shell::resolve_shell(&env) {
@@ -145,7 +151,7 @@ pub fn exec_fallback_shell() {
 /// and `#?` uses the non-integrated capture path.
 pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
     let env: HashMap<String, String> = std::env::vars().collect();
-    shell::assert_not_nested_koshell(&env)?;
+    shell::assert_not_nested_koshell(&env, shell::controlling_tty().as_deref())?;
 
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         anyhow::bail!("koshell must be started from an interactive TTY.");
@@ -156,7 +162,7 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
         None => (shell::resolve_shell(&env)?, &[] as &[String]),
     };
     let pty_env = shell::create_pty_env(&env);
-    let launch = create_shell_launch_config(&shell_path, extra_args, pty_env)?;
+    let mut launch = create_shell_launch_config(&shell_path, extra_args, pty_env)?;
 
     let (cols, rows) =
         sane_size(crossterm::terminal::size().unwrap_or((DEFAULT_COLUMNS, DEFAULT_ROWS)));
@@ -168,6 +174,28 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
         pixel_width,
         pixel_height,
     })?;
+
+    // Brand the child shell with the tty it will run on, plus a PID liveness marker, so a
+    // descendant that inherits this env across a tty boundary (a new tmux pane / fresh pts)
+    // re-wraps, and a descendant on a *recycled* pts whose original koshell has died is not
+    // fooled by the stale brand. Held for the session; dropping it removes the marker file.
+    // See `shell::is_nested_koshell`.
+    let _tty_marker = pair.master.tty_name().and_then(|tty| {
+        let tty = tty.to_string_lossy().into_owned();
+        // Brand with KOSHELL_TTY only when the liveness marker is also written: without the
+        // marker a descendant cannot tell a live wrap from a stale one, and branding anyway
+        // would make even the genuine inner shell re-wrap (and could recurse). Leaving
+        // KOSHELL_TTY unset falls back to the flat KOSHELL=1 guard, which is safe.
+        let marker = shell::register_tty_marker(&tty)?;
+        launch.env.insert(
+            shell::KOSHELL_TTY_MARKER_ENV_KEY.to_string(),
+            marker.path().to_string_lossy().into_owned(),
+        );
+        launch
+            .env
+            .insert(shell::KOSHELL_TTY_ENV_KEY.to_string(), tty);
+        Some(marker)
+    });
 
     let mut cmd = CommandBuilder::new(&launch.command);
     if let Ok(cwd) = std::env::current_dir() {

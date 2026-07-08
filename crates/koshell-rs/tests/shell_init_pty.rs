@@ -2,7 +2,8 @@
 //!
 //! The snippet's whole job happens during interactive shell startup: an rc file
 //! `eval`s it and the shell `exec`s into koshell, which re-sources the same rc inside
-//! its integration shell where the `KOSHELL=1` guard must skip the `exec`. That
+//! its integration shell where the tty-scoped `KOSHELL_TTY` guard must skip the `exec`
+//! (the inner shell's `$(tty)` equals its branded `KOSHELL_TTY`). That
 //! exec-and-no-recursion loop only exists with a real TTY (the snippet checks
 //! `-t 0 && -t 1`), so these tests spawn the actual shell in a PTY with the built
 //! `koshell` binary on `PATH` and observe which shell ends up reading the terminal.
@@ -37,8 +38,23 @@ fn drive_shell_init(
     extra_env: &[(&str, &str)],
     script: &[u8],
 ) -> String {
+    drive_shell_init_with_rc_prefix(shell, rc_name, dialect, "", extra_env, script)
+}
+
+/// Like [`drive_shell_init`] but prepends `rc_prefix` to the rc before the shell-init
+/// `eval`. Used to simulate a shell that inherited `KOSHELL_TTY`/`KOSHELL_TTY_MARKER`
+/// naming its own tty (the recycled-pts case); guard such prefixes with `[[ -z "$KOSHELL" ]]`
+/// so they run only in the outer, un-wrapped shell and do not clobber koshell's fresh brand.
+fn drive_shell_init_with_rc_prefix(
+    shell: &str,
+    rc_name: &str,
+    dialect: &str,
+    rc_prefix: &str,
+    extra_env: &[(&str, &str)],
+    script: &[u8],
+) -> String {
     let home = tempfile::tempdir().expect("create temp HOME");
-    let rc = format!("eval \"$(koshell shell-init {dialect})\"\n");
+    let rc = format!("{rc_prefix}eval \"$(koshell shell-init {dialect})\"\n");
     std::fs::write(home.path().join(rc_name), rc).expect("write rc");
     // Empty XDG_RUNTIME_DIR => daemon socket absent; the wrap must work regardless.
     let runtime = tempfile::tempdir().expect("create temp XDG_RUNTIME_DIR");
@@ -162,6 +178,92 @@ fn zsh_rc_snippet_execs_into_koshell_without_recursion() {
     assert!(
         output.contains("WRAP-STATE-1"),
         "expected the probe to run inside a koshell-wrapped shell (KOSHELL=1).\n\
+         --- captured PTY output ---\n{output}"
+    );
+}
+
+/// A path that can never equal a real controlling tty, standing in for a `KOSHELL_TTY`
+/// a tmux pane inherits from the koshell that started the server — branded for a
+/// *different* pts than the pane's own.
+const FOREIGN_TTY: &str = "/dev/pts/koshell-pane-test-not-a-real-tty";
+
+#[test]
+fn foreign_koshell_tty_still_wraps_like_a_tmux_pane() {
+    // A tmux pane inherits KOSHELL_TTY naming another pts. Because it does not match the
+    // pane's own `$(tty)`, the guard must not treat the pane as already-wrapped: it wraps
+    // into its own koshell. Only KOSHELL_TTY is set (not KOSHELL), so the `${KOSHELL:-none}`
+    // probe cleanly distinguishes a real wrap (WRAP-STATE-1) from a held shell.
+    let Some(zsh) = find_shell(&ZSH_CANDIDATES) else {
+        eprintln!("skipping zsh test: no zsh interpreter found");
+        return;
+    };
+
+    let output = drive_shell_init(zsh, ".zshrc", "zsh", &[("KOSHELL_TTY", FOREIGN_TTY)], PROBE);
+    assert!(
+        output.contains("WRAP-STATE-1"),
+        "expected a foreign inherited KOSHELL_TTY to still wrap the pane shell (KOSHELL=1).\n\
+         --- captured PTY output ---\n{output}"
+    );
+}
+
+/// rc prefix that, in the outer (un-wrapped) shell only, brands KOSHELL_TTY with the
+/// shell's *own* tty and points KOSHELL_TTY_MARKER at a file holding `pid` — simulating a
+/// shell that inherited a brand for its own pts (a recycled-pts pane). The `[[ -z KOSHELL ]]`
+/// guard keeps it from clobbering koshell's fresh brand in the wrapped inner shell.
+fn self_brand_rc_prefix(pid: &str) -> String {
+    format!(
+        "if [[ -z \"${{KOSHELL-}}\" ]]; then \
+           printf '%s' {pid} > \"$HOME/ktty_marker\"; \
+           export KOSHELL_TTY_MARKER=\"$HOME/ktty_marker\"; \
+           export KOSHELL_TTY=\"$(tty)\"; \
+         fi\n"
+    )
+}
+
+#[test]
+fn stale_marker_on_matching_tty_still_wraps() {
+    // KOSHELL_TTY equals the shell's own tty, but the liveness marker names a dead pid
+    // (past pid_max) — the recycled-pts case. The guard must not treat this as wrapped.
+    let Some(zsh) = find_shell(&ZSH_CANDIDATES) else {
+        eprintln!("skipping zsh test: no zsh interpreter found");
+        return;
+    };
+
+    let output = drive_shell_init_with_rc_prefix(
+        zsh,
+        ".zshrc",
+        "zsh",
+        &self_brand_rc_prefix("2147483646"),
+        &[],
+        PROBE,
+    );
+    assert!(
+        output.contains("WRAP-STATE-1"),
+        "expected a stale (dead-pid) marker on a matching tty to still wrap.\n\
+         --- captured PTY output ---\n{output}"
+    );
+}
+
+#[test]
+fn live_marker_on_matching_tty_skips_wrap() {
+    // KOSHELL_TTY equals the shell's own tty and the marker names a live pid ($$, the
+    // shell itself) — a genuine already-wrapped tty. The guard must skip the exec.
+    let Some(zsh) = find_shell(&ZSH_CANDIDATES) else {
+        eprintln!("skipping zsh test: no zsh interpreter found");
+        return;
+    };
+
+    let output = drive_shell_init_with_rc_prefix(
+        zsh,
+        ".zshrc",
+        "zsh",
+        &self_brand_rc_prefix("$$"),
+        &[],
+        PROBE,
+    );
+    assert!(
+        output.contains("WRAP-STATE-none") && !output.contains("WRAP-STATE-1"),
+        "expected a live marker on a matching tty to skip the wrap.\n\
          --- captured PTY output ---\n{output}"
     );
 }
