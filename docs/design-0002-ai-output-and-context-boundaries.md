@@ -8,10 +8,15 @@ metadata, primary text, current screen, session facts rendered into the prompt),
 per-terminal conversation scope, and a prototype simplification of bounded-side
 buffering (`crates/koshell-rs/src/presentation.rs`): command ended → PTY output (the
 returning prompt) is held from dispatch time, the AI response streams first, and the
-held output flushes after it, bounded by a size fuse and a max-hold deadline (a hung
-daemon can never freeze the terminal), with one dim waiting notice if nothing has
-rendered shortly after dispatch; still running → the response accumulates and inserts
-as one block at response end, without quiescence-gap detection or its max-wait.
+held output flushes after it, bounded by a size fuse and a max-hold deadline, with one
+dim waiting notice if nothing has rendered shortly after dispatch; still running → the
+response accumulates and inserts as one block at response end, without quiescence-gap
+detection or its max-wait. **Design 0010 revised the two bounds** so they keep the
+answer and command output in separate labeled blocks instead of line-interleaving: the
+max-hold deadline became a stall notice that reports the held output without flushing it
+(Ctrl+C releases it), and the fuse releases the held output as one labeled block and
+resumes buffering — see the invariant note under "Presentation: buffer the bounded
+side" below.
 Still open: the pull-side tool catalog and inventory (push-only for now), the final AI
 output style (a dim `[koshell ai]` header is the placeholder), gap insertion, and the
 pushed-package size budgets. Presentation line positioning and anchored streaming for
@@ -76,6 +81,18 @@ Program output never waits on AI output while the producer is alive; preserving 
 terminal behavior is the priority. The gap-insertion primitive is also what a future
 watch capability would use to speak.
 
+**Revised by design 0010.** The command-ended path's two bounds originally gave up by
+line-interleaving: the max-hold deadline force-flushed the held output, and the fuse did
+the same when the buffer grew too large, after which answer text and command output
+blurred together. Design 0010 keeps them in separate labeled blocks: the max-hold
+deadline is now a **stall notice** that reports the held output but does not flush it
+(the user releases it with Ctrl+C), and the fuse releases the held output as **one
+labeled block** and keeps buffering, relabeling the resumed answer with a fresh
+`[koshell ai]` header. The invariant "a hung daemon can never freeze the terminal"
+(previously enforced by the force-flush) becomes "…can never freeze it _silently_": the
+stall notice always states the recovery path, and memory is bounded by the fuse's block
+release rather than by abandoning buffering.
+
 ## Context: push the anchor, pull the exploration
 
 Pulling through tools is not cheaper than pushing: tool results enter the same model
@@ -118,6 +135,8 @@ deliberate future capability, not built now.
 - Presentation buffers the bounded side: command ended → buffer the shell leftover and
   stream AI first; still running → program output flows in real time and the AI response
   is inserted block-atomically at the next quiescence gap, with a bounded max-wait.
+  (Design 0010 reshaped the command-ended bounds so releases stay block-separated, never
+  line-interleaved.)
 - Context package = anchor plus inventory (question, span tail, current screen, session
   facts, pullable-material inventory); everything deeper is pulled through tools, guided
   by deterministic static instructions.

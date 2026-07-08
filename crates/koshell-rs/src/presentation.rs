@@ -3,15 +3,20 @@
 //! written to the terminal, PTY plus presentation output, in the same order).
 //!
 //! Buffering follows design 0002's "buffer the bounded side" rule, in its prototype
-//! simplification:
+//! simplification (revised by design 0010):
 //! - **Command ended** at fire time: PTY visible output (the returning prompt) is held
 //!   back from the moment the request is dispatched, the AI response streams first,
 //!   and the held output flushes after it — so `#?` reads like a command that prints
-//!   its answer before the next prompt. Two bounds keep the hold safe: a size fuse
-//!   (a new command's output cannot grow the buffer without bound) and a max-hold
-//!   deadline (a hung daemon cannot freeze the prompt); past either, the buffer
-//!   flushes and output interleaves. If nothing has been rendered shortly after
-//!   dispatch, one dim waiting notice tells the user the answer is coming.
+//!   its answer before the next prompt. The answer and command output are kept in
+//!   separate, labeled blocks — never line-interleaved. A size fuse bounds memory:
+//!   when the held output nears the fuse, it is released as one labeled block behind a
+//!   dim boundary notice and the answer resumes under a fresh `[koshell ai]` header,
+//!   with subsequent command output buffered again. A stall deadline bounds waiting:
+//!   if the answer is still absent then, one dim notice tells the user the command
+//!   output is held and Ctrl+C releases it — the hold is not force-flushed, so the
+//!   answer and the held output never mix without the user's say-so. If nothing has
+//!   rendered shortly after dispatch, one dim waiting notice tells the user the answer
+//!   is coming.
 //! - **Command still running**: program output keeps flowing in real time; deltas
 //!   accumulate and the whole response is inserted as one block when it completes.
 //!   Quiescence-gap insertion and its max-wait are deferred to dogfooding.
@@ -34,7 +39,8 @@
 //!   program output and AI text never interleave line-by-line.
 //!
 //! The AI output style (a dim `[koshell ai]` header) is a placeholder; design 0002
-//! leaves the final prefix/style open.
+//! leaves the final prefix/style open. The block-release-and-stall-notice behavior is
+//! specified in design 0010.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -46,8 +52,10 @@ use crate::event_log::{Event, EventLog};
 use crate::mirror::LiveRegionSnapshot;
 use crate::trigger::SessionState;
 
-/// Buffered-PTY fuse: past this, buffering gives up and output interleaves, so a
-/// user launching a new command mid-response cannot grow the buffer without bound.
+/// Buffered-PTY fuse: as the held output nears this, it is released as one labeled
+/// block and the answer resumes buffering, so a user launching a new command
+/// mid-response can neither grow the buffer without bound nor line-interleave the
+/// answer with command output (design 0010).
 const PTY_BUFFER_FUSE_BYTES: usize = 256 * 1024;
 
 /// If nothing of the response has rendered this long after dispatch, print one dim
@@ -55,10 +63,12 @@ const PTY_BUFFER_FUSE_BYTES: usize = 256 * 1024;
 /// Tunable during dogfooding.
 const RECEIPT_NOTICE_DELAY: Duration = Duration::from_secs(1);
 
-/// How long stream-mode buffering may hold PTY output while waiting for the response
-/// to finish. Past this the buffer flushes and output interleaves, so a hung daemon
-/// can never freeze the terminal. Tunable during dogfooding.
-const RESPONSE_MAX_HOLD: Duration = Duration::from_secs(30);
+/// How long stream-mode buffering holds PTY output before telling the user the answer
+/// is stalled. Past this, one dim notice reports that command output is held and that
+/// Ctrl+C releases it; the hold is not force-flushed (design 0010), so the answer and
+/// the held output never mix without the user's say-so — memory is bounded instead by
+/// the fuse above. Tunable during dogfooding.
+const STALL_NOTICE_DELAY: Duration = Duration::from_secs(30);
 
 const AI_HEADER: &str = "\x1b[2m[koshell ai]\x1b[0m\r\n";
 
@@ -107,9 +117,12 @@ struct ActiveResponse {
     /// Non-anchored stream mode: PTY visible bytes held back while the response is
     /// in flight.
     buffered_pty: Vec<u8>,
-    /// Non-anchored stream mode: the fuse blew or the max hold expired; stop
-    /// buffering.
-    interleaved: bool,
+    /// Non-anchored stream mode: the stall notice (design 0010) has fired, so it
+    /// prints at most once.
+    stall_notice_shown: bool,
+    /// Non-anchored stream mode: a held block was just released mid-answer, so the
+    /// next delta reprints the `[koshell ai]` header to relabel the resumed answer.
+    resume_header_pending: bool,
     /// Anchored streaming (design 0005): the response was dispatched onto an
     /// already-rendered prompt, so deltas insert above the live input line and PTY
     /// output writes through in real time (never buffered).
@@ -139,7 +152,8 @@ impl ActiveResponse {
             last_was_cr: false,
             accumulated: String::new(),
             buffered_pty: Vec::new(),
-            interleaved: false,
+            stall_notice_shown: false,
+            resume_header_pending: false,
             anchored: false,
             ai_end: None,
             began_anchored: false,
@@ -175,9 +189,11 @@ impl ActiveResponse {
     }
 
     /// True while stream-mode buffering is holding PTY output. Anchored streaming
-    /// never buffers: the live input line stays usable in real time.
+    /// never buffers: the live input line stays usable in real time. Holding stays on
+    /// for the whole stream response — the fuse releases a block and keeps buffering
+    /// rather than giving up (design 0010).
     fn holding_pty(&self) -> bool {
-        self.mode == Mode::Stream && !self.interleaved && !self.anchored
+        self.mode == Mode::Stream && !self.anchored
     }
 }
 
@@ -224,6 +240,32 @@ pub(crate) fn notice<W: Write>(text: &str, out: &mut W, state: &mut SessionState
     let _ = out.write_all(bytes.as_bytes());
     let _ = out.flush();
     state.record_presentation_output(bytes.as_bytes());
+}
+
+/// Releases the response's held PTY output as one block behind a dim boundary notice,
+/// so the resumed command output is never mistaken for answer text (design 0010). If
+/// the block is released mid-answer, the next delta reprints the `[koshell ai]` header
+/// to relabel the answer. `reason` is the boundary line shown above the block. A no-op
+/// when nothing is held.
+fn release_held_block<W: Write>(
+    active: &mut ActiveResponse,
+    reason: &str,
+    out: &mut W,
+    state: &mut SessionState,
+    now: Instant,
+) {
+    let buffered = std::mem::take(&mut active.buffered_pty);
+    if buffered.is_empty() {
+        return;
+    }
+    notice(reason, out, state);
+    let _ = out.write_all(&buffered);
+    let _ = out.flush();
+    state.record_output(&buffered, now);
+    // If the answer had already started rendering, relabel its continuation.
+    if active.started {
+        active.resume_header_pending = true;
+    }
 }
 
 /// Appends the erase sequence for a live region: bottom-up from the cursor row to
@@ -422,8 +464,16 @@ impl Presentation {
                     let _ = out.write_all(tail);
                     state.record_presentation_output(tail);
                 }
-                notice("answer interrupted (^C)", out, state);
-                if !active.buffered_pty.is_empty() {
+                // The interrupt notice doubles as the boundary before the released
+                // command output, so the two are never confused (design 0010).
+                if active.buffered_pty.is_empty() {
+                    notice("answer interrupted (^C)", out, state);
+                } else {
+                    notice(
+                        "answer interrupted (^C); releasing held command output",
+                        out,
+                        state,
+                    );
                     let _ = out.write_all(&active.buffered_pty);
                     state.record_output(&active.buffered_pty, now);
                 }
@@ -474,8 +524,10 @@ impl Presentation {
         self.active = Some(active);
     }
 
-    /// Routes PTY visible output: buffered while a stream-mode response is in flight
-    /// (until the fuse blows or the hold expires), written through otherwise.
+    /// Routes PTY visible output: buffered while a stream-mode response is in flight,
+    /// written through otherwise. When the held output reaches the fuse it is released
+    /// as one labeled block and buffering continues (design 0010), so the answer and
+    /// command output stay in separate blocks instead of interleaving line by line.
     pub fn pty_output<W: Write>(
         &mut self,
         visible: &[u8],
@@ -487,12 +539,14 @@ impl Presentation {
             && active.holding_pty()
         {
             active.buffered_pty.extend_from_slice(visible);
-            if active.buffered_pty.len() > PTY_BUFFER_FUSE_BYTES {
-                active.interleaved = true;
-                let buffered = std::mem::take(&mut active.buffered_pty);
-                let _ = out.write_all(&buffered);
-                let _ = out.flush();
-                state.record_output(&buffered, now);
+            if active.buffered_pty.len() >= PTY_BUFFER_FUSE_BYTES {
+                release_held_block(
+                    active,
+                    "held command output hit the size limit; releasing it (the answer resumes below)",
+                    out,
+                    state,
+                    now,
+                );
             }
             return;
         }
@@ -501,23 +555,25 @@ impl Presentation {
         state.record_output(visible, now);
     }
 
-    /// Time until the next presentation deadline (waiting notice or max hold), used
-    /// to bound the processor's channel wait alongside the trigger deadlines.
+    /// Time until the next presentation deadline (waiting notice or stall notice),
+    /// used to bound the processor's channel wait alongside the trigger deadlines.
     pub fn next_deadline(&self, now: Instant) -> Option<Duration> {
         let active = self.active.as_ref()?;
         let mut next: Option<Instant> = None;
         if !active.receipt_shown && active.nothing_rendered() {
             next = Some(active.dispatched_at + RECEIPT_NOTICE_DELAY);
         }
-        if active.holding_pty() {
-            let hold = active.dispatched_at + RESPONSE_MAX_HOLD;
-            next = Some(next.map_or(hold, |n| n.min(hold)));
+        // Once the stall notice has fired the hold no longer runs on a clock — the
+        // fuse is event-driven, so a PTY message is what wakes the loop next.
+        if active.holding_pty() && !active.stall_notice_shown {
+            let stall = active.dispatched_at + STALL_NOTICE_DELAY;
+            next = Some(next.map_or(stall, |n| n.min(stall)));
         }
         next.map(|deadline| deadline.saturating_duration_since(now))
     }
 
-    /// Fires due presentation deadlines: the delayed waiting notice, and the
-    /// max-hold release of buffered PTY output.
+    /// Fires due presentation deadlines: the delayed waiting notice, and the stall
+    /// notice that reports held command output without force-flushing it.
     pub fn poll<W: Write>(&mut self, now: Instant, out: &mut W, state: &mut SessionState) {
         let Some(active) = self.active.as_mut() else {
             return;
@@ -534,20 +590,21 @@ impl Presentation {
                 notice("waiting for the AI answer…", out, state);
             }
         }
-        if active.holding_pty() && now >= active.dispatched_at + RESPONSE_MAX_HOLD {
-            active.interleaved = true;
+        // Stall notice (design 0010): the answer is late but the held output is not
+        // force-flushed — the user decides when to release it with Ctrl+C, so the
+        // answer and command output never mix on their own.
+        if active.holding_pty()
+            && !active.stall_notice_shown
+            && now >= active.dispatched_at + STALL_NOTICE_DELAY
+        {
+            active.stall_notice_shown = true;
             active.receipt_shown = true;
-            let buffered = std::mem::take(&mut active.buffered_pty);
-            notice(
-                "still waiting for the AI answer; releasing command output",
-                out,
-                state,
-            );
-            if !buffered.is_empty() {
-                let _ = out.write_all(&buffered);
-                let _ = out.flush();
-                state.record_output(&buffered, now);
-            }
+            let message = if active.buffered_pty.is_empty() {
+                "still no answer — press Ctrl+C to stop waiting for the AI"
+            } else {
+                "still no answer — press Ctrl+C to stop the AI and release the held command output"
+            };
+            notice(message, out, state);
         }
     }
 
@@ -624,8 +681,11 @@ impl Presentation {
         match active.mode {
             Mode::Stream if active.anchored => anchored_delta(active, delta, out, state),
             Mode::Stream => {
-                if !active.started {
+                // Reprint the header on the first delta, and again after a held block
+                // was released mid-answer, so the resumed answer is relabeled.
+                if !active.started || active.resume_header_pending {
                     active.started = true;
+                    active.resume_header_pending = false;
                     let header = format!("{}{AI_HEADER}", line_prefix(state));
                     let _ = out.write_all(header.as_bytes());
                     state.record_presentation_output(header.as_bytes());
@@ -872,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn pty_buffer_fuse_flushes_and_interleaves() {
+    fn pty_buffer_fuse_releases_a_block_and_keeps_buffering() {
         let mut presentation = Presentation::new();
         let mut state = state();
         let mut out: Vec<u8> = Vec::new();
@@ -881,20 +941,53 @@ mod tests {
         presentation.note_dispatch("r1", false, &state, now);
         presentation.handle_server_message(&delta("r1", "answer"), &mut out, &mut state, now);
 
-        let big = vec![b'x'; PTY_BUFFER_FUSE_BYTES + 1];
+        // The held output reaches the fuse: it is released as one labeled block.
+        let big = vec![b'x'; PTY_BUFFER_FUSE_BYTES];
         presentation.pty_output(&big, &mut out, &mut state, now);
-        assert!(out.len() > PTY_BUFFER_FUSE_BYTES, "fuse flushed the buffer");
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(text.contains("held command output hit the size limit"));
+        assert!(out.len() > PTY_BUFFER_FUSE_BYTES, "the block flushed");
 
-        // Past the fuse, PTY output writes through immediately.
+        // Buffering stays on: output after the block is held again, not written through.
+        let len_after_release = out.len();
         presentation.pty_output(b"more", &mut out, &mut state, now);
-        assert!(String::from_utf8_lossy(&out).ends_with("more"));
+        assert_eq!(
+            out.len(),
+            len_after_release,
+            "output after the released block is re-buffered, not interleaved"
+        );
 
-        // Response end must not replay already-flushed bytes.
-        let len_before = out.len();
+        // Response end flushes the re-buffered tail exactly once.
         presentation.handle_server_message(&end("r1"), &mut out, &mut state, now);
+        assert!(String::from_utf8_lossy(&out).ends_with("more"));
+    }
+
+    #[test]
+    fn fuse_flush_relabels_the_resumed_answer() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.handle_server_message(&delta("r1", "before"), &mut out, &mut state, now);
+        presentation.pty_output(
+            &vec![b'x'; PTY_BUFFER_FUSE_BYTES],
+            &mut out,
+            &mut state,
+            now,
+        );
+        // The answer resumes after the released block under a fresh header.
+        presentation.handle_server_message(&delta("r1", "after"), &mut out, &mut state, now);
+
+        let text = String::from_utf8_lossy(&out).to_string();
+        let first_header = text.find("[koshell ai]").expect("initial header");
+        let boundary = text.find("hit the size limit").expect("boundary notice");
+        let second_header = text.rfind("[koshell ai]").expect("resumed header");
+        let resumed = text.find("after").expect("resumed answer text");
         assert!(
-            out.len() - len_before <= 2,
-            "only the closing newline is written"
+            first_header < boundary && boundary < second_header && second_header < resumed,
+            "answer, boundary block, then relabeled answer appear in order"
         );
     }
 
@@ -937,7 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn max_hold_releases_buffered_output() {
+    fn max_hold_holds_and_prompts_ctrl_c() {
         let mut presentation = Presentation::new();
         let mut state = state();
         let mut out: Vec<u8> = Vec::new();
@@ -947,16 +1040,39 @@ mod tests {
         presentation.pty_output(b"$ ", &mut out, &mut state, now);
         assert!(out.is_empty());
 
-        let expired = now + RESPONSE_MAX_HOLD + Duration::from_millis(10);
-        presentation.poll(expired, &mut out, &mut state);
+        // At the stall deadline the held output is reported, not force-flushed.
+        let stalled = now + STALL_NOTICE_DELAY + Duration::from_millis(10);
+        presentation.poll(stalled, &mut out, &mut state);
         let text = String::from_utf8_lossy(&out).to_string();
-        assert!(text.contains("releasing command output"));
-        assert!(text.ends_with("$ "), "held prompt flushes on max hold");
+        assert!(
+            text.contains("press Ctrl+C"),
+            "the stall notice offers Ctrl+C: {text:?}"
+        );
+        assert!(
+            !text.contains("$ "),
+            "the held prompt is not flushed on stall: {text:?}"
+        );
+        assert!(
+            presentation.next_deadline(stalled).is_none(),
+            "the hold no longer runs on a clock after the stall notice"
+        );
 
-        // Buffering stays off for the rest of this response.
-        presentation.pty_output(b"typed", &mut out, &mut state, expired);
-        assert!(String::from_utf8_lossy(&out).ends_with("typed"));
-        assert!(presentation.next_deadline(expired).is_none());
+        // Typed-ahead output stays held too — still no interleaving.
+        presentation.pty_output(b"typed", &mut out, &mut state, stalled);
+        assert!(
+            !String::from_utf8_lossy(&out).contains("typed"),
+            "output after the stall stays buffered"
+        );
+
+        // Ctrl+C is what releases the held output, behind a boundary notice.
+        let aborted = presentation.user_interrupt(&mut out, &mut state, stalled);
+        assert_eq!(aborted.as_deref(), Some("r1"));
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(text.contains("releasing held command output"));
+        assert!(
+            text.ends_with("$ typed"),
+            "the held output flushes on interrupt: {text:?}"
+        );
     }
 
     #[test]
@@ -1042,7 +1158,7 @@ mod tests {
             &mut state,
         );
         presentation.poll(
-            now + RESPONSE_MAX_HOLD + Duration::from_millis(10),
+            now + STALL_NOTICE_DELAY + Duration::from_millis(10),
             &mut out,
             &mut state,
         );
@@ -1454,6 +1570,10 @@ mod tests {
         assert_eq!(aborted.as_deref(), Some("r1"));
         let text = String::from_utf8_lossy(&out).to_string();
         assert!(text.contains("answer interrupted (^C)"));
+        assert!(
+            text.contains("releasing held command output"),
+            "the interrupt notice labels the released output: {text:?}"
+        );
         assert!(
             text.ends_with("$ "),
             "the held prompt flushes on interrupt: {text:?}"

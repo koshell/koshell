@@ -83,8 +83,8 @@ prompt-shaped live line instead of consuming it.
 
 The shell-integrated path is untouched: there `command_end` arrives before the
 prompt prints, so the prompt is buffered and the answer streams first (design
-0002's "buffer the bounded side"), with the size fuse and max-hold bounds — those
-now apply only to that non-anchored path.
+0002's "buffer the bounded side"), with the size fuse and stall-notice bounds
+(design 0010) — those apply only to that non-anchored path.
 
 ### Styled rewrite from grid cells (added 2026-07-03 12:10 CST)
 
