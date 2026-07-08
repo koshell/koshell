@@ -102,11 +102,15 @@ minimal config names one model and lets the key come from the provider's environ
 variable:
 
 ```toml
-model = "anthropic/claude-sonnet-4-5"    # "provider/id"; builtin providers are
-                                         # anthropic, openai, openrouter
+model = "anthropic/claude-sonnet-4-5"    # "provider/id"; 30+ builtin providers
+                                         # (anthropic, openai, google, openrouter, ...)
 ```
 
-with `ANTHROPIC_API_KEY` exported — or put the key in the config instead:
+with `ANTHROPIC_API_KEY` exported. The builtin catalog is the embedded pi
+runtime's full provider catalog, so most providers need nothing beyond their
+conventional API-key environment variable (`man koshell.toml` lists the common
+ones; a misspelled provider name makes `#?` print the complete list). Or put
+the key in the config instead:
 
 ```toml
 model = "anthropic/claude-sonnet-4-5"

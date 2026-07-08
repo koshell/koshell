@@ -6,19 +6,29 @@ import { join } from "node:path";
 import { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
 
 import { ConfigError, loadConfig } from "../src/config.ts";
-import { resolveProvider } from "../src/provider.ts";
+import {
+  ENV_KEY_HINTS,
+  knownProviderIds,
+  resolveProvider,
+} from "../src/provider.ts";
 
 let dir: string;
 
-// A stable builtin anthropic model id, discovered from pi rather than hardcoded
-// so the test does not drift as pi's catalog changes across releases.
-function anyBuiltinAnthropicId(): string {
+// A stable builtin model id for a provider, discovered from pi rather than
+// hardcoded so the tests do not drift as pi's catalog changes across releases.
+function anyBuiltinId(provider: string): string {
   const registry = ModelRegistry.inMemory(AuthStorage.inMemory());
-  const model = registry.getAll().find((m) => m.provider === "anthropic");
+  const model = registry.getAll().find((m) => m.provider === provider);
   if (model === undefined) {
-    throw new Error("no builtin anthropic model available in pi");
+    throw new Error(`no builtin ${provider} model available in pi`);
   }
   return model.id;
+}
+
+// Data-driven env cleanup for the ENV_KEY_HINTS drift test.
+function unsetEnv(name: string): void {
+  // eslint-disable-next-line @typescript-eslint/no-dynamic-delete -- the var names under test are data
+  delete process.env[name];
 }
 
 function resolve(contents: string): ReturnType<typeof resolveProvider> {
@@ -77,13 +87,32 @@ describe("resolveProvider", () => {
     expect(resolve(toml).model.id).toBe("big");
   });
 
-  it("errors on an unknown model", () => {
+  it("errors on an unknown provider, listing the builtin catalog", () => {
     expect(() => resolve('model = "nope/whatever"\n')).toThrow(ConfigError);
-    expect(() => resolve('model = "nope/whatever"\n')).toThrow(/unknown model/);
+    expect(() => resolve('model = "nope/whatever"\n')).toThrow(
+      /unknown provider "nope"/,
+    );
+    // The provider list is derived from pi's catalog, not hardcoded.
+    expect(() => resolve('model = "nope/whatever"\n')).toThrow(
+      /Known providers: .*\banthropic\b.*\bgoogle\b.*\bopenrouter\b/,
+    );
+  });
+
+  it("errors on an unknown model id, listing real ids for the provider", () => {
+    const known = anyBuiltinId("anthropic");
+    const attempt = (): unknown =>
+      resolve('model = "anthropic/definitely-not-a-model"\n');
+    expect(attempt).toThrow(ConfigError);
+    expect(attempt).toThrow(
+      /unknown model "anthropic\/definitely-not-a-model"/,
+    );
+    expect(attempt).toThrow(
+      new RegExp(`Available models: .*${known}|${known}`),
+    );
   });
 
   it("resolves a builtin provider with an api_key", () => {
-    const id = anyBuiltinAnthropicId();
+    const id = anyBuiltinId("anthropic");
     const resolved = resolve(
       [
         `model = "anthropic/${id}"`,
@@ -96,11 +125,83 @@ describe("resolveProvider", () => {
     expect(resolved.model.id).toBe(id);
   });
 
+  it("resolves any pi builtin provider, not just the historical three", () => {
+    const id = anyBuiltinId("google");
+    const resolved = resolve(
+      [
+        `model = "google/${id}"`,
+        "[providers.google]",
+        'api_key = "test-google-key"',
+        "",
+      ].join("\n"),
+    );
+    expect(resolved.model.provider).toBe("google");
+    expect(resolved.model.id).toBe(id);
+  });
+
   it("errors when a builtin provider has no credentials", () => {
-    const id = anyBuiltinAnthropicId();
+    const id = anyBuiltinId("anthropic");
     delete process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_OAUTH_TOKEN;
     expect(() => resolve(`model = "anthropic/${id}"\n`)).toThrow(
       /no credentials/,
     );
+  });
+
+  it("names the provider's API key environment variable in the error", () => {
+    const id = anyBuiltinId("google");
+    delete process.env.GEMINI_API_KEY;
+    expect(() => resolve(`model = "google/${id}"\n`)).toThrow(/GEMINI_API_KEY/);
+
+    process.env.GEMINI_API_KEY = "test-google-key";
+    try {
+      expect(resolve(`model = "google/${id}"\n`).model.provider).toBe("google");
+    } finally {
+      delete process.env.GEMINI_API_KEY;
+    }
+  });
+
+  it("exposes pi's full builtin catalog", () => {
+    const registry = ModelRegistry.inMemory(AuthStorage.inMemory());
+    const providers = knownProviderIds(registry);
+    // Breadth smoke check: a pi upgrade that shrinks the catalog should fail loudly.
+    expect(providers.length).toBeGreaterThanOrEqual(30);
+    for (const expected of ["anthropic", "openai", "openrouter", "google"]) {
+      expect(providers).toContain(expected);
+    }
+  });
+
+  // ENV_KEY_HINTS mirrors pi's env-var conventions, which pi does not export.
+  // Setting each hinted variable must make pi consider the provider authenticated,
+  // so a pi upgrade that renames a variable fails here instead of drifting silently.
+  it("env hints match pi's conventions", () => {
+    const failures: string[] = [];
+    for (const [provider, envVars] of Object.entries(ENV_KEY_HINTS)) {
+      for (const envVar of envVars) {
+        const saved = new Map(
+          envVars.map((name) => [name, process.env[name]] as const),
+        );
+        try {
+          for (const name of envVars) {
+            unsetEnv(name);
+          }
+          process.env[envVar] = "test-env-hint";
+          const registry = ModelRegistry.inMemory(AuthStorage.inMemory());
+          const model = registry.getAll().find((m) => m.provider === provider);
+          if (model === undefined || !registry.hasConfiguredAuth(model)) {
+            failures.push(`${provider} via ${envVar}`);
+          }
+        } finally {
+          for (const [name, value] of saved) {
+            if (value === undefined) {
+              unsetEnv(name);
+            } else {
+              process.env[name] = value;
+            }
+          }
+        }
+      }
+    }
+    expect(failures).toEqual([]);
   });
 });

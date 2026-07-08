@@ -53,11 +53,70 @@ A
 .B [providers.NAME]
 table takes one of two shapes, distinguished by whether it defines
 .BR models .
+.SS Builtin providers
+The builtin catalog is the embedded pi agent runtime's full provider
+catalog: 30+ providers and their model lists, endpoints, wire protocols,
+and model parameters, updated with each pi release.
+A builtin provider therefore needs no
+.B [providers.NAME]
+block at all when its credential comes from the environment \(em naming a
+model is enough.
+Commonly used builtin providers and their conventional environment
+variables:
+.TP
+.B anthropic
+.BR ANTHROPIC_API_KEY ,
+or
+.B ANTHROPIC_OAUTH_TOKEN
+for a Claude Pro/Max subscription token.
+.TP
+.B openai
+.BR OPENAI_API_KEY .
+.TP
+.B google
+.BR GEMINI_API_KEY .
+.TP
+.B openrouter
+.BR OPENROUTER_API_KEY .
+.TP
+.B github-copilot
+.BR COPILOT_GITHUB_TOKEN .
+.TP
+.BR deepseek ", " groq ", " mistral ", " xai ", " moonshotai ", " zai
+.BR DEEPSEEK_API_KEY ", " GROQ_API_KEY ", " MISTRAL_API_KEY ", "
+.BR XAI_API_KEY ", " MOONSHOT_API_KEY ", " ZAI_API_KEY .
+.PP
+Two providers authenticate through ambient cloud credentials instead of an
+API key:
+.B amazon-bedrock
+uses the AWS credential chain
+.RB ( AWS_PROFILE ,
+.BR AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY ,
+.BR AWS_BEARER_TOKEN_BEDROCK ,
+or container/instance roles), and
+.B google-vertex
+uses Application Default Credentials plus
+.B GOOGLE_CLOUD_PROJECT
+and
+.B GOOGLE_CLOUD_LOCATION
+(or a
+.B GOOGLE_CLOUD_API_KEY
+key).
+.B openai-codex
+only authenticates via an OAuth login flow, which koshell does not support
+yet.
+.PP
+This page does not enumerate the full catalog: referencing an unknown
+provider name makes
+.B #?
+report the complete builtin provider list inline, and pi's own provider
+documentation
+.RI ( docs/providers.md
+in the earendil-works/pi repository) describes every provider and model.
 .SS Builtin provider authentication
-For the builtin providers
-.RB ( anthropic ", " openai ", " openrouter )
-the model catalog is built in, and the block only carries authentication
-and optional endpoint overrides:
+For a builtin provider the model catalog is built in, and the
+.B [providers.NAME]
+block only carries authentication and optional endpoint overrides:
 .TP
 .B api_key
 Credential for the provider (see

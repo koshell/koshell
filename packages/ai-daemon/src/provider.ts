@@ -104,6 +104,53 @@ function applyProvider(
   }
 }
 
+// How many model ids an unknown-model error lists before "and N more".
+const MODEL_SUGGESTION_LIMIT = 8;
+
+// The registry's model list is the source of truth for what "builtin" means:
+// every provider pi ships appears here, plus any provider the config registered.
+export function knownProviderIds(registry: ModelRegistry): string[] {
+  return [...new Set(registry.getAll().map((m) => m.provider))].sort();
+}
+
+// Env-var hints for the "no credentials" error, covering the commonly used
+// builtin providers (the same subset koshell.toml(5) documents). pi resolves
+// these variables itself but does not export the name mapping, so this copy is
+// kept honest by a test that sets each variable and asserts pi accepts it.
+export const ENV_KEY_HINTS: Record<string, readonly string[]> = {
+  anthropic: ["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"],
+  deepseek: ["DEEPSEEK_API_KEY"],
+  "github-copilot": ["COPILOT_GITHUB_TOKEN"],
+  google: ["GEMINI_API_KEY"],
+  groq: ["GROQ_API_KEY"],
+  mistral: ["MISTRAL_API_KEY"],
+  moonshotai: ["MOONSHOT_API_KEY"],
+  openai: ["OPENAI_API_KEY"],
+  openrouter: ["OPENROUTER_API_KEY"],
+  xai: ["XAI_API_KEY"],
+  zai: ["ZAI_API_KEY"],
+};
+
+// Guidance for a "no credentials" failure, per provider. Ambient-credential
+// providers (AWS/GCP) and the OAuth-only openai-codex get dedicated hints;
+// everything else points at api_key and the provider's env-var convention.
+function credentialsHint(provider: string): string {
+  if (provider === "amazon-bedrock") {
+    return "configure AWS credentials (AWS_PROFILE, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or AWS_BEARER_TOKEN_BEDROCK).";
+  }
+  if (provider === "google-vertex") {
+    return "set up Application Default Credentials (GOOGLE_APPLICATION_CREDENTIALS or `gcloud auth application-default login`) plus GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION, or export GOOGLE_CLOUD_API_KEY.";
+  }
+  if (provider === "openai-codex") {
+    return `provider "${provider}" only authenticates via OAuth login, which Koshell does not support yet.`;
+  }
+  const envKeys = ENV_KEY_HINTS[provider];
+  if (envKeys !== undefined) {
+    return `set providers.${provider}.api_key in the config, or export ${envKeys.join(" or ")}.`;
+  }
+  return `set providers.${provider}.api_key in the config, or export the provider's API key environment variable.`;
+}
+
 // Builds the in-memory auth/model objects and resolves the single active model.
 // Throws ConfigError when the model is unknown or has no configured credentials.
 export function resolveProvider(config: KoshellConfig): ResolvedProvider {
@@ -117,13 +164,25 @@ export function resolveProvider(config: KoshellConfig): ResolvedProvider {
   const { provider, id } = splitModelRef(config.model);
   const model = modelRegistry.find(provider, id);
   if (model === undefined) {
+    const providers = knownProviderIds(modelRegistry);
+    if (!providers.includes(provider)) {
+      throw new ConfigError(
+        `unknown provider "${provider}" in model "${config.model}". Known providers: ${providers.join(", ")}. A custom provider needs a [providers.${provider}] block with api, base_url, api_key, and models.`,
+      );
+    }
+    const ids = modelRegistry
+      .getAll()
+      .filter((m) => m.provider === provider)
+      .map((m) => m.id);
+    const shown = ids.slice(0, MODEL_SUGGESTION_LIMIT);
+    const rest = ids.length - shown.length;
     throw new ConfigError(
-      `unknown model "${config.model}": no builtin or configured provider "${provider}" defines model "${id}". Builtin providers are anthropic, openai, and openrouter; a custom provider needs a [providers.${provider}] block with api, base_url, and models.`,
+      `unknown model "${config.model}": provider "${provider}" has no model "${id}". Available models: ${shown.join(", ")}${rest > 0 ? `, and ${String(rest)} more` : ""}.`,
     );
   }
   if (!modelRegistry.hasConfiguredAuth(model)) {
     throw new ConfigError(
-      `no credentials for provider "${provider}": set providers.${provider}.api_key in the config, or export the provider's API key environment variable.`,
+      `no credentials for provider "${provider}": ${credentialsHint(provider)}`,
     );
   }
 

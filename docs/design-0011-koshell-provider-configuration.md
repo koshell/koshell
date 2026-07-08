@@ -45,9 +45,10 @@ model = "anthropic/claude-sonnet-4-5"
 # Optional pi thinking level: off | minimal | low | medium | high | xhigh.
 thinking_level = "high"
 
-# A builtin provider (anthropic | openai | openrouter): pi's builtin model
-# catalog for this name is used as-is. api_key is optional — omit it to fall
-# back to the provider's environment variable (e.g. ANTHROPIC_API_KEY).
+# A builtin provider (any provider in pi's builtin catalog — see design-0013):
+# pi's builtin model catalog for this name is used as-is. api_key is optional —
+# omit it to fall back to the provider's environment variable (e.g.
+# ANTHROPIC_API_KEY).
 [providers.anthropic]
 api_key = "sk-ant-..."
 
@@ -139,8 +140,9 @@ internal `architecture/target-architecture` doc; MVP inclusion is owned by
 
 - Provider setup UX (guiding a first-time user to write `config.toml`) is not
   designed; the inline error is the current affordance.
-- Additional BYOK provider APIs beyond the builtin openai/anthropic/openrouter and
-  pi's `Api` set are not curated.
+- Additional BYOK provider APIs beyond pi's builtin catalog and `Api` set are not
+  curated. (The builtin set itself was expanded from the initial three advertised
+  names to pi's full catalog by design-0013.)
 - The terminal tool loop (pull-side context) still does not exist; this design only
   covers provider/model/auth.
 
