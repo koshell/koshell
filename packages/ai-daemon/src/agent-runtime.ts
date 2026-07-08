@@ -1,12 +1,14 @@
 // pi-backed agent runtime: the only module that imports pi. One KoshellAgent wraps
 // one persistent pi AgentSession, holding the conversation for one terminal session.
 //
-// Provider, model, and auth resolution are delegated to pi's own defaults
-// (~/.pi/agent/auth.json, then provider environment variables such as
-// ANTHROPIC_API_KEY). Koshell-owned XDG/TOML provider configuration replaces this
-// in a later stage. Compaction is disabled, so a very long conversation can outgrow
-// the model context; the conversation dies with the terminal session, which bounds
-// the damage for the prototype.
+// Provider, model, and auth resolution are Koshell-owned: the config is read and
+// validated (config.ts) and adapted into pi's in-memory auth/model objects
+// (provider.ts) when the conversation is created, then the single resolved model is
+// passed to the pi session factory. pi's own defaults (~/.pi/agent, provider env
+// vars) are not consulted, except that a builtin provider without an api_key in the
+// config falls back to its provider env var. Compaction is disabled, so a very long
+// conversation can outgrow the model context; the conversation dies with the
+// terminal session, which bounds the damage for the prototype.
 import {
   createAgentSession,
   createExtensionRuntime,
@@ -15,8 +17,10 @@ import {
   type ResourceLoader,
 } from "@earendil-works/pi-coding-agent";
 
+import { loadConfig } from "./config.ts";
 import type { Logger } from "./logging.ts";
 import { SYSTEM_PROMPT } from "./prompt.ts";
+import { resolveProvider } from "./provider.ts";
 
 export interface AskOptions {
   prompt: string;
@@ -64,6 +68,13 @@ function createResourceLoader(): ResourceLoader {
 // is testable with a fake agent.
 export function createPiAgentFactory(): AgentFactory {
   return async ({ cwd, log }) => {
+    // Read the config per conversation, so "edit the config, start a new
+    // conversation" applies without a reload. A ConfigError (missing file,
+    // invalid schema, unknown model, missing key) propagates as the #? failure,
+    // which the terminal shows inline as setup guidance.
+    const { authStorage, modelRegistry, model, thinkingLevel } =
+      resolveProvider(loadConfig());
+
     const { session } = await createAgentSession({
       cwd,
       resourceLoader: createResourceLoader(),
@@ -72,12 +83,19 @@ export function createPiAgentFactory(): AgentFactory {
       settingsManager: SettingsManager.inMemory({
         compaction: { enabled: false },
       }),
+      authStorage,
+      modelRegistry,
+      model,
+      // exactOptionalPropertyTypes: only pass thinkingLevel when configured.
+      ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
     });
 
     if (session.model === undefined) {
+      // The resolved model was rejected by the session factory; treat as a setup
+      // failure rather than a crash.
       session.dispose();
       throw new Error(
-        "no AI provider configured (set a provider API key such as ANTHROPIC_API_KEY, or configure pi)",
+        `AI model "${model.provider}/${model.id}" is unavailable`,
       );
     }
     log.info(`agent session created (model: ${session.model.id})`);

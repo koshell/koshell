@@ -73,10 +73,44 @@ Auto-spawn is controlled by two environment variables: `KOSHELL_NO_DAEMON_SPAWN=
 disables it (the terminal then degrades inline until you start the daemon yourself), and
 `KOSHELL_DAEMON_CMD` overrides the launch command entirely (used verbatim).
 
-Provider, model, and auth currently resolve through pi's own defaults: an existing pi
-setup (`~/.pi/agent/auth.json`) or a provider API key in the environment (for example
-`ANTHROPIC_API_KEY`) is enough. If no provider is configured, the terminal keeps working
-and `#?` reports the degradation inline.
+Provider, model, and auth come from Koshell's own config at
+`$XDG_CONFIG_HOME/koshell/config.toml` (default `~/.config/koshell/config.toml`). The
+minimal config names one model and lets the key come from the provider's environment
+variable:
+
+```toml
+model = "anthropic/claude-sonnet-4-5"    # "provider/id"; builtin providers are
+                                         # anthropic, openai, openrouter
+```
+
+with `ANTHROPIC_API_KEY` exported — or put the key in the config instead:
+
+```toml
+model = "anthropic/claude-sonnet-4-5"
+
+[providers.anthropic]
+api_key = "sk-ant-..."       # literal, "$ENV_VAR", or "!command" (e.g. a keychain read)
+```
+
+A custom provider is a full block (`api`, `base_url`, `api_key`, and at least one
+model); this is also how you pin a non-default API type such as `openai-responses`:
+
+```toml
+model = "mycorp/mycorp-large"
+
+[providers.mycorp]
+api = "openai-completions"
+base_url = "https://api.mycorp.example/v1"
+api_key = "$MYCORP_API_KEY"
+
+  [[providers.mycorp.models]]
+  id = "mycorp-large"
+```
+
+The config selects exactly one active model — there is no runtime model switching.
+Editing it takes effect on the next conversation (a new terminal). If the config is
+missing or invalid, the terminal keeps working and `#?` reports what to fix inline.
+See `docs/design-0011-koshell-provider-configuration.md`.
 
 Both processes log at a configurable level, set by `--log-level <level>` or the
 `KOSHELL_LOG` environment variable (the argument wins). The terminal owns the screen,

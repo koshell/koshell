@@ -5,9 +5,8 @@
 // runtime choice stays a packaging decision, not an API dependency. A JSONL
 // Unix-socket daemon answers terminal `#?` requests through a persistent
 // pi-backed agent conversation per terminal session, streaming the response as
-// `ai_delta` messages. Provider/model/auth resolution is pi's default chain for
-// now; Koshell-owned provider configuration and the terminal tool loop arrive
-// in later stages.
+// `ai_delta` messages. Provider/model/auth come from Koshell's own config.toml
+// (see config.ts / provider.ts); the terminal tool loop arrives in a later stage.
 //
 // Startup is single-instance (design 0008): the socket file is the lock. Probe
 // any existing socket — a live daemon means exit and let the terminal use it; a
