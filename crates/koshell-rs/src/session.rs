@@ -639,6 +639,67 @@ fn attach_daemon(
     Some(client)
 }
 
+/// Ensures `ipc_client` holds a connection, connecting lazily and — if no daemon is
+/// reachable — auto-spawning one (design 0008) and retrying the connect within a
+/// bounded budget. A no-op when a connection is already held; it does not revalidate
+/// that connection (a stale one is only discovered when a send fails).
+fn connect_daemon(
+    ipc_client: &mut Option<IpcClient>,
+    spawner: &mut DaemonSpawner,
+    socket_path: &std::path::PathBuf,
+    meta: &SessionMeta,
+    tx: &mpsc::Sender<Msg>,
+) {
+    if ipc_client.is_some() {
+        return;
+    }
+    if let Ok(client) = IpcClient::connect(socket_path) {
+        *ipc_client = attach_daemon(client, meta, tx);
+    } else if spawner.try_spawn(Instant::now()) {
+        // The daemon is connectable in ~200ms; retry within a bounded budget.
+        // The PTY reader keeps draining into the channel, so this only delays
+        // rendering — at the moment the user is already waiting on `#?`.
+        let deadline = Instant::now() + CONNECT_RETRY_BUDGET;
+        loop {
+            thread::sleep(CONNECT_RETRY_STEP);
+            if let Ok(client) = IpcClient::connect(socket_path) {
+                *ipc_client = attach_daemon(client, meta, tx);
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+    }
+}
+
+/// Sends `request` to the daemon, connecting lazily. A held connection is not
+/// revalidated up front, so a stale one — most often the daemon having been restarted
+/// since the last send — only surfaces as a send failure. On that failure the dead
+/// connection is dropped and the send is retried once against a fresh connection, so
+/// the *first* `#?` after a `daemon restart` still lands rather than degrading and only
+/// recovering on the next one. Returns whether the request reached a daemon.
+fn send_request(
+    ipc_client: &mut Option<IpcClient>,
+    spawner: &mut DaemonSpawner,
+    socket_path: &std::path::PathBuf,
+    meta: &SessionMeta,
+    tx: &mpsc::Sender<Msg>,
+    request: &ClientMessage,
+) -> bool {
+    for _ in 0..2 {
+        connect_daemon(ipc_client, spawner, socket_path, meta, tx);
+        let Some(client) = ipc_client.as_mut() else {
+            return false;
+        };
+        match client.send(request) {
+            Ok(()) => return true,
+            Err(_) => *ipc_client = None,
+        }
+    }
+    false
+}
+
 /// Sends a `#?` request to the AI daemon (connecting lazily), and acknowledges it inline.
 /// If no daemon is reachable the terminal auto-spawns one (design 0008) and retries the
 /// connect briefly; if it still cannot reach a daemon the terminal degrades gracefully.
@@ -656,45 +717,14 @@ fn dispatch_trigger(
     trigger: &Trigger,
     event_log: &EventLog,
 ) {
-    if ipc_client.is_none() {
-        if let Ok(client) = IpcClient::connect(socket_path) {
-            *ipc_client = attach_daemon(client, meta, tx);
-        } else if spawner.try_spawn(Instant::now()) {
-            // The daemon is connectable in ~200ms; retry within a bounded budget.
-            // The PTY reader keeps draining into the channel, so this only delays
-            // rendering — at the moment the user is already waiting on `#?`.
-            let deadline = Instant::now() + CONNECT_RETRY_BUDGET;
-            loop {
-                thread::sleep(CONNECT_RETRY_STEP);
-                if let Ok(client) = IpcClient::connect(socket_path) {
-                    *ipc_client = attach_daemon(client, meta, tx);
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    break;
-                }
-            }
-        }
-    }
-
     let request_id = format!("koshell-req-{request_seq}");
-    let sent = if let Some(client) = ipc_client.as_mut() {
-        let request = ClientMessage::AiRequest {
-            request_id: request_id.clone(),
-            question: trigger.question.clone(),
-            trigger: "#?".to_string(),
-            context_package: trigger.context_package.clone(),
-        };
-        match client.send(&request) {
-            Ok(()) => true,
-            Err(_) => {
-                *ipc_client = None;
-                false
-            }
-        }
-    } else {
-        false
+    let request = ClientMessage::AiRequest {
+        request_id: request_id.clone(),
+        question: trigger.question.clone(),
+        trigger: "#?".to_string(),
+        context_package: trigger.context_package.clone(),
     };
+    let sent = send_request(ipc_client, spawner, socket_path, meta, tx, &request);
     let now = Instant::now();
     if sent {
         event_log.emit(Event::Dispatched {
@@ -743,5 +773,133 @@ fn dispatch_trigger(
             stdout,
             state,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::sync::mpsc;
+    use std::thread;
+
+    use koshell_proto::ClientMessage;
+
+    use super::{SessionMeta, connect_daemon, send_request};
+    use crate::daemon_spawn::DaemonSpawner;
+    use crate::ipc::IpcClient;
+
+    fn test_meta() -> SessionMeta {
+        SessionMeta {
+            cwd: "/tmp".to_string(),
+            shell: "/bin/zsh".to_string(),
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    fn ai_request(id: &str) -> ClientMessage {
+        ClientMessage::AiRequest {
+            request_id: id.to_string(),
+            question: "why".to_string(),
+            trigger: "#?".to_string(),
+            context_package: serde_json::json!({}),
+        }
+    }
+
+    fn read_line(stream: &UnixStream) -> String {
+        let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read line");
+        line
+    }
+
+    // The core regression for the "first `#?` after `daemon restart` always fails"
+    // bug: a held connection whose daemon has gone away must not simply degrade. The
+    // held client's send fails (AF_UNIX yields EPIPE synchronously once the peer has
+    // closed), and `send_request` must drop it and reconnect to the fresh daemon
+    // listening at the same path, delivering the request on that first attempt.
+    #[test]
+    fn send_request_reconnects_when_the_held_connection_is_dead() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("daemon.sock");
+
+        // First daemon: reads the hello, then dies (drops the connection and its
+        // socket), leaving the client stale. The channel makes the teardown ordered,
+        // so the later send hits a definitively-closed peer.
+        let l1 = UnixListener::bind(&path).expect("bind l1");
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let path_for_l1 = path.clone();
+        let t1 = thread::spawn(move || {
+            let (conn, _) = l1.accept().expect("accept l1");
+            let _ = read_line(&conn); // hello
+            drop(conn);
+            drop(l1);
+            let _ = std::fs::remove_file(&path_for_l1);
+            closed_tx.send(()).expect("signal closed");
+        });
+
+        let mut ipc_client: Option<IpcClient> = None;
+        let mut spawner = DaemonSpawner::new();
+        let meta = test_meta();
+        let (tx, _rx) = mpsc::channel();
+
+        // Establish the connection to the first daemon, then let it die.
+        connect_daemon(&mut ipc_client, &mut spawner, &path, &meta, &tx);
+        assert!(ipc_client.is_some(), "connected to the first daemon");
+        closed_rx.recv().expect("first daemon closed");
+        t1.join().expect("join t1");
+
+        // Second daemon: a fresh listener at the same path (the restart). It must
+        // receive the request that the stale first connection could not deliver.
+        let l2 = UnixListener::bind(&path).expect("bind l2");
+        let (got_tx, got_rx) = mpsc::channel();
+        let t2 = thread::spawn(move || {
+            let (conn, _) = l2.accept().expect("accept l2");
+            let hello = read_line(&conn);
+            let request = read_line(&conn);
+            got_tx.send((hello, request)).expect("forward request");
+        });
+
+        let request = ai_request("koshell-req-1");
+        let sent = send_request(&mut ipc_client, &mut spawner, &path, &meta, &tx, &request);
+        assert!(sent, "the request must be delivered on the reconnect");
+
+        let (hello, request_line) = got_rx.recv().expect("second daemon received");
+        assert!(hello.contains("\"type\":\"hello\""), "hello: {hello}");
+        assert!(
+            request_line.contains("\"type\":\"ai_request\"")
+                && request_line.contains("koshell-req-1"),
+            "request: {request_line}"
+        );
+        t2.join().expect("join t2");
+    }
+
+    // With no daemon reachable and no launch command in the environment, a send does
+    // not block or panic — it reports failure so the caller can degrade gracefully.
+    #[test]
+    fn send_request_reports_failure_when_no_daemon_is_reachable() {
+        // SAFETY: single-threaded test setup; the guard disables auto-spawn so the
+        // connect finds nothing rather than launching a real daemon.
+        unsafe { std::env::set_var("KOSHELL_NO_DAEMON_SPAWN", "1") };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("daemon.sock");
+
+        let mut ipc_client: Option<IpcClient> = None;
+        let mut spawner = DaemonSpawner::new();
+        let meta = test_meta();
+        let (tx, _rx) = mpsc::channel();
+
+        let sent = send_request(
+            &mut ipc_client,
+            &mut spawner,
+            &path,
+            &meta,
+            &tx,
+            &ai_request("koshell-req-2"),
+        );
+        assert!(!sent, "no daemon means no delivery");
+        assert!(ipc_client.is_none(), "no connection is held");
+        unsafe { std::env::remove_var("KOSHELL_NO_DAEMON_SPAWN") };
     }
 }
