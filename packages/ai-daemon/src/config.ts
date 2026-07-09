@@ -2,7 +2,7 @@
 //
 // Koshell owns its configuration namespace instead of delegating to pi's own
 // resolution (~/.pi/agent/auth.json, models.json, provider env vars). This module
-// resolves, reads, and validates `config.toml` at the file boundary; adapting the
+// resolves, reads, and validates `koshell.toml` at the file boundary; adapting the
 // validated value into pi's in-memory auth/model objects is `provider.ts`.
 //
 // The config selects exactly one active model (the single-active-model rule). The
@@ -143,21 +143,15 @@ export type KoshellConfig = z.infer<typeof ConfigSchema>;
 export type ProviderConfig = z.infer<typeof ProviderSchema>;
 export type ModelDef = z.infer<typeof ModelDefSchema>;
 
-// Resolves the config path, following XDG: $XDG_CONFIG_HOME/koshell/config.toml,
-// falling back to ~/.config/koshell/config.toml.
+// Resolves the config path, following XDG: $XDG_CONFIG_HOME/koshell/koshell.toml,
+// falling back to ~/.config/koshell/koshell.toml.
 export function resolveConfigPath(): string {
   const configHome = process.env.XDG_CONFIG_HOME;
   if (configHome !== undefined && configHome.length > 0) {
-    return join(configHome, "koshell", "config.toml");
+    return join(configHome, "koshell", "koshell.toml");
   }
-  return join(homedir(), ".config", "koshell", "config.toml");
+  return join(homedir(), ".config", "koshell", "koshell.toml");
 }
-
-const SAMPLE_CONFIG = `  # ~/.config/koshell/config.toml
-  model = "anthropic/claude-sonnet-4-5"
-
-  [providers.anthropic]
-  api_key = "sk-ant-..."   # or omit and export ANTHROPIC_API_KEY`;
 
 // Reads and validates the config. Throws ConfigError with setup guidance when the
 // file is missing, unparseable, or invalid; the daemon surfaces the message inline.
@@ -170,7 +164,7 @@ export function loadConfig(pathOverride?: string): KoshellConfig {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       throw new ConfigError(
-        `no Koshell config at ${path}. Create it to choose your AI model, e.g.:\n\n${SAMPLE_CONFIG}`,
+        `no Koshell config at ${path}. Create it to choose your AI model; run \`man koshell.toml\` to see the format and examples.`,
       );
     }
     throw new ConfigError(

@@ -13,7 +13,7 @@ import {
 let dir: string;
 
 function write(contents: string): string {
-  const path = join(dir, "config.toml");
+  const path = join(dir, "koshell.toml");
   writeFileSync(path, contents);
   return path;
 }
@@ -128,7 +128,7 @@ describe("loadConfig", () => {
 
 describe("resolveConfigPath", () => {
   it("honors XDG_CONFIG_HOME", () => {
-    expect(resolveConfigPath()).toContain(join("koshell", "config.toml"));
+    expect(resolveConfigPath()).toContain(join("koshell", "koshell.toml"));
   });
 });
 

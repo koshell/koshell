@@ -78,7 +78,7 @@ export interface AuthPromptResponseMessage {
   value: string | null;
 }
 
-// Re-read config.toml and rebuild live sessions (`koshell reload`, design 0015).
+// Re-read koshell.toml and rebuild live sessions (`koshell reload`, design 0015).
 // `session_id` targets one instance's conversation; omitted (the `--all` form)
 // resets every active session. Answered with one `reload`, routed by the
 // `session_id` in the message rather than the requester's own connection, and

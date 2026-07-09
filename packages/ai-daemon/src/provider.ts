@@ -2,7 +2,7 @@
 //
 // The model registry stays in memory and never touches pi's ~/.pi/agent files,
 // so Koshell owns credential and model resolution end to end. A stranger with
-// only a Koshell config.toml (and no pi setup) can run `#?`. Credentials come
+// only a Koshell koshell.toml (and no pi setup) can run `#?`. Credentials come
 // from Koshell's own store ($XDG_DATA_HOME/koshell/auth.json, written by
 // `koshell auth login` — design 0014) plus the config and the environment;
 // config-supplied api_key values are registered in memory and never persisted.

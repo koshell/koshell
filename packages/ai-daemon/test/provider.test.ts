@@ -37,7 +37,7 @@ function resolve(
   contents: string,
   authStorage: AuthStorage = AuthStorage.inMemory(),
 ): ReturnType<typeof resolveProvider> {
-  const path = join(dir, "config.toml");
+  const path = join(dir, "koshell.toml");
   writeFileSync(path, contents);
   return resolveProvider(loadConfig(path), authStorage);
 }

@@ -74,7 +74,7 @@ pub enum Command {
     /// koshell shell.
     Status,
 
-    /// Reload config.toml into live sessions. By default only the current
+    /// Reload koshell.toml into live sessions. By default only the current
     /// instance's conversation resets (its next `#?` uses the new config);
     /// `--all` resets every active instance. Does not start the daemon.
     Reload {

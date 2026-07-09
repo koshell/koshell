@@ -97,7 +97,7 @@ disables it (the terminal then degrades inline until you start the daemon yourse
 `KOSHELL_DAEMON_CMD` overrides the launch command entirely (used verbatim).
 
 Provider, model, and auth come from Koshell's own config at
-`$XDG_CONFIG_HOME/koshell/config.toml` (default `~/.config/koshell/config.toml`). The
+`$XDG_CONFIG_HOME/koshell/koshell.toml` (default `~/.config/koshell/koshell.toml`). The
 minimal config names one model and lets the key come from the provider's environment
 variable:
 

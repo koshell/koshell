@@ -1,4 +1,4 @@
-//! `koshell reload` — asks the running AI daemon to re-read config.toml and
+//! `koshell reload` — asks the running AI daemon to re-read koshell.toml and
 //! apply it to live terminal sessions (design 0015). A daemon-global IPC round
 //! trip on the additive `reload_request`/`reload` pair (no hello, no ack), like
 //! `daemon status`. By default it targets the current instance (via
@@ -57,10 +57,10 @@ pub fn run(all: bool) -> i32 {
                 }
             }
         }
-        // No auto-spawn: a fresh daemon reads config.toml on its first #?.
+        // No auto-spawn: a fresh daemon reads koshell.toml on its first #?.
         Probe::Stale | Probe::Absent => {
             println!("AI daemon: not running; nothing to reload");
-            println!("  a freshly started daemon reads the current config.toml.");
+            println!("  a freshly started daemon reads the current koshell.toml.");
             0
         }
     }

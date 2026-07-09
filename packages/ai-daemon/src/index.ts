@@ -5,7 +5,7 @@
 // runtime choice stays a packaging decision, not an API dependency. A JSONL
 // Unix-socket daemon answers terminal `#?` requests through a persistent
 // pi-backed agent conversation per terminal session, streaming the response as
-// `ai_delta` messages. Provider/model/auth come from Koshell's own config.toml
+// `ai_delta` messages. Provider/model/auth come from Koshell's own koshell.toml
 // (see config.ts / provider.ts); the terminal tool loop arrives in a later stage.
 //
 // Startup is single-instance (design 0008): the socket file is the lock. Probe

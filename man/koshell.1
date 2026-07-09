@@ -125,7 +125,7 @@ removes the stored credential.
 .B status
 reports, per provider, whether a usable credential was found and where it
 comes from (a stored login, an environment variable, or
-.IR config.toml );
+.IR koshell.toml );
 with a provider argument it exits 0 only when that provider is configured.
 The commands talk to the AI daemon and start it on demand like the first
 .BR #? .
@@ -143,7 +143,7 @@ shell; it identifies the instance through
 .TP
 .B reload \fR[\fB\-\-all\fR]
 Re-read
-.I config.toml
+.I koshell.toml
 and apply it to live sessions. By default only the current instance's
 conversation is reset, so its next
 .B #?
@@ -203,7 +203,7 @@ The first
 .B #?
 starts the AI daemon automatically if it is not running.
 The daemon answers using the model configured in
-.IR config.toml ;
+.IR koshell.toml ;
 see
 .BR koshell.toml (5).
 .SH ENVIRONMENT
@@ -254,9 +254,9 @@ Standard XDG base directories; see
 for what koshell places where.
 .SH FILES
 .TP
-.I $XDG_CONFIG_HOME/koshell/config.toml
+.I $XDG_CONFIG_HOME/koshell/koshell.toml
 AI provider and model configuration (default
-.IR ~/.config/koshell/config.toml );
+.IR ~/.config/koshell/koshell.toml );
 see
 .BR koshell.toml (5).
 .TP
@@ -288,7 +288,7 @@ Credential store written by
 It holds OAuth tokens only;
 .B api_key
 values from
-.I config.toml
+.I koshell.toml
 are never written here.
 .TP
 .I $XDG_DATA_HOME/koshell/events.jsonl

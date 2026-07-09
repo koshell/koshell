@@ -107,7 +107,7 @@ pub enum ClientMessage {
         prompt_id: String,
         value: Option<String>,
     },
-    /// Asks the daemon to re-read config.toml and rebuild live sessions
+    /// Asks the daemon to re-read koshell.toml and rebuild live sessions
     /// (`koshell reload`). `session_id` targets one instance's conversation;
     /// `None` (the `--all` form) resets every active session. Answered with one
     /// [`ServerMessage::Reload`] regardless of the `hello` handshake — it is

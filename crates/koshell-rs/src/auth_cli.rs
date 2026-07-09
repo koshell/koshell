@@ -329,7 +329,7 @@ fn render_status(
                 (Some("stored"), _) => "logged in".to_string(),
                 (Some("environment"), Some(label)) => format!("configured via ${label}"),
                 (Some("environment"), None) => "configured via the environment".to_string(),
-                (Some("config"), _) => "configured via config.toml".to_string(),
+                (Some("config"), _) => "configured via koshell.toml".to_string(),
                 _ => "configured".to_string(),
             }
         } else if entry.oauth {

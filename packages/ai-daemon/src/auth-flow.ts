@@ -65,7 +65,7 @@ export async function runAuthLogin(
       ok: false,
       message:
         `"${provider}" is not an OAuth provider; providers with a login flow: ${ids}. ` +
-        `API-key providers are configured via config.toml or their environment variable instead.`,
+        `API-key providers are configured via koshell.toml or their environment variable instead.`,
     };
   }
 
