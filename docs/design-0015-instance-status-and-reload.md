@@ -4,6 +4,10 @@ Date: 2026-07-09 10:36:22 CST
 
 Status: accepted, implemented.
 
+> Superseded in part by design-0017: the `KOSHELL_SESSION_ID` variable this record
+> describes is now field 0 of the consolidated `KOSHELL=<session-id>,<tty>` variable. The
+> routing behavior is unchanged.
+
 ## Why
 
 The daemon reads `config.toml` only when a conversation is created

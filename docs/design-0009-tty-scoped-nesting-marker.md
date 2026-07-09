@@ -2,6 +2,11 @@
 
 Date: 2026-07-08 10:47:12 CST
 
+> Superseded in part by design-0017: the three markers below (`KOSHELL`, `KOSHELL_TTY`,
+> `KOSHELL_TTY_MARKER`) were consolidated into a single `KOSHELL=<session-id>,<tty>`
+> variable, and the marker path is now derived by convention rather than carried in the
+> environment. The nesting _rule_ described here is unchanged.
+
 ## Why
 
 koshell was unusable inside tmux. Two independently-correct suppressions collided:

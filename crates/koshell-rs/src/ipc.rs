@@ -95,22 +95,19 @@ pub fn default_socket_path() -> PathBuf {
     runtime_dir().join("daemon.sock")
 }
 
-/// The environment variable a koshell wrapper exports so its child processes
-/// (`koshell status`/`reload`) can address the current instance by its
-/// `terminal_session_id`. Set once at wrapper startup; the value is the fixed
-/// wrapper pid, so it never goes stale for the life of the session.
-pub const SESSION_ID_ENV: &str = "KOSHELL_SESSION_ID";
-
 /// This wrapper's session id, `koshell-<pid>` — the same value sent in `hello`
-/// and exported as `KOSHELL_SESSION_ID`.
+/// and branded as field 0 of the `KOSHELL` environment variable.
 pub fn session_id() -> String {
     format!("koshell-{}", std::process::id())
 }
 
-/// The current instance's session id from the environment, or `None` when the
-/// process is not running inside a koshell wrapper.
+/// The current instance's session id, read from field 0 of the inherited `KOSHELL`
+/// variable, or `None` when the process is not running inside a koshell wrapper. Child
+/// processes (`koshell status`/`reload`) use it to address the current instance; the
+/// value is the fixed wrapper pid, so it never goes stale for the life of the session.
 pub fn current_session_id() -> Option<String> {
-    std::env::var(SESSION_ID_ENV).ok().filter(|v| !v.is_empty())
+    let value = std::env::var(crate::shell::KOSHELL_ENV_KEY).ok()?;
+    crate::shell::koshell_session_id(&value).map(str::to_string)
 }
 
 /// Builds a `hello` handshake for a new connection.

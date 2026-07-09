@@ -2,9 +2,20 @@
 //!
 //! Ports the algorithms from the frozen `reference/src/shell.ts` so behavior stays
 //! identical: `SHELL`-first resolution with a fixed fallback list, a system-only
-//! fallback `PATH`, and a tty-scoped `KOSHELL_TTY` marker (with a flat `KOSHELL`
-//! fallback) that blocks running koshell inside koshell on the same terminal while
-//! letting a shell on a fresh tty — a new tmux pane — wrap itself.
+//! fallback `PATH`, and a single tmux-style `KOSHELL` identity marker that blocks
+//! running koshell inside koshell on the same terminal while letting a shell on a
+//! fresh tty — a new tmux pane — wrap itself.
+//!
+//! `KOSHELL` follows tmux's `TMUX=<socket>,<pid>,<session>` convention: it carries the
+//! information needed to identify the current koshell environment as comma-separated
+//! fields, `<session-id>,<tty>`. Field 0 (`koshell-<pid>`) is always present — it is
+//! the routing address child `koshell status`/`reload` use, and its mere presence is
+//! the public "am I inside koshell" signal and the coarse recursion fallback. Field 1
+//! (the wrapped controlling tty) is present only when the child pts was resolved and
+//! its liveness marker written; its absence falls back to the coarse guard. The
+//! liveness marker's path is not carried in the variable — both this crate and the
+//! shell snippet derive it from the tty by the same convention (see
+//! [`tty_marker_path`]).
 
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -23,27 +34,37 @@ const FALLBACK_SHELLS: [&str; 6] = [
 /// System-only fallback `PATH`, used when the source `PATH` is empty or whitespace.
 const FALLBACK_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
-/// Public "am I inside koshell" marker, kept for user scripts and as the recursion
-/// fallback when the tty-scoped marker below is unavailable.
-const KOSHELL_ENV_KEY: &str = "KOSHELL";
-const KOSHELL_ENV_VALUE: &str = "1";
-
-/// Primary, tty-scoped recursion marker: the controlling-tty path of the shell koshell
-/// wrapped. A descendant recognizes "already wrapped" only when its own controlling tty
-/// equals this value, so a shell that inherits the marker across a tty boundary (a new
-/// tmux pane, a fresh pts) re-wraps instead of staying inert. Set in `session.rs` once
-/// the child pts is known; see [`is_nested_koshell`].
-pub const KOSHELL_TTY_ENV_KEY: &str = "KOSHELL_TTY";
-
-/// Path of the liveness marker file for [`KOSHELL_TTY_ENV_KEY`]. koshell writes its own
-/// PID there and removes it on exit; a shell (or koshell) that inherits a `KOSHELL_TTY`
-/// matching its own tty consults this to tell a *live* wrapping koshell from a *stale*
-/// brand — a tmux pane on a recycled pts whose original koshell has died. See
-/// [`tty_marker_is_live`] and [`register_tty_marker`].
-pub const KOSHELL_TTY_MARKER_ENV_KEY: &str = "KOSHELL_TTY_MARKER";
+/// The single koshell identity variable (tmux-style `<session-id>,<tty>`). Always set
+/// inside a koshell (at least field 0), so its presence is the public "am I inside
+/// koshell" signal and the coarse recursion fallback; see the module docs and
+/// [`is_nested_koshell`].
+pub const KOSHELL_ENV_KEY: &str = "KOSHELL";
 
 /// The `SHELL` environment variable key.
 const SHELL_ENV_KEY: &str = "SHELL";
+
+/// Field 0 of a `KOSHELL` value: the session id (`koshell-<pid>`), or `None` when the
+/// value is empty. Never empty inside a real koshell — the field is always branded.
+pub fn koshell_session_id(value: &str) -> Option<&str> {
+    let id = value.split(',').next().unwrap_or("");
+    (!id.is_empty()).then_some(id)
+}
+
+/// Field 1 of a `KOSHELL` value: the wrapped controlling tty, or `None` when absent or
+/// empty (the coarse-fallback form, where koshell could not brand the child pts). tty
+/// paths never contain a comma, so a plain [`str::split_once`] recovers the field.
+pub fn koshell_tty(value: &str) -> Option<&str> {
+    value
+        .split_once(',')
+        .map(|(_, tty)| tty)
+        .filter(|tty| !tty.is_empty())
+}
+
+/// Builds a `KOSHELL` value branding `session_id` with the wrapped `tty`
+/// (`<session-id>,<tty>`).
+pub fn koshell_env_value(session_id: &str, tty: &str) -> String {
+    format!("{session_id},{tty}")
+}
 
 /// Returns true when `path` is executable for the current process (`access(X_OK)`).
 fn is_executable(path: &str) -> bool {
@@ -113,11 +134,14 @@ pub fn resolve_command(command: &str, env: &HashMap<String, String>) -> anyhow::
         .ok_or_else(|| anyhow::anyhow!("Command not found: {trimmed}"))
 }
 
-/// Builds the child PTY environment: copies the source env, forces the `KOSHELL`
-/// marker, and normalizes an empty/whitespace `PATH` to [`FALLBACK_PATH`].
+/// Builds the child PTY environment: copies the source env, sets the always-present
+/// base `KOSHELL` marker (the session id — field 0), and normalizes an empty/whitespace
+/// `PATH` to [`FALLBACK_PATH`]. `session.rs` upgrades `KOSHELL` to `<session-id>,<tty>`
+/// once the child pts is known and its liveness marker written; if that branding is
+/// skipped, this base value keeps the coarse recursion guard working.
 pub fn create_pty_env(source: &HashMap<String, String>) -> HashMap<String, String> {
     let mut env = source.clone();
-    env.insert(KOSHELL_ENV_KEY.to_string(), KOSHELL_ENV_VALUE.to_string());
+    env.insert(KOSHELL_ENV_KEY.to_string(), crate::ipc::session_id());
 
     let path = match source.get("PATH") {
         Some(value) if !value.trim().is_empty() => value.clone(),
@@ -146,6 +170,23 @@ pub fn controlling_tty() -> Option<String> {
     cstr.to_str().ok().map(str::to_string)
 }
 
+/// The liveness marker file path for a wrapped `tty`, by convention rather than carried
+/// in the environment: `<runtime_dir>/tty/<tty-with-slashes-escaped>`. Both this crate
+/// and the shell auto-wrap snippet derive it identically (the snippet reconstructs
+/// [`crate::ipc::runtime_dir`]'s XDG precedence and the `/`→`_` escape inline), so the
+/// path never needs a second `KOSHELL` field. See [`register_tty_marker`].
+pub fn tty_marker_path(tty: &str) -> PathBuf {
+    crate::ipc::runtime_dir()
+        .join("tty")
+        .join(tty.replace('/', "_"))
+}
+
+/// Returns true when the liveness marker for `tty` names a process that is still alive.
+/// Convenience over [`tty_marker_is_live`] that resolves the conventional path first.
+pub fn tty_is_live(tty: &str) -> bool {
+    tty_marker_is_live(Some(&tty_marker_path(tty).to_string_lossy()))
+}
+
 /// Returns true when the liveness marker at `marker_path` names a process that is still
 /// alive (`kill(pid, 0)`). Missing path, unreadable/garbage contents, or a dead/foreign
 /// pid all read as not-live, which is the safe default (treat the brand as stale → wrap).
@@ -167,38 +208,44 @@ pub fn tty_marker_is_live(marker_path: Option<&str>) -> bool {
 
 /// Returns true when this process is a genuine same-terminal nested koshell launch.
 ///
-/// Primary rule (tty-scoped, liveness-gated): when `KOSHELL_TTY` is set, nested iff it
-/// equals this process's controlling tty **and** a live koshell still owns that tty
-/// (`marker_live`). A marker inherited across a tty boundary (a new tmux pane on a fresh
-/// pts) names a *different* tty; a marker inherited onto a *recycled* pts whose original
-/// koshell has died fails the liveness gate. Either way the shell is not nested and wraps.
+/// Primary rule (tty-scoped, liveness-gated): when `KOSHELL`'s tty field is set, nested
+/// iff it equals this process's controlling tty **and** a live koshell still owns that
+/// tty (`marker_live`). A brand inherited across a tty boundary (a new tmux pane on a
+/// fresh pts) names a *different* tty; a brand inherited onto a *recycled* pts whose
+/// original koshell has died fails the liveness gate. Either way the shell is not nested
+/// and wraps.
 ///
-/// Fallback (`KOSHELL_TTY` unset, e.g. the child pts could not be resolved): fall back to
-/// the coarse flat `KOSHELL=1` marker so recursion is still broken.
+/// Fallback (`KOSHELL`'s tty field absent, e.g. the child pts could not be resolved):
+/// fall back to the mere presence of `KOSHELL` (field 0) so recursion is still broken.
 ///
-/// `marker_live` is the result of [`tty_marker_is_live`] for the inherited
-/// [`KOSHELL_TTY_MARKER_ENV_KEY`]; it is only consulted on the tty-match branch.
+/// `marker_live` is the result of [`tty_is_live`] for the tty in `KOSHELL`; it is only
+/// consulted on the tty-match branch.
 pub fn is_nested_koshell(
     env: &HashMap<String, String>,
     current_tty: Option<&str>,
     marker_live: bool,
 ) -> bool {
-    match env.get(KOSHELL_TTY_ENV_KEY).map(String::as_str) {
-        Some(marked_tty) if !marked_tty.is_empty() => {
-            current_tty == Some(marked_tty) && marker_live
-        }
-        _ => env.get(KOSHELL_ENV_KEY).map(String::as_str) == Some(KOSHELL_ENV_VALUE),
+    match env.get(KOSHELL_ENV_KEY).map(String::as_str) {
+        Some(value) if !value.is_empty() => match koshell_tty(value) {
+            Some(marked_tty) => current_tty == Some(marked_tty) && marker_live,
+            None => true,
+        },
+        _ => false,
     }
 }
 
 /// Fails when koshell is being launched from inside a *live* koshell on the same terminal.
 /// `current_tty` is this process's controlling tty (see [`controlling_tty`]); the liveness
-/// gate is read from the inherited [`KOSHELL_TTY_MARKER_ENV_KEY`].
+/// gate is derived from the tty branded into the inherited `KOSHELL`.
 pub fn assert_not_nested_koshell(
     env: &HashMap<String, String>,
     current_tty: Option<&str>,
 ) -> anyhow::Result<()> {
-    let marker_live = tty_marker_is_live(env.get(KOSHELL_TTY_MARKER_ENV_KEY).map(String::as_str));
+    let marker_live = env
+        .get(KOSHELL_ENV_KEY)
+        .and_then(|value| koshell_tty(value))
+        .map(tty_is_live)
+        .unwrap_or(false);
     if is_nested_koshell(env, current_tty, marker_live) {
         anyhow::bail!(
             "koshell is already running in this shell. Start a new regular terminal session before launching koshell again."
@@ -214,27 +261,19 @@ pub struct TtyMarker {
     path: PathBuf,
 }
 
-impl TtyMarker {
-    /// The marker file path, to export as [`KOSHELL_TTY_MARKER_ENV_KEY`].
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
 impl Drop for TtyMarker {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
 }
 
-/// Writes the liveness marker for the wrapped `tty` (this koshell's PID) and returns a
-/// guard that removes it on drop. Best-effort: returns `None` when no runtime directory is
-/// usable or the write fails — its absence only reopens the rare recycled-pts residual, it
-/// never breaks correctness.
+/// Writes the liveness marker for the wrapped `tty` (this koshell's PID) at its
+/// conventional [`tty_marker_path`] and returns a guard that removes it on drop.
+/// Best-effort: returns `None` when no runtime directory is usable or the write fails —
+/// its absence only reopens the rare recycled-pts residual, it never breaks correctness.
 pub fn register_tty_marker(tty: &str) -> Option<TtyMarker> {
-    let dir = crate::ipc::runtime_dir().join("tty");
-    std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join(tty.replace('/', "_"));
+    let path = tty_marker_path(tty);
+    std::fs::create_dir_all(path.parent()?).ok()?;
     std::fs::write(&path, std::process::id().to_string()).ok()?;
     Some(TtyMarker { path })
 }
@@ -254,7 +293,16 @@ mod tests {
     fn create_pty_env_sets_marker_and_keeps_empty_values() {
         let source = env_of(&[("PATH", "/custom/bin"), ("EMPTY", ""), ("FOO", "bar")]);
         let env = create_pty_env(&source);
-        assert_eq!(env.get("KOSHELL").map(String::as_str), Some("1"));
+        // The base marker is the session id (field 0); no tty field yet — session.rs
+        // adds it once the child pts is known.
+        assert_eq!(
+            env.get("KOSHELL").map(String::as_str),
+            Some(crate::ipc::session_id().as_str())
+        );
+        assert!(
+            !env["KOSHELL"].contains(','),
+            "no tty field in the base value"
+        );
         assert_eq!(env.get("PATH").map(String::as_str), Some("/custom/bin"));
         assert_eq!(env.get("EMPTY").map(String::as_str), Some(""));
         assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
@@ -278,44 +326,75 @@ mod tests {
         let live = true;
         let dead = false;
 
-        // Fallback (KOSHELL_TTY absent): coarse flat KOSHELL marker; liveness ignored.
+        // Fallback (KOSHELL has no tty field): mere presence is nested; liveness ignored.
         assert!(!is_nested_koshell(&env_of(&[]), tty, dead));
         assert!(!is_nested_koshell(&env_of(&[("KOSHELL", "")]), tty, dead));
+        assert!(is_nested_koshell(
+            &env_of(&[("KOSHELL", "koshell-1")]),
+            tty,
+            dead
+        ));
+        assert!(is_nested_koshell(
+            &env_of(&[("KOSHELL", "koshell-1")]),
+            None,
+            dead
+        ));
+        // A comma-less legacy value is still a valid presence marker.
         assert!(is_nested_koshell(&env_of(&[("KOSHELL", "1")]), tty, dead));
-        assert!(is_nested_koshell(&env_of(&[("KOSHELL", "1")]), None, dead));
 
-        // Primary (KOSHELL_TTY present): tty-scoped AND liveness-gated, ignores KOSHELL.
+        // Primary (KOSHELL carries a tty field): tty-scoped AND liveness-gated.
         // Same tty + live koshell → nested (the inner shell / a subshell).
         assert!(is_nested_koshell(
-            &env_of(&[("KOSHELL_TTY", "/dev/pts/3")]),
+            &env_of(&[("KOSHELL", "koshell-1,/dev/pts/3")]),
             tty,
             live
         ));
         // Same tty but a *dead* marker (recycled pts) → not nested → wraps.
         assert!(!is_nested_koshell(
-            &env_of(&[("KOSHELL_TTY", "/dev/pts/3")]),
+            &env_of(&[("KOSHELL", "koshell-1,/dev/pts/3")]),
             tty,
             dead
         ));
-        // A tmux pane inherits both markers but runs on a different tty → not nested,
+        // A tmux pane inherits the brand but runs on a different tty → not nested,
         // regardless of liveness.
         assert!(!is_nested_koshell(
-            &env_of(&[("KOSHELL_TTY", "/dev/pts/3"), ("KOSHELL", "1")]),
+            &env_of(&[("KOSHELL", "koshell-1,/dev/pts/3")]),
             Some("/dev/pts/8"),
             live
         ));
         // No current tty can never match a branded tty.
         assert!(!is_nested_koshell(
-            &env_of(&[("KOSHELL_TTY", "/dev/pts/3")]),
+            &env_of(&[("KOSHELL", "koshell-1,/dev/pts/3")]),
             None,
             live
         ));
-        // An empty KOSHELL_TTY is treated as absent (falls back to KOSHELL).
-        assert!(!is_nested_koshell(
-            &env_of(&[("KOSHELL_TTY", "")]),
+        // An empty tty field is treated as absent (falls back to presence → nested).
+        assert!(is_nested_koshell(
+            &env_of(&[("KOSHELL", "koshell-1,")]),
             tty,
-            live
+            dead
         ));
+    }
+
+    #[test]
+    fn koshell_env_value_round_trips() {
+        let value = koshell_env_value("koshell-4821", "/dev/pts/3");
+        assert_eq!(value, "koshell-4821,/dev/pts/3");
+        assert_eq!(koshell_session_id(&value), Some("koshell-4821"));
+        assert_eq!(koshell_tty(&value), Some("/dev/pts/3"));
+        // Base (no tty) form.
+        assert_eq!(koshell_session_id("koshell-4821"), Some("koshell-4821"));
+        assert_eq!(koshell_tty("koshell-4821"), None);
+        assert_eq!(koshell_tty("koshell-4821,"), None);
+        assert_eq!(koshell_session_id(""), None);
+    }
+
+    #[test]
+    fn tty_marker_path_escapes_the_tty() {
+        assert!(
+            tty_marker_path("/dev/pts/3").ends_with("tty/_dev_pts_3"),
+            "the marker path escapes slashes so it is a single path component"
+        );
     }
 
     #[test]
@@ -342,42 +421,25 @@ mod tests {
 
     #[test]
     fn assert_not_nested_uses_liveness() {
-        // Flat fallback still trips regardless of tty.
+        // Coarse fallback (no tty field) still trips regardless of tty.
         assert!(
-            assert_not_nested_koshell(&env_of(&[("KOSHELL", "1")]), Some("/dev/pts/3")).is_err()
+            assert_not_nested_koshell(&env_of(&[("KOSHELL", "koshell-1")]), Some("/dev/pts/3"))
+                .is_err()
         );
-        // Different tty is never nested.
+        // A branded tty different from ours is never nested (short-circuits before the
+        // liveness derivation, so no marker file is needed).
         assert!(
             assert_not_nested_koshell(
-                &env_of(&[("KOSHELL_TTY", "/dev/pts/3")]),
+                &env_of(&[("KOSHELL", "koshell-1,/dev/pts/3")]),
                 Some("/dev/pts/8")
             )
             .is_ok()
         );
-
-        // Same-tty brand with a live marker trips; with a dead/missing marker it does not.
-        let dir = tempfile::tempdir().expect("temp dir");
-        let live = dir.path().join("live");
-        std::fs::write(&live, std::process::id().to_string()).expect("write live marker");
-        let live = live.to_str().unwrap().to_string();
-        assert!(
-            assert_not_nested_koshell(
-                &env_of(&[("KOSHELL_TTY", "/dev/pts/3"), ("KOSHELL_TTY_MARKER", &live)]),
-                Some("/dev/pts/3")
-            )
-            .is_err()
-        );
-        assert!(
-            assert_not_nested_koshell(
-                &env_of(&[
-                    ("KOSHELL_TTY", "/dev/pts/3"),
-                    ("KOSHELL_TTY_MARKER", "/nonexistent")
-                ]),
-                Some("/dev/pts/3")
-            )
-            .is_ok()
-        );
+        // Not inside koshell at all.
         assert!(assert_not_nested_koshell(&env_of(&[]), Some("/dev/pts/3")).is_ok());
+        // The same-tty live/dead liveness branch is covered by `nested_detection` (which
+        // takes the liveness bool directly) and by the end-to-end `shell_init_pty` tests
+        // that write a real marker at the conventional path.
     }
 
     #[test]

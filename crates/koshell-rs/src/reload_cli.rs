@@ -2,7 +2,7 @@
 //! apply it to live terminal sessions (design 0015). A daemon-global IPC round
 //! trip on the additive `reload_request`/`reload` pair (no hello, no ack), like
 //! `daemon status`. By default it targets the current instance (via
-//! `KOSHELL_SESSION_ID`); `--all` targets every active instance.
+//! field 0 of `KOSHELL`); `--all` targets every active instance.
 //!
 //! It does NOT auto-spawn the daemon: a freshly started daemon already reads the
 //! current config, so "not running" is nothing to reload.

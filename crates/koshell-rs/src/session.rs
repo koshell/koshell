@@ -107,10 +107,11 @@ pub fn preflight() -> i32 {
     // never green-light a nested exec (which `run_interactive_shell` would reject anyway). A
     // marker inherited across a tty boundary (a new tmux pane), or onto a recycled pts whose
     // koshell has died, is not nested, so preflight still passes there and the pane wraps.
-    let marker_live = shell::tty_marker_is_live(
-        env.get(shell::KOSHELL_TTY_MARKER_ENV_KEY)
-            .map(String::as_str),
-    );
+    let marker_live = env
+        .get(shell::KOSHELL_ENV_KEY)
+        .and_then(|value| shell::koshell_tty(value))
+        .map(shell::tty_is_live)
+        .unwrap_or(false);
     if shell::is_nested_koshell(&env, shell::controlling_tty().as_deref(), marker_live) {
         return 1;
     }
@@ -175,33 +176,25 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
         pixel_height,
     })?;
 
-    // Brand the child shell with the tty it will run on, plus a PID liveness marker, so a
-    // descendant that inherits this env across a tty boundary (a new tmux pane / fresh pts)
-    // re-wraps, and a descendant on a *recycled* pts whose original koshell has died is not
-    // fooled by the stale brand. Held for the session; dropping it removes the marker file.
-    // See `shell::is_nested_koshell`.
-    // Export the instance's session id (the same `koshell-<pid>` sent in hello)
-    // so child `koshell status`/`reload` can address this instance's daemon
-    // connection. Unconditional — unlike the tty brand, it does not depend on
-    // the liveness marker, since it is only an address, not a nesting guard.
-    launch
-        .env
-        .insert(ipc::SESSION_ID_ENV.to_string(), ipc::session_id());
-
+    // Upgrade the single `KOSHELL` marker (set to the bare session id by `create_pty_env`)
+    // to its full `<session-id>,<tty>` form, branding the child with the tty it will run
+    // on, plus a PID liveness marker. A descendant that inherits this env across a tty
+    // boundary (a new tmux pane / fresh pts) re-wraps, and a descendant on a *recycled* pts
+    // whose original koshell has died is not fooled by the stale brand. The tty field is
+    // added only when the liveness marker is also written: without the marker a descendant
+    // cannot tell a live wrap from a stale one, and branding anyway would make even the
+    // genuine inner shell re-wrap (and could recurse). Leaving the base value (session id
+    // only) falls back to the coarse presence guard, which is safe. Field 0 stays the
+    // session id child `koshell status`/`reload` address, present either way. The marker is
+    // held for the session; dropping it removes the marker file. See
+    // `shell::is_nested_koshell`.
     let _tty_marker = pair.master.tty_name().and_then(|tty| {
         let tty = tty.to_string_lossy().into_owned();
-        // Brand with KOSHELL_TTY only when the liveness marker is also written: without the
-        // marker a descendant cannot tell a live wrap from a stale one, and branding anyway
-        // would make even the genuine inner shell re-wrap (and could recurse). Leaving
-        // KOSHELL_TTY unset falls back to the flat KOSHELL=1 guard, which is safe.
         let marker = shell::register_tty_marker(&tty)?;
         launch.env.insert(
-            shell::KOSHELL_TTY_MARKER_ENV_KEY.to_string(),
-            marker.path().to_string_lossy().into_owned(),
+            shell::KOSHELL_ENV_KEY.to_string(),
+            shell::koshell_env_value(&ipc::session_id(), &tty),
         );
-        launch
-            .env
-            .insert(shell::KOSHELL_TTY_ENV_KEY.to_string(), tty);
         Some(marker)
     });
 

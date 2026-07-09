@@ -1,6 +1,6 @@
 //! `koshell status` — reports the current koshell instance's state (design
 //! 0015): its daemon connection, conversation, and active model, plus a daemon
-//! summary. Routed by `KOSHELL_SESSION_ID` over the additive
+//! summary. Routed by the session id in `KOSHELL` (field 0) over the additive
 //! `instance_status_request`/`instance_status` pair (no hello, no ack), so it
 //! must be run from inside a koshell shell.
 
@@ -12,14 +12,10 @@ use std::time::Duration;
 use koshell_proto::{ClientMessage, ServerMessage};
 
 use crate::daemon_cli::{self, Probe, format_uptime};
-use crate::ipc;
+use crate::{ipc, shell};
 
 /// How long to wait for the daemon's `instance_status` reply.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// The controlling tty this instance wraps, exported by the wrapper. Purely a
-/// local display detail, so it is read straight from the environment.
-const TTY_ENV: &str = "KOSHELL_TTY";
 
 /// Runs `koshell status`, returning the process exit code.
 pub fn run() -> i32 {
@@ -32,8 +28,9 @@ pub fn run() -> i32 {
 
     let socket_path = ipc::default_socket_path();
     println!("koshell instance: {session_id}");
-    if let Ok(tty) = std::env::var(TTY_ENV)
-        && !tty.is_empty()
+    // The wrapped tty is field 1 of KOSHELL; purely a local display detail.
+    if let Ok(value) = std::env::var(shell::KOSHELL_ENV_KEY)
+        && let Some(tty) = shell::koshell_tty(&value)
     {
         println!("  tty:          {tty}");
     }

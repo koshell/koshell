@@ -34,9 +34,10 @@ fn failed_startup_falls_open_to_a_bare_shell() {
 
     let mut cmd = CommandBuilder::new(koshell_bin);
     cmd.env_clear();
-    // KOSHELL=1 trips the nested-koshell guard, a deterministic failure that happens
-    // before koshell takes over the terminal — exactly the case fail-open must cover.
-    cmd.env("KOSHELL", "1");
+    // A KOSHELL with no tty field (the coarse-fallback form) trips the nested-koshell
+    // guard, a deterministic failure that happens before koshell takes over the terminal —
+    // exactly the case fail-open must cover.
+    cmd.env("KOSHELL", "koshell-1");
     cmd.env("KOSHELL_NO_DAEMON_SPAWN", "1");
     cmd.env("SHELL", "/bin/sh");
     cmd.env("XDG_RUNTIME_DIR", runtime.path());

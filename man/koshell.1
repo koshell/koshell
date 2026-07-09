@@ -139,7 +139,7 @@ Report the current koshell instance's state: its daemon connection, whether
 a conversation exists, the active model, and the working directory, plus a
 daemon summary (pid, version, uptime, connections). Run inside a koshell
 shell; it identifies the instance through
-.BR KOSHELL_SESSION_ID .
+.BR KOSHELL .
 .TP
 .B reload \fR[\fB\-\-all\fR]
 Re-read
@@ -239,14 +239,26 @@ unwrapped.
 .B KOSHELL_NO_EVENT_LOG
 Any non-empty value disables the local dogfooding event log.
 .TP
-.B KOSHELL_SESSION_ID
-Set by koshell in each wrapped shell to this instance's session id
-.RB ( koshell- \fIpid\fR ).
+.B KOSHELL
+Set by koshell in each wrapped shell to identify the current environment, in
+the tmux
+.RB ( TMUX )
+style: comma-separated fields
+.IR session-id , tty ,
+where
+.I session-id
+is
+.RB ( koshell- \fIpid\fR )
+and
+.I tty
+is the wrapped controlling terminal (present only once koshell has branded the
+child pts; absent in the coarse fallback). Its presence is the public "am I
+inside koshell" signal; koshell uses the fields to refuse a same-terminal nested
+launch and to let
 .B koshell status
 and
 .B koshell reload
-read it to address the current instance's daemon connection; it is not meant
-to be set by hand.
+address the current instance's daemon connection. Not meant to be set by hand.
 .TP
 .BR XDG_CONFIG_HOME ", " XDG_STATE_HOME ", " XDG_DATA_HOME ", " XDG_RUNTIME_DIR ", " XDG_CACHE_HOME
 Standard XDG base directories; see
@@ -279,6 +291,13 @@ Daemon socket; the directory falls back to
 and then
 .IR ~/.cache/koshell .
 The socket doubles as the single-instance lock.
+.TP
+.I $XDG_RUNTIME_DIR/koshell/tty/*
+Per-tty liveness markers (same directory fallback as the socket): each holds
+the PID of the koshell wrapping that terminal, written on startup and removed on
+exit. The nested-launch guard checks the marker for the tty named in
+.B KOSHELL
+to tell a live wrap from a stale brand on a recycled pts.
 .TP
 .I $XDG_DATA_HOME/koshell/auth.json
 Credential store written by
