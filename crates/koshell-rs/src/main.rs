@@ -25,6 +25,12 @@ fn main() {
         Some(Command::Auth { action }) => {
             std::process::exit(koshell_rs::auth_cli::run(action));
         }
+        Some(Command::Status) => {
+            std::process::exit(koshell_rs::status_cli::run());
+        }
+        Some(Command::Reload { all }) => {
+            std::process::exit(koshell_rs::reload_cli::run(all));
+        }
         Some(Command::Launch(command)) => command,
         None => Vec::new(),
     };

@@ -107,6 +107,22 @@ pub enum ClientMessage {
         prompt_id: String,
         value: Option<String>,
     },
+    /// Asks the daemon to re-read config.toml and rebuild live sessions
+    /// (`koshell reload`). `session_id` targets one instance's conversation;
+    /// `None` (the `--all` form) resets every active session. Answered with one
+    /// [`ServerMessage::Reload`] regardless of the `hello` handshake — it is
+    /// daemon-global, like status, and routed by the `session_id` in the message
+    /// rather than the requester's own connection. Additive: a daemon that does
+    /// not know this type ignores it, which the client treats as "daemon too old".
+    ReloadRequest {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+    /// Asks for one instance's live state (`koshell status`), routed by
+    /// `session_id` (the wrapper's `terminal_session_id`). Answered with one
+    /// [`ServerMessage::InstanceStatus`], again without a `hello` handshake.
+    /// Additive: a daemon that does not know this type ignores it.
+    InstanceStatusRequest { session_id: String },
 }
 
 /// One choice offered by [`ServerMessage::AuthSelect`].
@@ -216,6 +232,38 @@ pub enum ServerMessage {
     AuthStatus {
         request_id: String,
         entries: Vec<AuthStatusEntry>,
+    },
+    /// Reply to [`ClientMessage::ReloadRequest`]. `ok` is whether the new config
+    /// validated and was applied; `message` is a human summary (applied-session
+    /// count, or the validation error). Kept as a single message + bool so later
+    /// Skills/plugin reloading extends it without a rigid schema. Additive: an
+    /// older terminal's IPC reader ignores it.
+    Reload {
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    /// Reply to [`ClientMessage::InstanceStatusRequest`]. `known` is whether the
+    /// daemon has a live connection for that `session_id` (an instance that has
+    /// not issued a `#?` yet is unknown); the per-connection fields are populated
+    /// only when `known`, while the daemon-global fields are always present so
+    /// `koshell status` can report the daemon even for a not-yet-connected
+    /// instance. Additive: an older terminal's IPC reader ignores it.
+    InstanceStatus {
+        known: bool,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        shell: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        conversation: bool,
+        daemon_pid: u32,
+        uptime_ms: u64,
+        version: String,
+        protocol_version: u32,
+        connections: u32,
     },
 }
 
@@ -501,5 +549,108 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn reload_request_omits_an_absent_session() {
+        let all =
+            serde_json::to_string(&ClientMessage::ReloadRequest { session_id: None }).unwrap();
+        assert_eq!(all, r#"{"type":"reload_request"}"#);
+        let one = serde_json::to_string(&ClientMessage::ReloadRequest {
+            session_id: Some("koshell-42".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            one,
+            r#"{"type":"reload_request","session_id":"koshell-42"}"#
+        );
+        let back: ClientMessage = serde_json::from_str(&all).unwrap();
+        match back {
+            ClientMessage::ReloadRequest { session_id } => assert_eq!(session_id, None),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reload_reply_round_trips_with_optional_message() {
+        let ok = serde_json::to_string(&ServerMessage::Reload {
+            ok: true,
+            message: Some("configuration reloaded".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            ok,
+            r#"{"type":"reload","ok":true,"message":"configuration reloaded"}"#
+        );
+        let back: ServerMessage = serde_json::from_str(r#"{"type":"reload","ok":false}"#).unwrap();
+        match back {
+            ServerMessage::Reload { ok, message } => {
+                assert!(!ok);
+                assert_eq!(message, None);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn instance_status_round_trips() {
+        let request = serde_json::to_string(&ClientMessage::InstanceStatusRequest {
+            session_id: "koshell-42".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            request,
+            r#"{"type":"instance_status_request","session_id":"koshell-42"}"#
+        );
+
+        let known = ServerMessage::InstanceStatus {
+            known: true,
+            session_id: "koshell-42".into(),
+            cwd: Some("/home/u/proj".into()),
+            shell: Some("/bin/zsh".into()),
+            model: Some("anthropic/claude-sonnet-4-5".into()),
+            conversation: true,
+            daemon_pid: 1234,
+            uptime_ms: 9000,
+            version: "0.1.0".into(),
+            protocol_version: PROTOCOL_VERSION,
+            connections: 2,
+        };
+        let line = serde_json::to_string(&known).unwrap();
+        let back: ServerMessage = serde_json::from_str(&line).unwrap();
+        match back {
+            ServerMessage::InstanceStatus {
+                known,
+                model,
+                conversation,
+                connections,
+                ..
+            } => {
+                assert!(known);
+                assert_eq!(model.as_deref(), Some("anthropic/claude-sonnet-4-5"));
+                assert!(conversation);
+                assert_eq!(connections, 2);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+
+        // An unknown instance omits the per-connection fields but keeps the
+        // daemon-global ones.
+        let unknown = serde_json::to_string(&ServerMessage::InstanceStatus {
+            known: false,
+            session_id: "koshell-99".into(),
+            cwd: None,
+            shell: None,
+            model: None,
+            conversation: false,
+            daemon_pid: 1234,
+            uptime_ms: 9000,
+            version: "0.1.0".into(),
+            protocol_version: PROTOCOL_VERSION,
+            connections: 2,
+        })
+        .unwrap();
+        assert!(!unknown.contains("\"cwd\""));
+        assert!(unknown.contains("\"known\":false"));
     }
 }

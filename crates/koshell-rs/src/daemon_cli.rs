@@ -63,7 +63,7 @@ fn query_status(path: &Path) -> Option<ServerMessage> {
 }
 
 /// Renders an uptime in milliseconds as `1h 2m 3s` / `2m 3s` / `3s`.
-fn format_uptime(ms: u64) -> String {
+pub(crate) fn format_uptime(ms: u64) -> String {
     let total = ms / 1000;
     let (hours, minutes, seconds) = (total / 3600, (total % 3600) / 60, total % 60);
     if hours > 0 {

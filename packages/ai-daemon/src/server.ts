@@ -15,6 +15,7 @@ import { type KoshellConfig, loadConfig } from "./config.ts";
 import { NdjsonDecoder } from "./framing.ts";
 import type { Logger } from "./logging.ts";
 import { buildUserPrompt } from "./prompt.ts";
+import { resolveProvider } from "./provider.ts";
 import {
   type AiRequestMessage,
   type AuthLoginMessage,
@@ -34,6 +35,31 @@ export interface DaemonStatus {
   connections: number;
 }
 
+// Outcome of a `reload_request`: whether the new config validated and was
+// applied, and a human summary for the client to print (design 0015).
+export interface ReloadOutcome {
+  ok: boolean;
+  message: string;
+}
+
+// One instance's live state, for `instance_status_request`. `known` is whether
+// the daemon has a live connection for that session_id; the per-connection
+// fields are set only when known, while the daemon-global fields are always
+// present (design 0015).
+export interface InstanceStatusData {
+  known: boolean;
+  session_id: string;
+  cwd?: string;
+  shell?: string;
+  model?: string;
+  conversation: boolean;
+  daemon_pid: number;
+  uptime_ms: number;
+  version: string;
+  protocol_version: number;
+  connections: number;
+}
+
 // What one TerminalConnection needs. `status` is injected by startDaemon (which
 // owns the connection counter and the start time); its absence just makes
 // status_request a no-op, which keeps unit tests that never exercise status
@@ -47,6 +73,16 @@ export interface ConnectionOptions {
   status?: () => DaemonStatus;
   openAuthStorage?: () => AuthStorage;
   loadConfig?: () => KoshellConfig;
+  // The `koshell reload` / `koshell status` seams, injected by startDaemon
+  // which owns the session registry. `reload`/`instanceStatus` route by the
+  // session_id in the request (not this connection). `registerSession` /
+  // `unregisterSession` let a connection add itself to the registry when its
+  // hello arrives and remove itself on close. Absent seams make the handlers
+  // no-ops, keeping unit tests that never exercise them free of plumbing.
+  reload?: (sessionId?: string) => ReloadOutcome;
+  instanceStatus?: (sessionId: string) => InstanceStatusData;
+  registerSession?: (id: string, connection: TerminalConnection) => void;
+  unregisterSession?: (id: string, connection: TerminalConnection) => void;
 }
 
 // An interactive login flow can sit in pi's polling loops for as long as the
@@ -91,6 +127,12 @@ export class TerminalConnection {
   private helloRejection: string | undefined =
     "the terminal did not complete the hello handshake on this connection";
   private agent: Promise<KoshellAgent> | undefined;
+  // The resolved model id, cached synchronously once the agent resolves so
+  // `koshell status` can read it without awaiting; cleared with the agent.
+  private modelId: string | undefined;
+  // This connection's terminal_session_id, learned from hello; the key it is
+  // registered under so it can unregister itself on close.
+  private sessionId: string | undefined;
   private queue: Promise<void> = Promise.resolve();
   // Requests withdrawn by ai_cancel; consumed when run() reaches them (queued
   // requests are skipped without prompting) and cleared when the request ends,
@@ -137,6 +179,15 @@ export class TerminalConnection {
         }
         this.hello = message;
         this.helloRejection = undefined;
+        // Register under the terminal_session_id so `koshell reload`/`status`,
+        // arriving on their own throwaway connections, can route to this one.
+        if (this.sessionId !== message.terminal_session_id) {
+          if (this.sessionId !== undefined) {
+            this.options.unregisterSession?.(this.sessionId, this);
+          }
+          this.sessionId = message.terminal_session_id;
+          this.options.registerSession?.(this.sessionId, this);
+        }
         this.options.log.info(
           `hello from ${message.terminal_session_id} (${message.shell}, ${String(message.cols)}x${String(message.rows)}) cwd=${message.cwd}`,
         );
@@ -186,6 +237,26 @@ export class TerminalConnection {
         const status = this.options.status?.();
         if (status !== undefined) {
           this.send({ type: "status", ...status });
+        }
+        break;
+      }
+      case "reload_request": {
+        // Daemon-global, routed by session_id; served without a hello gate,
+        // like status_request. Absent seam => no-op (older-daemon behaviour).
+        const outcome = this.options.reload?.(message.session_id);
+        if (outcome !== undefined) {
+          const reply: ServerMessage = { type: "reload", ok: outcome.ok };
+          if (outcome.message.length > 0) {
+            reply.message = outcome.message;
+          }
+          this.send(reply);
+        }
+        break;
+      }
+      case "instance_status_request": {
+        const data = this.options.instanceStatus?.(message.session_id);
+        if (data !== undefined) {
+          this.send({ type: "instance_status", ...data });
         }
         break;
       }
@@ -390,6 +461,9 @@ export class TerminalConnection {
       return;
     }
     this.closed = true;
+    if (this.sessionId !== undefined) {
+      this.options.unregisterSession?.(this.sessionId, this);
+    }
     this.activeLogin?.controller.abort();
     void this.agent
       ?.then((agent) => {
@@ -397,6 +471,61 @@ export class TerminalConnection {
       })
       .catch(() => undefined);
     this.agent = undefined;
+    this.modelId = undefined;
+  }
+
+  // `koshell reload` seam: drop the memoized agent so the next ai_request
+  // rebuilds it from the current config, WITHOUT closing the connection. The
+  // teardown is deferred onto the FIFO queue so an in-flight request finishes
+  // on its old session first; the next request re-enters getAgent() and picks
+  // up the new config (its conversation starts fresh — history is discarded).
+  // Returns whether an agent was live, so the caller can count applied sessions.
+  resetAgent(): boolean {
+    if (this.closed) {
+      return false;
+    }
+    const had = this.agent !== undefined;
+    const reset = async (): Promise<void> => {
+      const pending = this.agent;
+      this.agent = undefined;
+      this.modelId = undefined;
+      if (pending !== undefined) {
+        try {
+          (await pending).dispose();
+        } catch {
+          // A never-built agent's creation error is already surfaced elsewhere.
+        }
+      }
+    };
+    this.queue = this.queue.then(reset, reset);
+    return had;
+  }
+
+  // Per-instance snapshot for `koshell status`. `model` is present only once
+  // the agent has been built and resolved; `conversation` is whether a live
+  // agent exists on this connection.
+  instanceSnapshot(): {
+    cwd?: string;
+    shell?: string;
+    model?: string;
+    conversation: boolean;
+  } {
+    const snapshot: {
+      cwd?: string;
+      shell?: string;
+      model?: string;
+      conversation: boolean;
+    } = { conversation: this.agent !== undefined };
+    if (this.hello?.cwd !== undefined) {
+      snapshot.cwd = this.hello.cwd;
+    }
+    if (this.hello?.shell !== undefined) {
+      snapshot.shell = this.hello.shell;
+    }
+    if (this.modelId !== undefined) {
+      snapshot.model = this.modelId;
+    }
+    return snapshot;
   }
 
   // Never rejects: exactly one of ai_response_end or ai_error per request.
@@ -450,11 +579,17 @@ export class TerminalConnection {
         cwd: this.hello?.cwd ?? process.cwd(),
         log: this.options.log,
       })
+      .then((agent) => {
+        // Cache the resolved model id so `koshell status` reads it synchronously.
+        this.modelId = agent.modelId;
+        return agent;
+      })
       .catch((error: unknown) => {
         // A failed creation must not poison the connection: clear the memoized
         // promise so the next request retries (the user may have configured a
         // provider key in the meantime).
         this.agent = undefined;
+        this.modelId = undefined;
         throw error;
       });
     return this.agent;
@@ -513,10 +648,79 @@ export function startDaemon(
     connections,
   });
 
+  // Session registry: maps each connection's terminal_session_id to its
+  // TerminalConnection so `koshell reload`/`status`, arriving on their own
+  // throwaway connections, can route to the right instance (design 0015).
+  const sessions = new Map<string, TerminalConnection>();
+
+  // `koshell reload`: validate the new config once (a faithful dry run of what
+  // createAgent does), and only if it holds, reset the target session(s) so
+  // their next #? rebuilds from it. A broken config leaves every session on its
+  // previous working config. sessionId === undefined is the `--all` form.
+  const reload = (sessionId?: string): ReloadOutcome => {
+    try {
+      resolveProvider(loadConfig());
+    } catch (error) {
+      return {
+        ok: false,
+        message: `config invalid: ${errorText(error)}; sessions keep the previous configuration`,
+      };
+    }
+    const targets =
+      sessionId === undefined
+        ? [...sessions.values()]
+        : [sessions.get(sessionId)].filter(
+            (c): c is TerminalConnection => c !== undefined,
+          );
+    let applied = 0;
+    for (const connection of targets) {
+      if (connection.resetAgent()) {
+        applied += 1;
+      }
+    }
+    const scope = sessionId === undefined ? "" : " for this instance";
+    const note =
+      applied === 0
+        ? ` no active conversation${scope} to reset; config validated`
+        : ` ${String(applied)} session(s) will use it on the next #?`;
+    return { ok: true, message: `configuration reloaded;${note}` };
+  };
+
+  // `koshell status`: one instance's live state (per-connection if the session
+  // is registered) plus the daemon-global facts (always present).
+  const instanceStatus = (sessionId: string): InstanceStatusData => {
+    const connection = sessions.get(sessionId);
+    const snapshot = connection?.instanceSnapshot();
+    return {
+      known: connection !== undefined,
+      session_id: sessionId,
+      conversation: snapshot?.conversation ?? false,
+      daemon_pid: process.pid,
+      uptime_ms: Date.now() - startedAt,
+      version: options.version,
+      protocol_version: PROTOCOL_VERSION,
+      connections,
+      ...(snapshot?.cwd !== undefined ? { cwd: snapshot.cwd } : {}),
+      ...(snapshot?.shell !== undefined ? { shell: snapshot.shell } : {}),
+      ...(snapshot?.model !== undefined ? { model: snapshot.model } : {}),
+    };
+  };
+
   const connectionOptions: ConnectionOptions = {
     createAgent: options.createAgent,
     log: options.log,
     status,
+    reload,
+    instanceStatus,
+    registerSession: (id, connection) => sessions.set(id, connection),
+    unregisterSession: (id, connection) => {
+      // Only drop the entry if it still points at the connection unregistering:
+      // a reconnect under the same id (same wrapper pid) may have replaced it,
+      // and the old connection's close must not evict the new one.
+      if (sessions.get(id) === connection) {
+        sessions.delete(id);
+      }
+    },
   };
 
   const server = net.createServer((socket) => {

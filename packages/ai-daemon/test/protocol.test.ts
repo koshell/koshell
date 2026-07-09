@@ -138,9 +138,39 @@ describe("parseClientMessage", () => {
     });
   });
 
+  it("parses reload_request with and without a session_id", () => {
+    expect(
+      parseClientMessage(JSON.stringify({ type: "reload_request" })),
+    ).toEqual({ type: "reload_request" });
+    expect(
+      parseClientMessage(
+        JSON.stringify({ type: "reload_request", session_id: "koshell-42" }),
+      ),
+    ).toEqual({ type: "reload_request", session_id: "koshell-42" });
+  });
+
+  it("parses instance_status_request", () => {
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "instance_status_request",
+          session_id: "koshell-42",
+        }),
+      ),
+    ).toEqual({ type: "instance_status_request", session_id: "koshell-42" });
+  });
+
   it("rejects malformed input", () => {
     expect(parseClientMessage("not json")).toBeNull();
     expect(parseClientMessage(JSON.stringify({ type: "unknown" }))).toBeNull();
+    expect(
+      parseClientMessage(
+        JSON.stringify({ type: "reload_request", session_id: 42 }),
+      ),
+    ).toBeNull();
+    expect(
+      parseClientMessage(JSON.stringify({ type: "instance_status_request" })),
+    ).toBeNull();
     expect(
       parseClientMessage(JSON.stringify({ type: "ai_request" })),
     ).toBeNull();
@@ -277,6 +307,34 @@ describe("serializeServerMessage", () => {
       }),
     ).toBe(
       '{"type":"auth_status","request_id":"auth-1","entries":[{"provider":"anthropic","name":"Anthropic (Claude Pro/Max)","oauth":true,"configured":true,"source":"environment","label":"ANTHROPIC_API_KEY"}]}\n',
+    );
+    expect(serializeServerMessage({ type: "reload", ok: true })).toBe(
+      '{"type":"reload","ok":true}\n',
+    );
+    expect(
+      serializeServerMessage({
+        type: "reload",
+        ok: false,
+        message: "config invalid",
+      }),
+    ).toBe('{"type":"reload","ok":false,"message":"config invalid"}\n');
+    expect(
+      serializeServerMessage({
+        type: "instance_status",
+        known: true,
+        session_id: "koshell-42",
+        cwd: "/home/u/proj",
+        shell: "/bin/zsh",
+        model: "anthropic/claude-sonnet-4-5",
+        conversation: true,
+        daemon_pid: 1234,
+        uptime_ms: 9000,
+        version: "0.1.0",
+        protocol_version: 1,
+        connections: 2,
+      }),
+    ).toBe(
+      '{"type":"instance_status","known":true,"session_id":"koshell-42","cwd":"/home/u/proj","shell":"/bin/zsh","model":"anthropic/claude-sonnet-4-5","conversation":true,"daemon_pid":1234,"uptime_ms":9000,"version":"0.1.0","protocol_version":1,"connections":2}\n',
     );
   });
 });

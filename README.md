@@ -124,6 +124,13 @@ Subscription providers sign in interactively instead: `koshell auth login anthro
 provider's OAuth flow and stores the token in `$XDG_DATA_HOME/koshell/auth.json`;
 `koshell auth status` shows what is configured and from where.
 
+The daemon reads the config when a conversation starts, so after editing it run
+`koshell reload` to apply the change to the current terminal (its next `#?` picks up
+the new config; the in-progress conversation is discarded). `koshell reload --all`
+applies it to every open koshell. An invalid config is rejected without disturbing any
+running session. `koshell status` reports the current instance: its daemon connection,
+active model, and whether a conversation is live.
+
 A custom provider is a full block (`api`, `base_url`, `api_key`, and at least one
 model); this is also how you pin a non-default API type such as `openai-responses`:
 

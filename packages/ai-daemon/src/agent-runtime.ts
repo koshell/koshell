@@ -29,6 +29,9 @@ export interface AskOptions {
 
 // One persistent conversation for one terminal session.
 export interface KoshellAgent {
+  // The resolved model id in use, e.g. "anthropic/claude-sonnet-4-5". Reported
+  // by `koshell status`; fixed for the life of this conversation.
+  readonly modelId: string;
   // Resolves when the response is complete; rejects with the provider/setup error.
   ask(options: AskOptions): Promise<void>;
   // Interrupts the in-flight ask (user Ctrl+C); a no-op when nothing is running.
@@ -129,6 +132,7 @@ export function createPiAgentFactory(): AgentFactory {
     };
 
     return {
+      modelId: `${model.provider}/${model.id}`,
       async ask(options: AskOptions): Promise<void> {
         streaming.onDelta = options.onDelta;
         delete streaming.errorMessage;

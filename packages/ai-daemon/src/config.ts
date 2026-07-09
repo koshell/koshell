@@ -7,8 +7,10 @@
 //
 // The config selects exactly one active model (the single-active-model rule). The
 // daemon reads it when a conversation is created, so switching a model is "edit the
-// config, then start a new conversation" — there is no reload mechanism and no
-// runtime `/model` switching in the MVP.
+// config, then start a new conversation". `koshell reload` (design 0015) makes that
+// explicit for live sessions — it re-reads the config and rebuilds an instance's
+// agent so its next `#?` uses the new config — but there is still no runtime
+// `/model` switching within a single conversation.
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";

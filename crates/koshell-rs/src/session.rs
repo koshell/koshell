@@ -180,6 +180,14 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
     // re-wraps, and a descendant on a *recycled* pts whose original koshell has died is not
     // fooled by the stale brand. Held for the session; dropping it removes the marker file.
     // See `shell::is_nested_koshell`.
+    // Export the instance's session id (the same `koshell-<pid>` sent in hello)
+    // so child `koshell status`/`reload` can address this instance's daemon
+    // connection. Unconditional — unlike the tty brand, it does not depend on
+    // the liveness marker, since it is only an address, not a nesting guard.
+    launch
+        .env
+        .insert(ipc::SESSION_ID_ENV.to_string(), ipc::session_id());
+
     let _tty_marker = pair.master.tty_name().and_then(|tty| {
         let tty = tty.to_string_lossy().into_owned();
         // Brand with KOSHELL_TTY only when the liveness marker is also written: without the

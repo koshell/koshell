@@ -9,9 +9,9 @@
 //! `--` allows a program whose name starts with a dash. Unknown dashed arguments before
 //! the program are rejected so the option namespace stays reserved for future flags.
 //!
-//! `shell-init`, `daemon`, `auth`, and `preflight` shadow programs literally named that;
-//! launching such a program requires a path form (for example `koshell ./shell-init` or
-//! `koshell ./daemon`). Accepted residual of reserving the names.
+//! `shell-init`, `daemon`, `auth`, `preflight`, `status`, and `reload` shadow programs
+//! literally named that; launching such a program requires a path form (for example
+//! `koshell ./shell-init` or `koshell ./daemon`). Accepted residual of reserving the names.
 
 use clap::{Parser, Subcommand};
 
@@ -67,6 +67,20 @@ pub enum Command {
     Auth {
         #[command(subcommand)]
         action: AuthAction,
+    },
+
+    /// Report the current koshell instance's state: its daemon connection,
+    /// conversation, and active model, plus a daemon summary. Run inside a
+    /// koshell shell.
+    Status,
+
+    /// Reload config.toml into live sessions. By default only the current
+    /// instance's conversation resets (its next `#?` uses the new config);
+    /// `--all` resets every active instance. Does not start the daemon.
+    Reload {
+        /// Reset every active instance, not just the current one.
+        #[arg(long)]
+        all: bool,
     },
 
     /// Program to launch instead of the default shell, with its arguments.
@@ -214,6 +228,28 @@ mod tests {
         // A path spelling still launches a real program of that name.
         let cli = parse(&["./preflight", "--check"]).unwrap();
         assert_eq!(launch(&cli), ["./preflight", "--check"]);
+    }
+
+    #[test]
+    fn status_parses_and_a_program_named_status_needs_a_path_form() {
+        assert_eq!(parse(&["status"]).unwrap().command, Some(Command::Status));
+        let cli = parse(&["./status", "--json"]).unwrap();
+        assert_eq!(launch(&cli), ["./status", "--json"]);
+    }
+
+    #[test]
+    fn reload_parses_with_and_without_all() {
+        assert_eq!(
+            parse(&["reload"]).unwrap().command,
+            Some(Command::Reload { all: false })
+        );
+        assert_eq!(
+            parse(&["reload", "--all"]).unwrap().command,
+            Some(Command::Reload { all: true })
+        );
+        // A path spelling still launches a real program of that name.
+        let cli = parse(&["./reload", "--now"]).unwrap();
+        assert_eq!(launch(&cli), ["./reload", "--now"]);
     }
 
     #[test]

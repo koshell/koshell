@@ -22,6 +22,11 @@ koshell \- human-centric shared terminal: AI beside your terminal, not above it
 .B koshell auth
 .BR login | logout | status
 .RI [ provider ]
+.br
+.B koshell status
+.br
+.B koshell reload
+.RB [ \-\-all ]
 .SH DESCRIPTION
 .B koshell
 is a transparent PTY wrapper that keeps the human as the primary terminal
@@ -129,6 +134,25 @@ API-key providers do not need
 see
 .BR koshell.toml (5).
 .TP
+.B status
+Report the current koshell instance's state: its daemon connection, whether
+a conversation exists, the active model, and the working directory, plus a
+daemon summary (pid, version, uptime, connections). Run inside a koshell
+shell; it identifies the instance through
+.BR KOSHELL_SESSION_ID .
+.TP
+.B reload \fR[\fB\-\-all\fR]
+Re-read
+.I config.toml
+and apply it to live sessions. By default only the current instance's
+conversation is reset, so its next
+.B #?
+uses the new config (the in-progress conversation is discarded);
+.B \-\-all
+resets every active instance. The new config is validated first: if it is
+invalid, nothing changes and every session keeps its previous configuration.
+Does not start the daemon.
+.TP
 .I program \fR[\fIargs\fR...]
 Any other leading positional launches that program in the PTY instead of
 the default shell, with
@@ -141,8 +165,10 @@ The names
 .BR shell-init ,
 .BR preflight ,
 .BR daemon ,
+.BR auth ,
+.BR status ,
 and
-.B auth
+.B reload
 are reserved for the subcommands above; to launch a program literally named
 that, use a path form (for example
 .BR "koshell ./daemon" ).
@@ -212,6 +238,15 @@ unwrapped.
 .TP
 .B KOSHELL_NO_EVENT_LOG
 Any non-empty value disables the local dogfooding event log.
+.TP
+.B KOSHELL_SESSION_ID
+Set by koshell in each wrapped shell to this instance's session id
+.RB ( koshell- \fIpid\fR ).
+.B koshell status
+and
+.B koshell reload
+read it to address the current instance's daemon connection; it is not meant
+to be set by hand.
 .TP
 .BR XDG_CONFIG_HOME ", " XDG_STATE_HOME ", " XDG_DATA_HOME ", " XDG_RUNTIME_DIR ", " XDG_CACHE_HOME
 Standard XDG base directories; see

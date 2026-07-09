@@ -78,6 +78,7 @@ describe("TerminalConnection", () => {
     const { sink, lines } = collectingSink();
     const factory: AgentFactory = () =>
       Promise.resolve<KoshellAgent>({
+        modelId: "test/model",
         ask({ onDelta }: AskOptions): Promise<void> {
           onDelta("Hello ");
           onDelta("world");
@@ -113,6 +114,7 @@ describe("TerminalConnection", () => {
         return Promise.reject(new Error("no AI provider configured"));
       }
       return Promise.resolve<KoshellAgent>({
+        modelId: "test/model",
         ask({ onDelta }: AskOptions): Promise<void> {
           onDelta("ok");
           return Promise.resolve();
@@ -147,6 +149,7 @@ describe("TerminalConnection", () => {
     const { sink, lines } = collectingSink();
     const factory: AgentFactory = () =>
       Promise.resolve<KoshellAgent>({
+        modelId: "test/model",
         ask({ onDelta }: AskOptions): Promise<void> {
           onDelta("partial");
           return Promise.reject(new Error("provider exploded"));
@@ -173,6 +176,7 @@ describe("TerminalConnection", () => {
     let asks = 0;
     const factory: AgentFactory = () =>
       Promise.resolve<KoshellAgent>({
+        modelId: "test/model",
         ask({ onDelta }: AskOptions): Promise<void> {
           asks += 1;
           const id = asks;
@@ -222,6 +226,7 @@ describe("TerminalConnection", () => {
     let finishAsk: (() => void) | undefined;
     const factory: AgentFactory = () =>
       Promise.resolve<KoshellAgent>({
+        modelId: "test/model",
         ask({ onDelta }: AskOptions): Promise<void> {
           onDelta("partial");
           // Like pi: abort() makes the in-flight prompt resolve early.
@@ -258,6 +263,7 @@ describe("TerminalConnection", () => {
     let asks = 0;
     const factory: AgentFactory = () =>
       Promise.resolve<KoshellAgent>({
+        modelId: "test/model",
         ask({ onDelta }: AskOptions): Promise<void> {
           asks += 1;
           onDelta(`answer-${String(asks)}`);
@@ -304,6 +310,7 @@ describe("TerminalConnection", () => {
     let emitLate: (() => void) | undefined;
     const factory: AgentFactory = () =>
       Promise.resolve<KoshellAgent>({
+        modelId: "test/model",
         ask({ onDelta }: AskOptions): Promise<void> {
           onDelta("early");
           return new Promise(() => {
@@ -358,6 +365,7 @@ describe("TerminalConnection", () => {
     const { sink, lines } = collectingSink();
     const factory: AgentFactory = () =>
       Promise.resolve<KoshellAgent>({
+        modelId: "test/model",
         ask({ onDelta }: AskOptions): Promise<void> {
           onDelta("ok");
           return Promise.resolve();
@@ -789,5 +797,127 @@ describe("TerminalConnection auth", () => {
       oauth: true,
       configured: false,
     });
+  });
+});
+
+describe("TerminalConnection reload and status", () => {
+  it("resetAgent rebuilds the agent from the next request", async () => {
+    const { sink, lines } = collectingSink();
+    let builds = 0;
+    const disposed: number[] = [];
+    const factory: AgentFactory = () => {
+      const n = (builds += 1);
+      return Promise.resolve<KoshellAgent>({
+        modelId: `model-${String(n)}`,
+        ask({ onDelta }: AskOptions): Promise<void> {
+          onDelta(`a${String(n)}`);
+          return Promise.resolve();
+        },
+        abort: noop,
+        dispose: () => disposed.push(n),
+      });
+    };
+    const connection = new TerminalConnection(sink, {
+      createAgent: factory,
+      log: NOOP_LOGGER,
+    });
+
+    connection.handleLine(HELLO_LINE);
+    connection.handleLine(aiRequestLine("r1"));
+    await settle();
+    expect(builds).toBe(1);
+
+    expect(connection.resetAgent()).toBe(true);
+    connection.handleLine(aiRequestLine("r2"));
+    await settle();
+
+    expect(builds).toBe(2); // rebuilt from the current config
+    expect(disposed).toEqual([1]); // old agent disposed after r1 finished
+    // r2 streamed through the rebuilt agent, not the disposed one.
+    expect(lines.some((line) => line.includes('"delta":"a2"'))).toBe(true);
+    expect(lines.some((line) => line.includes('"delta":"a1"'))).toBe(true);
+  });
+
+  it("resetAgent returns false when no agent has been built", () => {
+    const { sink } = collectingSink();
+    const connection = new TerminalConnection(sink, {
+      createAgent: () => Promise.reject(new Error("unused")),
+      log: NOOP_LOGGER,
+    });
+    connection.handleLine(HELLO_LINE);
+    expect(connection.resetAgent()).toBe(false);
+  });
+
+  it("registers under its session id on hello and unregisters on dispose", () => {
+    const { sink } = collectingSink();
+    const registered: string[] = [];
+    const unregistered: string[] = [];
+    const connection = new TerminalConnection(sink, {
+      createAgent: () => Promise.reject(new Error("unused")),
+      log: NOOP_LOGGER,
+      registerSession: (id) => registered.push(id),
+      unregisterSession: (id) => unregistered.push(id),
+    });
+    connection.handleLine(HELLO_LINE);
+    expect(registered).toEqual(["koshell-42"]);
+    connection.dispose();
+    expect(unregistered).toEqual(["koshell-42"]);
+  });
+
+  it("answers reload_request via the injected reload without building an agent", () => {
+    const { sink, lines } = collectingSink();
+    const connection = new TerminalConnection(sink, {
+      createAgent: () => {
+        throw new Error("reload must not build an agent");
+      },
+      log: NOOP_LOGGER,
+      reload: (sessionId) => ({
+        ok: true,
+        message: `reloaded ${sessionId ?? "all"}`,
+      }),
+    });
+    // No hello: reload is daemon-global and served without the handshake.
+    connection.handleLine(
+      JSON.stringify({ type: "reload_request", session_id: "koshell-42" }),
+    );
+    expect(types(lines)).toEqual(["reload"]);
+    const reply = JSON.parse(lines[0] ?? "{}") as {
+      ok: boolean;
+      message: string;
+    };
+    expect(reply.ok).toBe(true);
+    expect(reply.message).toBe("reloaded koshell-42");
+  });
+
+  it("answers instance_status_request via the injected instanceStatus", () => {
+    const { sink, lines } = collectingSink();
+    const connection = new TerminalConnection(sink, {
+      createAgent: () => Promise.reject(new Error("unused")),
+      log: NOOP_LOGGER,
+      instanceStatus: (sessionId) => ({
+        known: true,
+        session_id: sessionId,
+        conversation: true,
+        model: "anthropic/claude-sonnet-4-5",
+        daemon_pid: 1,
+        uptime_ms: 2,
+        version: "0.1.0",
+        protocol_version: PROTOCOL_VERSION,
+        connections: 1,
+      }),
+    });
+    connection.handleLine(
+      JSON.stringify({
+        type: "instance_status_request",
+        session_id: "koshell-42",
+      }),
+    );
+    expect(types(lines)).toEqual(["instance_status"]);
+    const reply = JSON.parse(lines[0] ?? "{}") as {
+      known: boolean;
+      model: string;
+    };
+    expect(reply.known).toBe(true);
+    expect(reply.model).toBe("anthropic/claude-sonnet-4-5");
   });
 });
