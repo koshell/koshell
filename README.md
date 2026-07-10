@@ -132,6 +132,14 @@ applies it to every open koshell. An invalid config is rejected without disturbi
 running session. `koshell status` reports the current instance: its daemon connection,
 active model, and whether a conversation is live.
 
+Conversations are currently memory-only. `koshell reload` starts a fresh conversation
+and discards the previous transcript; disconnecting the terminal session or restarting
+the daemon also leaves no conversation to resume. Terminal context is likewise bounded:
+the daemon receives the current screen and a recent pushed window, but it cannot yet pull
+older off-screen output. In dogfooding, output longer than one screen can therefore leave
+the AI with only the currently visible portion. Transcript persistence and the read-only
+terminal context tool loop are not implemented yet.
+
 A custom provider is a full block (`api`, `base_url`, `api_key`, and at least one
 model); this is also how you pin a non-default API type such as `openai-responses`:
 
@@ -148,8 +156,9 @@ api_key = "$MYCORP_API_KEY"
 ```
 
 The config selects exactly one active model — there is no runtime model switching.
-Editing it takes effect on the next conversation (a new terminal). If the config is
-missing or invalid, the terminal keeps working and `#?` reports what to fix inline.
+A new terminal uses the current config; an existing terminal applies an edit through
+`koshell reload`, which starts a fresh conversation. If the config is missing or invalid,
+the terminal keeps working and `#?` reports what to fix inline.
 See `docs/design-0011-koshell-provider-configuration.md`.
 
 Both processes log at a configurable level, set by `--log-level <level>` or the
@@ -169,9 +178,10 @@ Koshell is a hybrid monorepo with two runtimes:
   even when the AI daemon is unavailable.
 - **`koshell-ai-daemon` (Bun, shared)** — one process per user session, auto-spawned by
   the terminal and single-instance per user (the socket is the lock). Receives `#?`
-  requests over IPC and (in a later stage) runs the pi-backed agent session, provider
-  configuration, tool loop, and streaming AI responses. Its source uses `node:` APIs
-  only, so Bun is the runtime and packager, not an API dependency.
+  requests over IPC, owns Koshell provider/model/auth resolution, and runs one pi-backed
+  streaming agent conversation per terminal session. The read-only terminal context tool
+  loop is not wired yet, so context is push-only. Its source uses `node:` APIs only, so
+  Bun is the runtime and packager, not an API dependency.
 
 The two communicate over newline-delimited JSON (JSONL) on a Unix domain socket.
 

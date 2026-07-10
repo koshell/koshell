@@ -4,6 +4,13 @@ Date: 2026-07-09 10:36:22 CST
 
 Status: accepted, implemented.
 
+Dogfooding update: 2026-07-10 10:16 CST +0800. The implemented reset semantics match
+this design, but losing the previous chat history on every successful reload is now a
+reported user pain rather than an unnoticed trade-off. The transcript is memory-only,
+so terminal disconnects and daemon restarts also have no conversation to resume. This
+record does not revise reload semantics by itself; persistence, resume identity,
+model-change compatibility, privacy, and retention require a separate design decision.
+
 > Superseded in part by design-0017: the `KOSHELL_SESSION_ID` variable this record
 > describes is now field 0 of the consolidated `KOSHELL=<session-id>,<tty>` variable. The
 > routing behavior is unchanged.

@@ -49,10 +49,10 @@ terminal operator while AI assists from beside the shell.
   the daemon on demand and it is single-instance per user (the socket is the lock),
   exiting itself after an idle period; lifecycle and the Bun runtime choice are owned by
   `design-0008-daemon-lifecycle-auto-spawn-and-bun-runtime.md`. Provider/model/auth
-  resolution currently delegates to pi's own default chain (`~/.pi/agent/auth.json`,
-  then provider environment variables such as `ANTHROPIC_API_KEY`); Koshell-owned
-  XDG/TOML provider configuration and the read-only terminal tool loop are later
-  stages.
+  resolution is Koshell-owned: the daemon reads `koshell.toml`, adapts the selected model
+  and credentials into pi, and supports stored OAuth credentials without reading pi's
+  configuration files. The read-only terminal tool loop is not wired yet, so each request
+  relies on a bounded context package pushed by the terminal.
 
 ## Dependency boundaries
 
@@ -87,15 +87,27 @@ Messages (see `crates/koshell-proto`):
 
 ## Implementation status
 
-The current stage delivers the full Rust terminal-core plus the pi-backed AI daemon
-prototype: `#?` requests reach a persistent per-terminal pi conversation and the answer
-streams back into the terminal. The `#?` detector implements the revised
-stabilization-based design of `design-0001-repl-command-completion.md`, including the
-pending-trigger interaction; the debounce tiers and cancel paths await real-use tuning
-(see that document's implementation notes). Response presentation implements the
-prototype simplification of `design-0002-ai-output-and-context-boundaries.md` (see that
-document's status note). Koshell-owned provider configuration and the terminal tool loop
-(pull-side context) are the next stage.
+Status updated: 2026-07-10 10:16 CST +0800.
+
+The current stage delivers the full Rust terminal-core and a pi-backed AI daemon: `#?`
+requests reach one FIFO-serialized conversation per terminal session and answers stream
+back into the terminal. The terminal auto-spawns the daemon; Koshell-owned
+`koshell.toml` configuration, the full pi builtin provider catalog, interactive OAuth,
+per-instance status, and config reload are implemented. The `#?` detector implements
+the stabilization-based design of `design-0001-repl-command-completion.md`, including
+pending-trigger interaction and Ctrl+C cancellation. Response presentation implements
+bounded stream/block separation and anchored streaming.
+
+Two dogfooding gaps remain on the core context path:
+
+- Context is push-only. When command output exceeds the bounded pushed window, the agent
+  cannot retrieve older off-screen output; a real observed case left it with only the
+  current screen. The reserved `ai_tool_call` / `tool_response` round trip and read-only
+  terminal tool catalog are not implemented.
+- Conversations live only in daemon memory. `koshell reload` intentionally replaces the
+  current agent session and loses its transcript, and no transcript can be resumed after
+  a terminal disconnect or daemon restart. Conversation persistence and resume semantics
+  are not designed or implemented.
 
 The pre-rewrite TypeScript prototype is frozen under `reference/` as algorithm and
 behavior reference.

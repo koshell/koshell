@@ -24,6 +24,12 @@ the stabilization path (where the prompt renders before the response can be pres
 so the answer is inserted above the live input line while the terminal stays usable)
 are refined in `design-0005-presentation-line-position-and-prompt-redraw.md`.
 
+Dogfooding update: 2026-07-10 10:16 CST +0800. The push-only boundary now has a concrete
+failure case: when output extended beyond one screen, the AI saw only the currently
+visible content and could not inspect the older off-screen portion. This confirms that
+the pull-side catalog is a user-visible context gap, not only an architectural follow-up.
+The exact tool set, inventory shape, budgets, and scheduling remain undecided.
+
 ## Context
 
 Design 0001 settles _when_ the AI is asked (`#?` semantics and firing). This document
@@ -147,6 +153,9 @@ deliberate future capability, not built now.
 
 - The exact pushed-package schema and size budgets are not pinned (open since
   rewrite-0001, where `context_package` is opaque JSON on the wire).
+- Output beyond the pushed/current-screen window is unavailable to the agent. A
+  dogfooding case on 2026-07-10 reproduced the resulting loss of off-screen evidence;
+  the read-only pull-side tool loop and advertised inventory do not exist yet.
 - The AI-output prefix or style is not designed.
 - The quiescence-gap insertion and max-wait values need dogfooding alongside the
   stabilization debounce tiers of design 0001.
@@ -157,6 +166,9 @@ deliberate future capability, not built now.
 
 - Pin the context-package schema and budgets when the daemon starts consuming the
   package.
+- Resolve the observed off-screen gap by giving the agent a bounded, read-only way to
+  discover and fetch older terminal evidence, then validate it against output longer
+  than one screen without adding a PTY-writing capability.
 - Design the AI-output prefix or style with the presentation layer.
 - Tune gap insertion and max-wait during real-PTY dogfooding of the AI stage.
 - Specify the transcript lifecycle together with session commands.
