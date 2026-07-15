@@ -25,7 +25,10 @@ terminal operator while AI assists from beside the shell.
     non-integrated mirror-capture + stabilization path). `--` reserves the option
     namespace for future flags. `koshell shell-init <shell>` prints the rc snippet for
     `eval "$(koshell shell-init zsh)"`-style auto-wrap installs (see
-    `design-0003-shell-init-auto-wrap.md`);
+    `design-0003-shell-init-auto-wrap.md`). The plain-stdio command surface also owns the
+    searchable crossterm `koshell model` picker and scripted model list/show/set clients;
+    model and credential semantics remain daemon-side (see
+    `design-0018-model-discovery-and-runtime-switching.md`);
   - the terminal mirror (via `alacritty_terminal`), screen snapshots, alternate-screen
     detection, and line-level screen diffs;
   - the bounded in-memory terminal timeline (age-tiered snapshot downsampling plus a
@@ -50,8 +53,11 @@ terminal operator while AI assists from beside the shell.
   exiting itself after an idle period; lifecycle and the Bun runtime choice are owned by
   `design-0008-daemon-lifecycle-auto-spawn-and-bun-runtime.md`. Provider/model/auth
   resolution is Koshell-owned: the daemon reads `koshell.toml`, adapts the selected model
-  and credentials into pi, and supports stored OAuth credentials without reading pi's
-  configuration files. The read-only terminal tool loop is not wired yet, so each request
+  and credentials into pi, supports stored OAuth credentials without reading pi's
+  configuration files, exposes the live pi/custom model catalog, and source-preservingly
+  updates the configured default. A live conversation switches models through pi's
+  existing AgentSession without losing messages. The read-only terminal tool loop is not
+  wired yet, so each request
   relies on a bounded context package pushed by the terminal.
 
 ## Dependency boundaries
@@ -80,20 +86,26 @@ Messages (see `crates/koshell-proto`):
 
 - Terminal → daemon: `hello`, `ai_request` (carries the assembled context package),
   `ai_cancel` (best-effort withdrawal after a user interrupt; see
-  `design-0006-interrupting-ai-responses.md`), `tool_response` (reserved), `bye`.
-- Daemon → terminal: `ack`, then per request zero or more `ai_delta` chunks followed by
+  `design-0006-interrupting-ai-responses.md`), auth request/prompt messages, model
+  list/show/set requests, instance status/reload requests, `tool_response` (reserved), and
+  `bye`.
+- Daemon → terminal: `ack`, then per AI request zero or more `ai_delta` chunks followed by
   exactly one of `ai_response_end` or `ai_error` (a cancelled request still gets its
-  terminal marker). `ai_tool_call` is reserved for the tool round-trip stage.
+  terminal marker); auth flow/status replies; model catalog/state/result replies; and
+  instance status/reload replies. `ai_tool_call` is reserved for the tool round-trip
+  stage.
 
 ## Implementation status
 
-Status updated: 2026-07-10 10:16 CST +0800.
+Status updated: 2026-07-12 09:07 CST +0800.
 
 The current stage delivers the full Rust terminal-core and a pi-backed AI daemon: `#?`
 requests reach one FIFO-serialized conversation per terminal session and answers stream
 back into the terminal. The terminal auto-spawns the daemon; Koshell-owned
 `koshell.toml` configuration, the full pi builtin provider catalog, interactive OAuth,
-per-instance status, and config reload are implemented. The `#?` detector implements
+per-instance status, config reload, searchable model discovery, source-preserving default
+selection, and transcript-preserving per-conversation runtime model switching are
+implemented. The `#?` detector implements
 the stabilization-based design of `design-0001-repl-command-completion.md`, including
 pending-trigger interaction and Ctrl+C cancellation. Response presentation implements
 bounded stream/block separation and anchored streaming.
@@ -104,10 +116,10 @@ Two dogfooding gaps remain on the core context path:
   cannot retrieve older off-screen output; a real observed case left it with only the
   current screen. The reserved `ai_tool_call` / `tool_response` round trip and read-only
   terminal tool catalog are not implemented.
-- Conversations live only in daemon memory. `koshell reload` intentionally replaces the
-  current agent session and loses its transcript, and no transcript can be resumed after
-  a terminal disconnect or daemon restart. Conversation persistence and resume semantics
-  are not designed or implemented.
+- Conversations live only in daemon memory. Model selection and model-only reload now
+  preserve the active transcript, but a provider/credential/thinking configuration
+  rebuild, terminal disconnect, or daemon restart still has no transcript to resume.
+  Conversation persistence and resume semantics are not designed or implemented.
 
 The pre-rewrite TypeScript prototype is frozen under `reference/` as algorithm and
 behavior reference.

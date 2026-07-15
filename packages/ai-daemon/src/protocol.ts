@@ -96,6 +96,30 @@ export interface InstanceStatusRequestMessage {
   session_id: string;
 }
 
+// Live model discovery and selection (design 0018). These requests use a hello
+// handshake on their throwaway CLI connection and are acknowledged before the
+// terminal response.
+export interface ModelListMessage {
+  type: "model_list";
+  request_id: string;
+  all: boolean;
+  query?: string;
+}
+
+export interface ModelShowMessage {
+  type: "model_show";
+  request_id: string;
+  session_id?: string;
+}
+
+export interface ModelSetMessage {
+  type: "model_set";
+  request_id: string;
+  model: string;
+  session_id?: string;
+  session_only: boolean;
+}
+
 export type ClientMessage =
   | HelloMessage
   | AiRequestMessage
@@ -107,7 +131,10 @@ export type ClientMessage =
   | AuthStatusRequestMessage
   | AuthPromptResponseMessage
   | ReloadRequestMessage
-  | InstanceStatusRequestMessage;
+  | InstanceStatusRequestMessage
+  | ModelListMessage
+  | ModelShowMessage
+  | ModelSetMessage;
 
 // Per request, the daemon sends `ack` first (parsed and enqueued), then zero or
 // more `ai_delta` chunks, then exactly one of `ai_response_end` or `ai_error`.
@@ -249,6 +276,41 @@ export interface InstanceStatusMessage {
   connections: number;
 }
 
+export interface ModelCatalogEntry {
+  ref: string;
+  provider: string;
+  id: string;
+  name: string;
+  available: boolean;
+  context_window: number;
+  reasoning: boolean;
+}
+
+export interface ModelCatalogMessage {
+  type: "model_catalog";
+  request_id: string;
+  configured_model?: string;
+  entries: ModelCatalogEntry[];
+}
+
+export interface ModelStateMessage {
+  type: "model_state";
+  request_id: string;
+  configured_model?: string;
+  active_model?: string;
+  session_known: boolean;
+  conversation: boolean;
+}
+
+export interface ModelResultMessage {
+  type: "model_result";
+  request_id: string;
+  ok: boolean;
+  message: string;
+  configured_model?: string;
+  active_model?: string;
+}
+
 export type ServerMessage =
   | AckMessage
   | AiDeltaMessage
@@ -263,7 +325,10 @@ export type ServerMessage =
   | AuthResultMessage
   | AuthStatusMessage
   | ReloadMessage
-  | InstanceStatusMessage;
+  | InstanceStatusMessage
+  | ModelCatalogMessage
+  | ModelStateMessage
+  | ModelResultMessage;
 
 // Encodes one server message as a newline-terminated JSONL line.
 export function serializeServerMessage(message: ServerMessage): string {
@@ -397,6 +462,64 @@ export function parseClientMessage(line: string): ClientMessage | null {
           prompt_id: value.prompt_id,
           value: value.value,
         };
+      }
+      return null;
+    case "model_list":
+      if (
+        typeof value.request_id === "string" &&
+        typeof value.all === "boolean"
+      ) {
+        const message: ModelListMessage = {
+          type: "model_list",
+          request_id: value.request_id,
+          all: value.all,
+        };
+        if (typeof value.query === "string") {
+          message.query = value.query;
+        } else if (value.query !== undefined && value.query !== null) {
+          return null;
+        }
+        return message;
+      }
+      return null;
+    case "model_show":
+      if (typeof value.request_id === "string") {
+        const message: ModelShowMessage = {
+          type: "model_show",
+          request_id: value.request_id,
+        };
+        if (typeof value.session_id === "string") {
+          message.session_id = value.session_id;
+        } else if (
+          value.session_id !== undefined &&
+          value.session_id !== null
+        ) {
+          return null;
+        }
+        return message;
+      }
+      return null;
+    case "model_set":
+      if (
+        typeof value.request_id === "string" &&
+        typeof value.model === "string" &&
+        typeof value.session_only === "boolean"
+      ) {
+        const message: ModelSetMessage = {
+          type: "model_set",
+          request_id: value.request_id,
+          model: value.model,
+          session_only: value.session_only,
+        };
+        if (typeof value.session_id === "string") {
+          message.session_id = value.session_id;
+        } else if (
+          value.session_id !== undefined &&
+          value.session_id !== null
+        ) {
+          return null;
+        }
+        return message;
       }
       return null;
     default:

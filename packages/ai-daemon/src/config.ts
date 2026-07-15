@@ -5,12 +5,9 @@
 // resolves, reads, and validates `koshell.toml` at the file boundary; adapting the
 // validated value into pi's in-memory auth/model objects is `provider.ts`.
 //
-// The config selects exactly one active model (the single-active-model rule). The
-// daemon reads it when a conversation is created, so switching a model is "edit the
-// config, then start a new conversation". `koshell reload` (design 0015) makes that
-// explicit for live sessions — it re-reads the config and rebuilds an instance's
-// agent so its next `#?` uses the new config — but there is still no runtime
-// `/model` switching within a single conversation.
+// The config selects one default model for new conversations. `koshell model`
+// source-preservingly updates that root value, while a live conversation may
+// temporarily use a different active model (design 0018).
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -153,25 +150,9 @@ export function resolveConfigPath(): string {
   return join(homedir(), ".config", "koshell", "koshell.toml");
 }
 
-// Reads and validates the config. Throws ConfigError with setup guidance when the
-// file is missing, unparseable, or invalid; the daemon surfaces the message inline.
-export function loadConfig(pathOverride?: string): KoshellConfig {
-  const path = pathOverride ?? resolveConfigPath();
-
-  let text: string;
-  try {
-    text = readFileSync(path, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      throw new ConfigError(
-        `no Koshell config at ${path}. Create it to choose your AI model; run \`man koshell.toml\` to see the format and examples.`,
-      );
-    }
-    throw new ConfigError(
-      `cannot read ${path}: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-
+// Parses and validates config text. Exported for the source-preserving model
+// updater, which validates proposed bytes before atomically replacing the file.
+export function parseConfigText(text: string, path: string): KoshellConfig {
   let parsed: unknown;
   try {
     parsed = parseToml(text);
@@ -191,6 +172,28 @@ export function loadConfig(pathOverride?: string): KoshellConfig {
     throw new ConfigError(`invalid config in ${path}: ${issues}`);
   }
   return result.data;
+}
+
+// Reads and validates the config. Throws ConfigError with setup guidance when the
+// file is missing, unparseable, or invalid; the daemon surfaces the message inline.
+export function loadConfig(pathOverride?: string): KoshellConfig {
+  const path = pathOverride ?? resolveConfigPath();
+
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new ConfigError(
+        `no Koshell config at ${path}. Run \`koshell model\` to choose your AI model, or \`man koshell.toml\` to configure it manually.`,
+      );
+    }
+    throw new ConfigError(
+      `cannot read ${path}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  return parseConfigText(text, path);
 }
 
 // Splits a validated "provider/id" model reference on the first slash.

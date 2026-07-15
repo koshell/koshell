@@ -123,6 +123,32 @@ pub enum ClientMessage {
     /// [`ServerMessage::InstanceStatus`], again without a `hello` handshake.
     /// Additive: a daemon that does not know this type ignores it.
     InstanceStatusRequest { session_id: String },
+    /// Lists models from the daemon's live pi registry (`koshell model list` and
+    /// the interactive picker). By default only credential-available entries are
+    /// returned; `all` includes unavailable entries. Additive (design 0018).
+    ModelList {
+        request_id: String,
+        all: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+    },
+    /// Reports the configured default and, when addressed from inside Koshell,
+    /// the current conversation's active model.
+    ModelShow {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
+    /// Selects one model. `session_only` requires a live `session_id`; otherwise
+    /// selection persists the default and also switches that conversation when
+    /// it exists.
+    ModelSet {
+        request_id: String,
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        session_only: bool,
+    },
 }
 
 /// One choice offered by [`ServerMessage::AuthSelect`].
@@ -151,6 +177,19 @@ pub struct AuthStatusEntry {
     /// Human detail for the source, e.g. the environment variable name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+}
+
+/// One model row returned by [`ServerMessage::ModelCatalog`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCatalogEntry {
+    #[serde(rename = "ref")]
+    pub model_ref: String,
+    pub provider: String,
+    pub id: String,
+    pub name: String,
+    pub available: bool,
+    pub context_window: u64,
+    pub reasoning: bool,
 }
 
 /// A message sent from the AI daemon back to the terminal process.
@@ -264,6 +303,33 @@ pub enum ServerMessage {
         version: String,
         protocol_version: u32,
         connections: u32,
+    },
+    /// Live registry reply for [`ClientMessage::ModelList`].
+    ModelCatalog {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configured_model: Option<String>,
+        entries: Vec<ModelCatalogEntry>,
+    },
+    /// Current configured/active model state for [`ClientMessage::ModelShow`].
+    ModelState {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configured_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_model: Option<String>,
+        session_known: bool,
+        conversation: bool,
+    },
+    /// Terminal success/failure reply for [`ClientMessage::ModelSet`].
+    ModelResult {
+        request_id: String,
+        ok: bool,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configured_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_model: Option<String>,
     },
 }
 
@@ -652,5 +718,46 @@ mod tests {
         .unwrap();
         assert!(!unknown.contains("\"cwd\""));
         assert!(unknown.contains("\"known\":false"));
+    }
+
+    #[test]
+    fn model_messages_round_trip() {
+        let request = ClientMessage::ModelSet {
+            request_id: "model-1".into(),
+            model: "openrouter/anthropic/claude".into(),
+            session_id: Some("koshell-42".into()),
+            session_only: false,
+        };
+        let line = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            line,
+            r#"{"type":"model_set","request_id":"model-1","model":"openrouter/anthropic/claude","session_id":"koshell-42","session_only":false}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<ClientMessage>(&line).unwrap(),
+            ClientMessage::ModelSet { .. }
+        ));
+
+        let catalog = ServerMessage::ModelCatalog {
+            request_id: "model-1".into(),
+            configured_model: Some("test/one".into()),
+            entries: vec![ModelCatalogEntry {
+                model_ref: "test/one".into(),
+                provider: "test".into(),
+                id: "one".into(),
+                name: "Test One".into(),
+                available: true,
+                context_window: 128_000,
+                reasoning: false,
+            }],
+        };
+        let line = serde_json::to_string(&catalog).unwrap();
+        assert!(line.contains("\"ref\":\"test/one\""));
+        match serde_json::from_str::<ServerMessage>(&line).unwrap() {
+            ServerMessage::ModelCatalog { entries, .. } => {
+                assert_eq!(entries[0].model_ref, "test/one");
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
     }
 }

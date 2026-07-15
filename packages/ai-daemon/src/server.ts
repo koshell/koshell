@@ -3,7 +3,11 @@ import process from "node:process";
 
 import type { AuthStorage } from "@earendil-works/pi-coding-agent";
 
-import type { AgentFactory, KoshellAgent } from "./agent-runtime.ts";
+import {
+  type AgentFactory,
+  type KoshellAgent,
+  configurationFingerprint,
+} from "./agent-runtime.ts";
 import {
   type AuthFlowIo,
   buildAuthStatus,
@@ -14,12 +18,18 @@ import { openAuthStorage } from "./auth-store.ts";
 import { type KoshellConfig, loadConfig } from "./config.ts";
 import { NdjsonDecoder } from "./framing.ts";
 import type { Logger } from "./logging.ts";
+import {
+  type ModelCatalog,
+  buildModelCatalog,
+  updateDefaultModel,
+} from "./model-service.ts";
 import { buildUserPrompt } from "./prompt.ts";
 import { resolveProvider } from "./provider.ts";
 import {
   type AiRequestMessage,
   type AuthLoginMessage,
   type HelloMessage,
+  type ModelSetMessage,
   PROTOCOL_VERSION,
   type ServerMessage,
   parseClientMessage,
@@ -79,8 +89,15 @@ export interface ConnectionOptions {
   // `unregisterSession` let a connection add itself to the registry when its
   // hello arrives and remove itself on close. Absent seams make the handlers
   // no-ops, keeping unit tests that never exercise them free of plumbing.
-  reload?: (sessionId?: string) => ReloadOutcome;
+  reload?: (sessionId?: string) => ReloadOutcome | Promise<ReloadOutcome>;
   instanceStatus?: (sessionId: string) => InstanceStatusData;
+  modelCatalog?: (all: boolean, query?: string) => ModelCatalog;
+  modelSet?: (message: ModelSetMessage) => Promise<{
+    ok: boolean;
+    message: string;
+    configuredModel?: string;
+    activeModel?: string;
+  }>;
   registerSession?: (id: string, connection: TerminalConnection) => void;
   unregisterSession?: (id: string, connection: TerminalConnection) => void;
 }
@@ -130,6 +147,7 @@ export class TerminalConnection {
   // The resolved model id, cached synchronously once the agent resolves so
   // `koshell status` can read it without awaiting; cleared with the agent.
   private modelId: string | undefined;
+  private agentConfigurationFingerprint: string | undefined;
   // This connection's terminal_session_id, learned from hello; the key it is
   // registered under so it can unregister itself on close.
   private sessionId: string | undefined;
@@ -243,13 +261,15 @@ export class TerminalConnection {
       case "reload_request": {
         // Daemon-global, routed by session_id; served without a hello gate,
         // like status_request. Absent seam => no-op (older-daemon behaviour).
-        const outcome = this.options.reload?.(message.session_id);
-        if (outcome !== undefined) {
-          const reply: ServerMessage = { type: "reload", ok: outcome.ok };
-          if (outcome.message.length > 0) {
-            reply.message = outcome.message;
-          }
-          this.send(reply);
+        const pending = this.options.reload?.(message.session_id);
+        if (pending !== undefined) {
+          void Promise.resolve(pending).then((outcome) => {
+            const reply: ServerMessage = { type: "reload", ok: outcome.ok };
+            if (outcome.message.length > 0) {
+              reply.message = outcome.message;
+            }
+            this.send(reply);
+          });
         }
         break;
       }
@@ -257,6 +277,95 @@ export class TerminalConnection {
         const data = this.options.instanceStatus?.(message.session_id);
         if (data !== undefined) {
           this.send({ type: "instance_status", ...data });
+        }
+        break;
+      }
+      case "model_list": {
+        this.send({ type: "ack", request_id: message.request_id });
+        if (this.helloRejection !== undefined) {
+          this.sendModelResult(message.request_id, {
+            ok: false,
+            message: this.helloRejection,
+          });
+          break;
+        }
+        try {
+          const catalog = this.options.modelCatalog?.(
+            message.all,
+            message.query,
+          );
+          if (catalog !== undefined) {
+            this.send({
+              type: "model_catalog",
+              request_id: message.request_id,
+              ...catalog,
+            });
+          }
+        } catch (error) {
+          this.sendModelResult(message.request_id, {
+            ok: false,
+            message: errorText(error),
+          });
+        }
+        break;
+      }
+      case "model_show": {
+        this.send({ type: "ack", request_id: message.request_id });
+        if (this.helloRejection !== undefined) {
+          this.sendModelResult(message.request_id, {
+            ok: false,
+            message: this.helloRejection,
+          });
+          break;
+        }
+        try {
+          const configuredModel =
+            this.options.modelCatalog?.(false).configured_model;
+          const state =
+            message.session_id === undefined
+              ? undefined
+              : this.options.instanceStatus?.(message.session_id);
+          this.send({
+            type: "model_state",
+            request_id: message.request_id,
+            ...(configuredModel !== undefined
+              ? { configured_model: configuredModel }
+              : {}),
+            ...(state?.model !== undefined
+              ? { active_model: state.model }
+              : {}),
+            session_known: state?.known ?? false,
+            conversation: state?.conversation ?? false,
+          });
+        } catch (error) {
+          this.sendModelResult(message.request_id, {
+            ok: false,
+            message: errorText(error),
+          });
+        }
+        break;
+      }
+      case "model_set": {
+        this.send({ type: "ack", request_id: message.request_id });
+        if (this.helloRejection !== undefined) {
+          this.sendModelResult(message.request_id, {
+            ok: false,
+            message: this.helloRejection,
+          });
+          break;
+        }
+        const pending = this.options.modelSet?.(message);
+        if (pending !== undefined) {
+          void pending
+            .then((outcome) => {
+              this.sendModelResult(message.request_id, outcome);
+            })
+            .catch((error: unknown) => {
+              this.sendModelResult(message.request_id, {
+                ok: false,
+                message: errorText(error),
+              });
+            });
         }
         break;
       }
@@ -422,6 +531,29 @@ export class TerminalConnection {
     );
   }
 
+  private sendModelResult(
+    requestId: string,
+    outcome: {
+      ok: boolean;
+      message: string;
+      configuredModel?: string;
+      activeModel?: string;
+    },
+  ): void {
+    this.send({
+      type: "model_result",
+      request_id: requestId,
+      ok: outcome.ok,
+      message: outcome.message,
+      ...(outcome.configuredModel !== undefined
+        ? { configured_model: outcome.configuredModel }
+        : {}),
+      ...(outcome.activeModel !== undefined
+        ? { active_model: outcome.activeModel }
+        : {}),
+    });
+  }
+
   private sendAuthResult(
     requestId: string,
     outcome: { ok: boolean; message: string },
@@ -472,6 +604,72 @@ export class TerminalConnection {
       .catch(() => undefined);
     this.agent = undefined;
     this.modelId = undefined;
+    this.agentConfigurationFingerprint = undefined;
+  }
+
+  private enqueueControl<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.queue.then(operation, operation);
+    // A rejected control operation must not poison later #? requests.
+    this.queue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  // Queues a model switch behind every already-acknowledged #? request. When
+  // `requireConversation` is false, an instance with no agent is a successful
+  // no-op because the persisted default will apply when its conversation starts.
+  switchModel(model: string, requireConversation: boolean): Promise<boolean> {
+    return this.enqueueControl(async () => {
+      const pending = this.agent;
+      if (pending === undefined) {
+        if (requireConversation) {
+          throw new Error(
+            "this koshell instance has no active conversation; run a `#?` first or omit --session-only",
+          );
+        }
+        return false;
+      }
+      const agent = await pending;
+      if (agent.setModel === undefined) {
+        throw new Error(
+          "the active agent does not support in-place model switching",
+        );
+      }
+      await agent.setModel(model);
+      this.modelId = agent.modelId;
+      return true;
+    });
+  }
+
+  // Applies a validated reload. A matching construction fingerprint proves the
+  // root model is the only relevant change, so the transcript stays in place;
+  // all other changes conservatively rebuild and report that history is lost.
+  reloadFromConfig(
+    config: KoshellConfig,
+  ): Promise<"none" | "switched" | "rebuilt"> {
+    return this.enqueueControl(async () => {
+      const pending = this.agent;
+      if (pending === undefined) {
+        return "none";
+      }
+      const agent = await pending;
+      if (
+        this.agentConfigurationFingerprint ===
+          configurationFingerprint(config) &&
+        agent.setModel !== undefined
+      ) {
+        await agent.setModel(config.model);
+        this.modelId = agent.modelId;
+        return "switched";
+      }
+      this.agent = undefined;
+      this.modelId = undefined;
+      this.agentConfigurationFingerprint = undefined;
+      agent.dispose();
+      return "rebuilt";
+    });
   }
 
   // `koshell reload` seam: drop the memoized agent so the next ai_request
@@ -489,6 +687,7 @@ export class TerminalConnection {
       const pending = this.agent;
       this.agent = undefined;
       this.modelId = undefined;
+      this.agentConfigurationFingerprint = undefined;
       if (pending !== undefined) {
         try {
           (await pending).dispose();
@@ -580,8 +779,10 @@ export class TerminalConnection {
         log: this.options.log,
       })
       .then((agent) => {
-        // Cache the resolved model id so `koshell status` reads it synchronously.
+        // Cache live state so `koshell status` and model-only reload can read it
+        // without awaiting the agent promise.
         this.modelId = agent.modelId;
+        this.agentConfigurationFingerprint = agent.configurationFingerprint;
         return agent;
       })
       .catch((error: unknown) => {
@@ -590,6 +791,7 @@ export class TerminalConnection {
         // provider key in the meantime).
         this.agent = undefined;
         this.modelId = undefined;
+        this.agentConfigurationFingerprint = undefined;
         throw error;
       });
     return this.agent;
@@ -653,13 +855,14 @@ export function startDaemon(
   // throwaway connections, can route to the right instance (design 0015).
   const sessions = new Map<string, TerminalConnection>();
 
-  // `koshell reload`: validate the new config once (a faithful dry run of what
-  // createAgent does), and only if it holds, reset the target session(s) so
-  // their next #? rebuilds from it. A broken config leaves every session on its
-  // previous working config. sessionId === undefined is the `--all` form.
-  const reload = (sessionId?: string): ReloadOutcome => {
+  // `koshell reload`: validate once, then preserve transcripts when the root
+  // model is the only construction change. Other changes conservatively rebuild
+  // and say that history was discarded.
+  const reload = async (sessionId?: string): Promise<ReloadOutcome> => {
+    let config: KoshellConfig;
     try {
-      resolveProvider(loadConfig());
+      config = loadConfig();
+      resolveProvider(config);
     } catch (error) {
       return {
         ok: false,
@@ -670,20 +873,43 @@ export function startDaemon(
       sessionId === undefined
         ? [...sessions.values()]
         : [sessions.get(sessionId)].filter(
-            (c): c is TerminalConnection => c !== undefined,
+            (connection): connection is TerminalConnection =>
+              connection !== undefined,
           );
-    let applied = 0;
-    for (const connection of targets) {
-      if (connection.resetAgent()) {
-        applied += 1;
+    try {
+      const outcomes = await Promise.all(
+        targets.map((connection) => connection.reloadFromConfig(config)),
+      );
+      const switched = outcomes.filter(
+        (outcome) => outcome === "switched",
+      ).length;
+      const rebuilt = outcomes.filter(
+        (outcome) => outcome === "rebuilt",
+      ).length;
+      if (switched === 0 && rebuilt === 0) {
+        return {
+          ok: true,
+          message: "configuration reloaded; no active conversation to update",
+        };
       }
+      const details = [
+        switched > 0
+          ? `${String(switched)} transcript-preserving model switch(es)`
+          : undefined,
+        rebuilt > 0
+          ? `${String(rebuilt)} agent rebuild(s); those conversation transcripts were discarded because non-model configuration changed`
+          : undefined,
+      ].filter((detail): detail is string => detail !== undefined);
+      return {
+        ok: true,
+        message: `configuration reloaded: ${details.join(", ")}`,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        message: `configuration was valid but could not be applied: ${errorText(error)}`,
+      };
     }
-    const scope = sessionId === undefined ? "" : " for this instance";
-    const note =
-      applied === 0
-        ? ` no active conversation${scope} to reset; config validated`
-        : ` ${String(applied)} session(s) will use it on the next #?`;
-    return { ok: true, message: `configuration reloaded;${note}` };
   };
 
   // `koshell status`: one instance's live state (per-connection if the session
@@ -706,12 +932,76 @@ export function startDaemon(
     };
   };
 
+  const modelCatalog = (all: boolean, query?: string): ModelCatalog =>
+    buildModelCatalog({
+      all,
+      ...(query !== undefined ? { query } : {}),
+    });
+
+  const modelSet = async (
+    message: ModelSetMessage,
+  ): Promise<{
+    ok: boolean;
+    message: string;
+    configuredModel?: string;
+    activeModel?: string;
+  }> => {
+    const target =
+      message.session_id === undefined
+        ? undefined
+        : sessions.get(message.session_id);
+    try {
+      if (message.session_only) {
+        if (message.session_id === undefined) {
+          throw new Error(
+            "--session-only must be run inside a koshell session",
+          );
+        }
+        if (target === undefined) {
+          throw new Error(
+            `koshell session "${message.session_id}" is not connected to this daemon`,
+          );
+        }
+        await target.switchModel(message.model, true);
+        return {
+          ok: true,
+          message: `active conversation switched to ${message.model}; koshell.toml was not changed`,
+          activeModel: message.model,
+        };
+      }
+
+      const config = await updateDefaultModel(message.model, {
+        ...(target !== undefined
+          ? {
+              apply: async () => {
+                await target.switchModel(message.model, false);
+              },
+            }
+          : {}),
+      });
+      const activeModel = target?.instanceSnapshot().model;
+      const switched = activeModel === message.model;
+      return {
+        ok: true,
+        message: switched
+          ? `active conversation switched to ${message.model}; future conversations will use it by default`
+          : `default model set to ${message.model}; future conversations will use it`,
+        configuredModel: config.model,
+        ...(activeModel !== undefined ? { activeModel } : {}),
+      };
+    } catch (error) {
+      return { ok: false, message: errorText(error) };
+    }
+  };
+
   const connectionOptions: ConnectionOptions = {
     createAgent: options.createAgent,
     log: options.log,
     status,
     reload,
     instanceStatus,
+    modelCatalog,
+    modelSet,
     registerSession: (id, connection) => sessions.set(id, connection),
     unregisterSession: (id, connection) => {
       // Only drop the entry if it still points at the connection unregistering:

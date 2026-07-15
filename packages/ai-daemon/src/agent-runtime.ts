@@ -17,10 +17,10 @@ import {
   type ResourceLoader,
 } from "@earendil-works/pi-coding-agent";
 
-import { loadConfig } from "./config.ts";
+import { type KoshellConfig, loadConfig } from "./config.ts";
 import type { Logger } from "./logging.ts";
 import { SYSTEM_PROMPT } from "./prompt.ts";
-import { resolveProvider } from "./provider.ts";
+import { resolveModel, resolveProvider } from "./provider.ts";
 
 export interface AskOptions {
   prompt: string;
@@ -29,9 +29,15 @@ export interface AskOptions {
 
 // One persistent conversation for one terminal session.
 export interface KoshellAgent {
-  // The resolved model id in use, e.g. "anthropic/claude-sonnet-4-5". Reported
-  // by `koshell status`; fixed for the life of this conversation.
+  // The active model id, e.g. "anthropic/claude-sonnet-4-5". Reported by
+  // `koshell status` and updated after an in-place switch.
   readonly modelId: string;
+  // Stable serialization of provider/thinking construction inputs, excluding the
+  // root default model. `koshell reload` uses it to prove a change is model-only.
+  readonly configurationFingerprint?: string;
+  // Switches this AgentSession in place, preserving its transcript. Optional only
+  // for lightweight injected test agents; the production pi agent implements it.
+  setModel?(modelId: string): Promise<void>;
   // Resolves when the response is complete; rejects with the provider/setup error.
   ask(options: AskOptions): Promise<void>;
   // Interrupts the in-flight ask (user Ctrl+C); a no-op when nothing is running.
@@ -48,6 +54,34 @@ export interface AgentFactoryOptions {
 export type AgentFactory = (
   options: AgentFactoryOptions,
 ) => Promise<KoshellAgent>;
+
+const MODEL_SWITCH_RESERVE_TOKENS = 16_384;
+
+export function assertModelSwitchCapacity(
+  modelId: string,
+  contextWindow: number,
+  maxTokens: number,
+  retainedTokens: number | null,
+): void {
+  if (retainedTokens === null) {
+    throw new Error(
+      `cannot safely switch to "${modelId}" because retained context usage is unknown`,
+    );
+  }
+  const reserveTokens = Math.min(MODEL_SWITCH_RESERVE_TOKENS, maxTokens);
+  if (retainedTokens + reserveTokens > contextWindow) {
+    throw new Error(
+      `cannot switch to "${modelId}": the retained conversation needs about ${String(retainedTokens)} tokens plus a ${String(reserveTokens)}-token response reserve, but the model context window is ${String(contextWindow)}. Start a new conversation or choose a larger-context model.`,
+    );
+  }
+}
+
+export function configurationFingerprint(config: KoshellConfig): string {
+  return JSON.stringify({
+    thinking_level: config.thinking_level ?? null,
+    providers: config.providers,
+  });
+}
 
 function createResourceLoader(): ResourceLoader {
   return {
@@ -71,12 +105,12 @@ function createResourceLoader(): ResourceLoader {
 // is testable with a fake agent.
 export function createPiAgentFactory(): AgentFactory {
   return async ({ cwd, log }) => {
-    // Read the config per conversation, so "edit the config, start a new
-    // conversation" applies without a reload. A ConfigError (missing file,
-    // invalid schema, unknown model, missing key) propagates as the #? failure,
-    // which the terminal shows inline as setup guidance.
+    // Read the config when constructing a conversation. `koshell model` can
+    // later switch this session in place; other config changes rebuild it via
+    // reload. A ConfigError propagates as the #? failure shown inline.
+    const config = loadConfig();
     const { authStorage, modelRegistry, model, thinkingLevel } =
-      resolveProvider(loadConfig());
+      resolveProvider(config);
 
     const { session } = await createAgentSession({
       cwd,
@@ -131,8 +165,32 @@ export function createPiAgentFactory(): AgentFactory {
       return message;
     };
 
+    let currentModelId = `${model.provider}/${model.id}`;
     return {
-      modelId: `${model.provider}/${model.id}`,
+      get modelId(): string {
+        return currentModelId;
+      },
+      configurationFingerprint: configurationFingerprint(config),
+      async setModel(modelId: string): Promise<void> {
+        // `koshell auth login/logout` can mutate the shared credential file after
+        // this conversation was created. Refresh it before validating the target.
+        authStorage.reload();
+        const target = resolveModel(modelRegistry, modelId);
+        const targetId = `${target.provider}/${target.id}`;
+        if (targetId === currentModelId) {
+          return;
+        }
+        const usage = session.getContextUsage();
+        assertModelSwitchCapacity(
+          targetId,
+          target.contextWindow,
+          target.maxTokens,
+          usage === undefined ? 0 : usage.tokens,
+        );
+        await session.setModel(target);
+        currentModelId = targetId;
+        log.info(`agent model switched in place (model: ${targetId})`);
+      },
       async ask(options: AskOptions): Promise<void> {
         streaming.onDelta = options.onDelta;
         delete streaming.errorMessage;

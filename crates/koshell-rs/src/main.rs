@@ -25,6 +25,12 @@ fn main() {
         Some(Command::Auth { action }) => {
             std::process::exit(koshell_rs::auth_cli::run(action));
         }
+        Some(Command::Model {
+            session_only,
+            action,
+        }) => {
+            std::process::exit(koshell_rs::model_cli::run(session_only, action));
+        }
         Some(Command::Status) => {
             std::process::exit(koshell_rs::status_cli::run());
         }

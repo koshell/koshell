@@ -98,20 +98,30 @@ disables it (the terminal then degrades inline until you start the daemon yourse
 `KOSHELL_DAEMON_CMD` overrides the launch command entirely (used verbatim).
 
 Provider, model, and auth come from Koshell's own config at
-`$XDG_CONFIG_HOME/koshell/koshell.toml` (default `~/.config/koshell/koshell.toml`). The
-minimal config names one model and lets the key come from the provider's environment
-variable:
+`$XDG_CONFIG_HOME/koshell/koshell.toml` (default `~/.config/koshell/koshell.toml`).
+Export a provider key (or sign in with `koshell auth login`), then choose a model without
+hand-editing TOML:
 
-```toml
-model = "anthropic/claude-sonnet-4-5"    # "provider/id"; 30+ builtin providers
-                                         # (anthropic, openai, google, openrouter, ...)
+```bash
+export ANTHROPIC_API_KEY=...       # export before the daemon starts
+koshell model                      # searchable interactive picker
+koshell model list                 # credential-available models
+koshell model list --all sonnet    # full catalog, filtered; marks missing credentials
+koshell model set anthropic/claude-sonnet-4-5
+koshell model show                 # configured default and this conversation's active model
 ```
 
-with `ANTHROPIC_API_KEY` exported. The builtin catalog is the embedded pi
-runtime's full provider catalog, so most providers need nothing beyond their
-conventional API-key environment variable (`man koshell.toml` lists the common
-ones; a misspelled provider name makes `#?` print the complete list). Or put
-the key in the config instead:
+The builtin catalog is the embedded pi runtime's full provider catalog (30+ providers,
+1,000+ models), so Koshell keeps no static model list. If a key is exported after the
+daemon has already started, run `koshell daemon restart` so the daemon inherits it; this
+still loses memory-only conversations. The resulting minimal config is:
+
+```toml
+model = "anthropic/claude-sonnet-4-5"
+```
+
+Most providers need nothing beyond their conventional API-key environment variable
+(`man koshell.toml` lists the common ones). Or put the key in the config instead:
 
 ```toml
 model = "anthropic/claude-sonnet-4-5"
@@ -125,16 +135,24 @@ Subscription providers sign in interactively instead: `koshell auth login anthro
 provider's OAuth flow and stores the token in `$XDG_DATA_HOME/koshell/auth.json`;
 `koshell auth status` shows what is configured and from where.
 
-The daemon reads the config when a conversation starts, so after editing it run
-`koshell reload` to apply the change to the current terminal (its next `#?` picks up
-the new config; the in-progress conversation is discarded). `koshell reload --all`
-applies it to every open koshell. An invalid config is rejected without disturbing any
-running session. `koshell status` reports the current instance: its daemon connection,
-active model, and whether a conversation is live.
+Inside Koshell, `koshell model` and `model set` switch the current conversation in
+place **and** save the choice as the default for future conversations. Add
+`--session-only` for a temporary switch that leaves `koshell.toml` byte-for-byte
+unchanged. Other terminal conversations keep their own active models. A switch waits for
+an in-progress answer and preserves the transcript; if the retained history cannot fit
+the target context window, Koshell rejects it instead of dropping or summarizing history.
+Outside Koshell, selection updates only the future default.
 
-Conversations are currently memory-only. `koshell reload` starts a fresh conversation
-and discards the previous transcript; disconnecting the terminal session or restarting
-the daemon also leaves no conversation to resume. Terminal context is likewise bounded:
+After manually editing `koshell.toml`, run `koshell reload` for the current terminal or
+`koshell reload --all`. A model-only reload uses the same transcript-preserving switch;
+provider, credential, thinking-level, or other construction changes rebuild the affected
+agent and explicitly report that its in-memory transcript was discarded. Invalid config
+is rejected without disturbing a running session. `koshell status` reports the current
+instance's active model and conversation state.
+
+Conversations are currently memory-only. Model switches no longer discard them, but a
+provider-definition rebuild, terminal disconnect, or daemon restart still leaves no
+conversation to resume. Terminal context is likewise bounded:
 the daemon receives the current screen and a recent pushed window, but it cannot yet pull
 older off-screen output. In dogfooding, output longer than one screen can therefore leave
 the AI with only the currently visible portion. Transcript persistence and the read-only
@@ -155,11 +173,12 @@ api_key = "$MYCORP_API_KEY"
   id = "mycorp-large"
 ```
 
-The config selects exactly one active model — there is no runtime model switching.
-A new terminal uses the current config; an existing terminal applies an edit through
-`koshell reload`, which starts a fresh conversation. If the config is missing or invalid,
-the terminal keeps working and `#?` reports what to fix inline.
-See `docs/design-0011-koshell-provider-configuration.md`.
+The config selects one default model, and each conversation has one active model at any
+instant. `koshell model` updates only the root `model` assignment through a locked,
+source-preserving atomic replacement, retaining comments, formatting, custom providers,
+and file permissions. If the config is missing or invalid, the terminal keeps working
+and `#?` reports what to fix inline. See
+`docs/design-0018-model-discovery-and-runtime-switching.md`.
 
 Both processes log at a configurable level, set by `--log-level <level>` or the
 `KOSHELL_LOG` environment variable (the argument wins). The terminal owns the screen,

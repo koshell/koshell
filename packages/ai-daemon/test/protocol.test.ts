@@ -160,6 +160,52 @@ describe("parseClientMessage", () => {
     ).toEqual({ type: "instance_status_request", session_id: "koshell-42" });
   });
 
+  it("parses model discovery and selection requests", () => {
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "model_list",
+          request_id: "model-1",
+          all: true,
+          query: "sonnet",
+        }),
+      ),
+    ).toEqual({
+      type: "model_list",
+      request_id: "model-1",
+      all: true,
+      query: "sonnet",
+    });
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "model_show",
+          request_id: "model-1",
+          session_id: "koshell-42",
+        }),
+      ),
+    ).toEqual({
+      type: "model_show",
+      request_id: "model-1",
+      session_id: "koshell-42",
+    });
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "model_set",
+          request_id: "model-1",
+          model: "anthropic/claude",
+          session_only: false,
+        }),
+      ),
+    ).toEqual({
+      type: "model_set",
+      request_id: "model-1",
+      model: "anthropic/claude",
+      session_only: false,
+    });
+  });
+
   it("rejects malformed input", () => {
     expect(parseClientMessage("not json")).toBeNull();
     expect(parseClientMessage(JSON.stringify({ type: "unknown" }))).toBeNull();
@@ -194,6 +240,20 @@ describe("parseClientMessage", () => {
         }),
       ),
     ).toBeNull();
+    expect(
+      parseClientMessage(
+        JSON.stringify({ type: "model_list", request_id: "m1", all: "yes" }),
+      ),
+    ).toBeNull();
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          type: "model_set",
+          request_id: "m1",
+          model: "test/one",
+        }),
+      ),
+    ).toBeNull();
   });
 });
 
@@ -225,6 +285,41 @@ describe("serializeServerMessage", () => {
       }),
     ).toBe(
       '{"type":"ai_error","request_id":"req-1","message":"no provider configured"}\n',
+    );
+  });
+
+  it("produces the exact model JSONL wire lines", () => {
+    expect(
+      serializeServerMessage({
+        type: "model_catalog",
+        request_id: "model-1",
+        configured_model: "test/one",
+        entries: [
+          {
+            ref: "test/one",
+            provider: "test",
+            id: "one",
+            name: "Test One",
+            available: true,
+            context_window: 128000,
+            reasoning: false,
+          },
+        ],
+      }),
+    ).toBe(
+      '{"type":"model_catalog","request_id":"model-1","configured_model":"test/one","entries":[{"ref":"test/one","provider":"test","id":"one","name":"Test One","available":true,"context_window":128000,"reasoning":false}]}\n',
+    );
+    expect(
+      serializeServerMessage({
+        type: "model_state",
+        request_id: "model-1",
+        configured_model: "test/one",
+        active_model: "test/two",
+        session_known: true,
+        conversation: true,
+      }),
+    ).toBe(
+      '{"type":"model_state","request_id":"model-1","configured_model":"test/one","active_model":"test/two","session_known":true,"conversation":true}\n',
     );
   });
 

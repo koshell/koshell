@@ -10,6 +10,7 @@ pub mod event_log;
 pub mod ipc;
 pub mod logging;
 pub mod mirror;
+pub mod model_cli;
 pub mod presentation;
 pub mod reload_cli;
 pub mod screen_diff;

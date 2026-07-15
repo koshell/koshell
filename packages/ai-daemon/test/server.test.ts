@@ -7,10 +7,11 @@ import {
   unregisterOAuthProvider,
 } from "@earendil-works/pi-ai/oauth";
 
-import type {
-  AgentFactory,
-  AskOptions,
-  KoshellAgent,
+import {
+  type AgentFactory,
+  type AskOptions,
+  type KoshellAgent,
+  configurationFingerprint,
 } from "../src/agent-runtime.ts";
 import type { KoshellConfig } from "../src/config.ts";
 import type { Logger } from "../src/logging.ts";
@@ -864,7 +865,85 @@ describe("TerminalConnection reload and status", () => {
     expect(unregistered).toEqual(["koshell-42"]);
   });
 
-  it("answers reload_request via the injected reload without building an agent", () => {
+  it("reloadFromConfig preserves the agent for a model-only change", async () => {
+    const { sink } = collectingSink();
+    const original: KoshellConfig = {
+      model: "test/old",
+      thinking_level: "high",
+      providers: {},
+    };
+    let model = original.model;
+    let disposed = false;
+    const agent: KoshellAgent = {
+      get modelId() {
+        return model;
+      },
+      configurationFingerprint: configurationFingerprint(original),
+      ask: () => Promise.resolve(),
+      setModel: (next) => {
+        model = next;
+        return Promise.resolve();
+      },
+      abort: noop,
+      dispose: () => {
+        disposed = true;
+      },
+    };
+    const connection = new TerminalConnection(sink, {
+      createAgent: () => Promise.resolve(agent),
+      log: NOOP_LOGGER,
+    });
+    connection.handleLine(HELLO_LINE);
+    connection.handleLine(aiRequestLine("r1"));
+    await settle();
+
+    const outcome = await connection.reloadFromConfig({
+      ...original,
+      model: "test/new",
+    });
+
+    expect(outcome).toBe("switched");
+    expect(model).toBe("test/new");
+    expect(disposed).toBe(false);
+    expect(connection.instanceSnapshot().conversation).toBe(true);
+  });
+
+  it("reloadFromConfig reports a rebuild for non-model changes", async () => {
+    const { sink } = collectingSink();
+    const original: KoshellConfig = {
+      model: "test/old",
+      providers: {},
+    };
+    let disposed = false;
+    const connection = new TerminalConnection(sink, {
+      createAgent: () =>
+        Promise.resolve({
+          modelId: "test/old",
+          configurationFingerprint: configurationFingerprint(original),
+          ask: () => Promise.resolve(),
+          abort: noop,
+          dispose: () => {
+            disposed = true;
+          },
+        }),
+      log: NOOP_LOGGER,
+    });
+    connection.handleLine(HELLO_LINE);
+    connection.handleLine(aiRequestLine("r1"));
+    await settle();
+
+    const outcome = await connection.reloadFromConfig({
+      model: "test/old",
+      thinking_level: "low",
+      providers: {},
+    });
+
+    expect(outcome).toBe("rebuilt");
+    expect(disposed).toBe(true);
+    expect(connection.instanceSnapshot().conversation).toBe(false);
+  });
+
+  it("answers reload_request via the injected reload without building an agent", async () => {
     const { sink, lines } = collectingSink();
     const connection = new TerminalConnection(sink, {
       createAgent: () => {
@@ -880,6 +959,7 @@ describe("TerminalConnection reload and status", () => {
     connection.handleLine(
       JSON.stringify({ type: "reload_request", session_id: "koshell-42" }),
     );
+    await settle();
     expect(types(lines)).toEqual(["reload"]);
     const reply = JSON.parse(lines[0] ?? "{}") as {
       ok: boolean;
@@ -919,5 +999,164 @@ describe("TerminalConnection reload and status", () => {
     };
     expect(reply.known).toBe(true);
     expect(reply.model).toBe("anthropic/claude-sonnet-4-5");
+  });
+});
+
+describe("TerminalConnection model discovery and switching", () => {
+  it("acknowledges model list and returns the injected live catalog", () => {
+    const { sink, lines } = collectingSink();
+    const connection = new TerminalConnection(sink, {
+      createAgent: () => Promise.reject(new Error("unused")),
+      log: NOOP_LOGGER,
+      modelCatalog: (all, query) => ({
+        configured_model: "anthropic/old",
+        entries: [
+          {
+            ref: `${all ? "all" : "ready"}/${query ?? "none"}`,
+            provider: "test",
+            id: "one",
+            name: "Test One",
+            available: true,
+            context_window: 128_000,
+            reasoning: false,
+          },
+        ],
+      }),
+    });
+    connection.handleLine(HELLO_LINE);
+    connection.handleLine(
+      JSON.stringify({
+        type: "model_list",
+        request_id: "m1",
+        all: true,
+        query: "sonnet",
+      }),
+    );
+
+    expect(types(lines)).toEqual(["ack", "model_catalog"]);
+    const reply = JSON.parse(lines[1] ?? "{}") as {
+      configured_model: string;
+      entries: { ref: string }[];
+    };
+    expect(reply.configured_model).toBe("anthropic/old");
+    expect(reply.entries[0]?.ref).toBe("all/sonnet");
+  });
+
+  it("refuses model commands before a matching hello", () => {
+    const { sink, lines } = collectingSink();
+    const connection = new TerminalConnection(sink, {
+      createAgent: () => Promise.reject(new Error("unused")),
+      log: NOOP_LOGGER,
+      modelCatalog: () => ({ entries: [] }),
+    });
+    connection.handleLine(
+      JSON.stringify({ type: "model_list", request_id: "m1", all: false }),
+    );
+    expect(types(lines)).toEqual(["ack", "model_result"]);
+    expect(lines[1]).toContain("hello handshake");
+  });
+
+  it("queues an in-place switch behind an in-flight answer and updates status", async () => {
+    const { sink } = collectingSink();
+    let releaseAsk: (() => void) | undefined;
+    let activeModel = "test/old";
+    const events: string[] = [];
+    const agent: KoshellAgent = {
+      get modelId() {
+        return activeModel;
+      },
+      configurationFingerprint: "same",
+      ask: () =>
+        new Promise((resolve) => {
+          events.push("ask-start");
+          releaseAsk = () => {
+            events.push("ask-end");
+            resolve();
+          };
+        }),
+      setModel: (model) => {
+        events.push(`switch-${model}`);
+        activeModel = model;
+        return Promise.resolve();
+      },
+      abort: noop,
+      dispose: noop,
+    };
+    const connection = new TerminalConnection(sink, {
+      createAgent: () => Promise.resolve(agent),
+      log: NOOP_LOGGER,
+    });
+    connection.handleLine(HELLO_LINE);
+    connection.handleLine(aiRequestLine("r1"));
+    await settle();
+
+    const switched = connection.switchModel("test/new", true);
+    await settle();
+    expect(events).toEqual(["ask-start"]);
+    releaseAsk?.();
+    await switched;
+
+    expect(events).toEqual(["ask-start", "ask-end", "switch-test/new"]);
+    expect(connection.instanceSnapshot().model).toBe("test/new");
+    expect(connection.instanceSnapshot().conversation).toBe(true);
+  });
+
+  it("keeps the FIFO usable after a rejected switch", async () => {
+    const { sink, lines } = collectingSink();
+    const agent: KoshellAgent = {
+      modelId: "test/old",
+      ask: ({ onDelta }) => {
+        onDelta("still works");
+        return Promise.resolve();
+      },
+      setModel: () => Promise.reject(new Error("context too large")),
+      abort: noop,
+      dispose: noop,
+    };
+    const connection = new TerminalConnection(sink, {
+      createAgent: () => Promise.resolve(agent),
+      log: NOOP_LOGGER,
+    });
+    connection.handleLine(HELLO_LINE);
+    connection.handleLine(aiRequestLine("r1"));
+    await settle();
+    let failure: unknown;
+    try {
+      await connection.switchModel("test/small", true);
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toContain("context too large");
+    connection.handleLine(aiRequestLine("r2"));
+    await settle();
+    expect(lines.some((line) => line.includes("still works"))).toBe(true);
+  });
+
+  it("routes model_set through the injected transactional handler", async () => {
+    const { sink, lines } = collectingSink();
+    const connection = new TerminalConnection(sink, {
+      createAgent: () => Promise.reject(new Error("unused")),
+      log: NOOP_LOGGER,
+      modelSet: (message) =>
+        Promise.resolve({
+          ok: true,
+          message: `selected ${message.model}`,
+          configuredModel: message.model,
+        }),
+    });
+    connection.handleLine(HELLO_LINE);
+    connection.handleLine(
+      JSON.stringify({
+        type: "model_set",
+        request_id: "m1",
+        model: "anthropic/new",
+        session_id: "koshell-42",
+        session_only: false,
+      }),
+    );
+    await settle();
+    expect(types(lines)).toEqual(["ack", "model_result"]);
+    expect(lines[1]).toContain('"configured_model":"anthropic/new"');
   });
 });

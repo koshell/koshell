@@ -9,8 +9,8 @@
 //! `--` allows a program whose name starts with a dash. Unknown dashed arguments before
 //! the program are rejected so the option namespace stays reserved for future flags.
 //!
-//! `shell-init`, `daemon`, `auth`, `preflight`, `status`, and `reload` shadow programs
-//! literally named that; launching such a program requires a path form (for example
+//! `shell-init`, `daemon`, `auth`, `model`, `preflight`, `status`, and `reload` shadow
+//! programs literally named that; launching such a program requires a path form (for example
 //! `koshell ./shell-init` or `koshell ./daemon`). Accepted residual of reserving the names.
 
 use clap::{Parser, Subcommand};
@@ -69,6 +69,18 @@ pub enum Command {
         action: AuthAction,
     },
 
+    /// Discover, inspect, and select the AI model. With no action, opens a
+    /// searchable interactive picker.
+    Model {
+        /// Change only the current conversation, leaving koshell.toml unchanged.
+        /// Requires a live conversation inside Koshell.
+        #[arg(long)]
+        session_only: bool,
+
+        #[command(subcommand)]
+        action: Option<ModelAction>,
+    },
+
     /// Report the current koshell instance's state: its daemon connection,
     /// conversation, and active model, plus a daemon summary. Run inside a
     /// koshell shell.
@@ -119,6 +131,29 @@ pub enum AuthAction {
     Status {
         /// Provider id to report on; omit for all.
         provider: Option<String>,
+    },
+}
+
+/// Actions for `koshell model`; omitting one opens the interactive picker.
+#[derive(Debug, Subcommand, PartialEq, Eq)]
+pub enum ModelAction {
+    /// Show the configured default and this conversation's active model.
+    Show,
+    /// List credential-available models, optionally filtered by a query.
+    List {
+        /// Include models whose credentials are not currently available.
+        #[arg(long)]
+        all: bool,
+        /// Search provider id, model id, and display name.
+        query: Option<String>,
+    },
+    /// Select a validated provider/id without opening the picker.
+    Set {
+        /// Model reference as provider/id.
+        model: String,
+        /// Change only the current conversation, leaving koshell.toml unchanged.
+        #[arg(long)]
+        session_only: bool,
     },
 }
 
@@ -341,5 +376,69 @@ mod tests {
         // A path spelling still launches a real program of that name.
         let cli = parse(&["./auth", "status"]).unwrap();
         assert_eq!(launch(&cli), ["./auth", "status"]);
+    }
+
+    #[test]
+    fn model_picker_and_actions_parse() {
+        assert_eq!(
+            parse(&["model"]).unwrap().command,
+            Some(Command::Model {
+                session_only: false,
+                action: None,
+            })
+        );
+        assert_eq!(
+            parse(&["model", "--session-only"]).unwrap().command,
+            Some(Command::Model {
+                session_only: true,
+                action: None,
+            })
+        );
+        assert_eq!(
+            parse(&["model", "show"]).unwrap().command,
+            Some(Command::Model {
+                session_only: false,
+                action: Some(ModelAction::Show),
+            })
+        );
+        assert_eq!(
+            parse(&["model", "list", "--all", "sonnet"])
+                .unwrap()
+                .command,
+            Some(Command::Model {
+                session_only: false,
+                action: Some(ModelAction::List {
+                    all: true,
+                    query: Some("sonnet".to_string()),
+                }),
+            })
+        );
+        assert_eq!(
+            parse(&[
+                "model",
+                "set",
+                "openrouter/anthropic/claude",
+                "--session-only",
+            ])
+            .unwrap()
+            .command,
+            Some(Command::Model {
+                session_only: false,
+                action: Some(ModelAction::Set {
+                    model: "openrouter/anthropic/claude".to_string(),
+                    session_only: true,
+                }),
+            })
+        );
+    }
+
+    #[test]
+    fn a_program_named_model_needs_a_path_form() {
+        assert!(matches!(
+            parse(&["model", "show"]).unwrap().command,
+            Some(Command::Model { .. })
+        ));
+        let cli = parse(&["./model", "show"]).unwrap();
+        assert_eq!(launch(&cli), ["./model", "show"]);
     }
 }

@@ -23,7 +23,7 @@ import {
 
 type RegisterProviderConfig = Parameters<ModelRegistry["registerProvider"]>[1];
 type PiModelConfig = NonNullable<RegisterProviderConfig["models"]>[number];
-type PiModel = NonNullable<ReturnType<ModelRegistry["find"]>>;
+export type PiModel = NonNullable<ReturnType<ModelRegistry["find"]>>;
 
 export interface ResolvedProvider {
   authStorage: AuthStorage;
@@ -146,7 +146,7 @@ export const ENV_KEY_HINTS: Record<string, readonly string[]> = {
 // providers with a login flow (derived from pi's live OAuth registry) offer
 // `koshell auth login`; everything else points at api_key and the provider's
 // env-var convention.
-function credentialsHint(provider: string): string {
+export function credentialsHint(provider: string): string {
   if (provider === "amazon-bedrock") {
     return "configure AWS credentials (AWS_PROFILE, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or AWS_BEARER_TOKEN_BEDROCK).";
   }
@@ -166,51 +166,67 @@ function credentialsHint(provider: string): string {
   return `set providers.${provider}.api_key in the config, or export the provider's API key environment variable${login}.`;
 }
 
-// Builds the auth/model objects and resolves the single active model. Throws
-// ConfigError when the model is unknown or has no configured credentials.
-// `authStorage` defaults to Koshell's persistent store so `koshell auth login`
-// credentials apply; tests inject AuthStorage.inMemory(). Reading the store is
-// best-effort: a corrupt auth.json degrades to "no credentials" and its read
-// error is appended to that ConfigError instead of failing resolution outright.
-export function resolveProvider(
-  config: KoshellConfig,
+// Builds the live registry from pi's builtin catalog plus valid custom provider
+// definitions. Discovery uses this independently of whether a default model has
+// been configured yet.
+export function buildModelRegistry(
+  config: KoshellConfig | undefined,
   authStorage: AuthStorage = openAuthStorage(),
-): ResolvedProvider {
-  const storeErrors = authStorage.drainErrors();
+): ModelRegistry {
   const modelRegistry = ModelRegistry.inMemory(authStorage);
-
-  for (const [name, provider] of Object.entries(config.providers)) {
+  for (const [name, provider] of Object.entries(config?.providers ?? {})) {
     applyProvider(modelRegistry, name, provider);
   }
+  return modelRegistry;
+}
 
-  const { provider, id } = splitModelRef(config.model);
+// Resolves and credential-checks one provider/id against a prepared registry.
+export function resolveModel(
+  modelRegistry: ModelRegistry,
+  ref: string,
+  storeErrors: readonly Error[] = [],
+): PiModel {
+  const { provider, id } = splitModelRef(ref);
   const model = modelRegistry.find(provider, id);
   if (model === undefined) {
     const providers = knownProviderIds(modelRegistry);
     if (!providers.includes(provider)) {
       throw new ConfigError(
-        `unknown provider "${provider}" in model "${config.model}". Known providers: ${providers.join(", ")}. A custom provider needs a [providers.${provider}] block with api, base_url, api_key, and models.`,
+        `unknown provider "${provider}" in model "${ref}". Known providers: ${providers.join(", ")}. A custom provider needs a [providers.${provider}] block with api, base_url, api_key, and models.`,
       );
     }
     const ids = modelRegistry
       .getAll()
-      .filter((m) => m.provider === provider)
-      .map((m) => m.id);
+      .filter((candidate) => candidate.provider === provider)
+      .map((candidate) => candidate.id);
     const shown = ids.slice(0, MODEL_SUGGESTION_LIMIT);
     const rest = ids.length - shown.length;
     throw new ConfigError(
-      `unknown model "${config.model}": provider "${provider}" has no model "${id}". Available models: ${shown.join(", ")}${rest > 0 ? `, and ${String(rest)} more` : ""}.`,
+      `unknown model "${ref}": provider "${provider}" has no model "${id}". Available models: ${shown.join(", ")}${rest > 0 ? `, and ${String(rest)} more` : ""}.`,
     );
   }
   if (!modelRegistry.hasConfiguredAuth(model)) {
     const storeNote =
       storeErrors.length > 0
-        ? ` (note: reading the credential store failed: ${storeErrors.map((e) => e.message).join("; ")})`
+        ? ` (note: reading the credential store failed: ${storeErrors.map((error) => error.message).join("; ")})`
         : "";
     throw new ConfigError(
-      `no credentials for provider "${provider}": ${credentialsHint(provider)}${storeNote}`,
+      `no credentials for provider "${provider}": ${credentialsHint(provider)} If you exported a key after the daemon started, run \`koshell daemon restart\`.${storeNote}`,
     );
   }
+  return model;
+}
+
+// Builds the auth/model objects and resolves the configured default model.
+// Reading the store is best-effort: a corrupt auth.json degrades to "no
+// credentials" and its read error is appended to that ConfigError.
+export function resolveProvider(
+  config: KoshellConfig,
+  authStorage: AuthStorage = openAuthStorage(),
+): ResolvedProvider {
+  const storeErrors = authStorage.drainErrors();
+  const modelRegistry = buildModelRegistry(config, authStorage);
+  const model = resolveModel(modelRegistry, config.model, storeErrors);
 
   return {
     authStorage,

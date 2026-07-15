@@ -1,4 +1,4 @@
-.TH KOSHELL 1 "2026-07-08" "koshell 0.1.0" "Koshell Manual"
+.TH KOSHELL 1 "2026-07-12" "koshell 0.1.0" "Koshell Manual"
 .SH NAME
 koshell \- human-centric shared terminal: AI beside your terminal, not above it
 .SH SYNOPSIS
@@ -22,6 +22,19 @@ koshell \- human-centric shared terminal: AI beside your terminal, not above it
 .B koshell auth
 .BR login | logout | status
 .RI [ provider ]
+.br
+.B koshell model
+.RB [ \-\-session-only ]
+.br
+.B koshell model show
+.br
+.B koshell model list
+.RB [ \-\-all ]
+.RI [ query ]
+.br
+.B koshell model set
+.RB [ \-\-session-only ]
+.I provider/id
 .br
 .B koshell status
 .br
@@ -134,6 +147,42 @@ API-key providers do not need
 see
 .BR koshell.toml (5).
 .TP
+.B model \fR[\fB\-\-session-only\fR]
+Open a searchable interactive picker over the daemon's live pi model catalog.
+By default the picker shows only models with credentials available to the
+running daemon; type to filter provider id, model id, or display name, use the
+arrow keys to move, Enter to select, and Esc or Ctrl-C to cancel.
+Inside koshell, selection switches the current conversation in place and also
+saves the model as the default for future conversations.
+.B \-\-session-only
+switches only the current conversation and leaves
+.I koshell.toml
+unchanged; it requires a live conversation.
+Outside koshell, selection changes only the future default.
+.TP
+.B model show
+Show the configured default model and, when run inside koshell, the current
+conversation's active model.
+.TP
+.B model list \fR[\fB\-\-all\fR] [\fIquery\fR]
+List credential-available models in a script-friendly table.
+.B \-\-all
+includes the full catalog and marks entries without credentials.
+The optional query searches provider id, model id, and display name.
+.TP
+.B model set \fR[\fB\-\-session-only\fR] \fIprovider/id\fR
+Validate and select a model without opening the picker.
+The default and
+.B \-\-session-only
+scope are the same as bare
+.BR model .
+Persistent changes alter only the root
+.B model
+value with a locked, source-preserving atomic replacement.
+A live switch waits behind an in-progress answer and retains the conversation;
+it is rejected if the retained history cannot safely fit the target model's
+context window.
+.TP
 .B status
 Report the current koshell instance's state: its daemon connection, whether
 a conversation exists, the active model, and the working directory, plus a
@@ -144,14 +193,15 @@ shell; it identifies the instance through
 .B reload \fR[\fB\-\-all\fR]
 Re-read
 .I koshell.toml
-and apply it to live sessions. By default only the current instance's
-conversation is reset, so its next
-.B #?
-uses the new config (the in-progress conversation is discarded);
+and apply it to live sessions. By default only the current instance is
+targeted;
 .B \-\-all
-resets every active instance. The new config is validated first: if it is
-invalid, nothing changes and every session keeps its previous configuration.
-Does not start the daemon.
+targets every active instance. A model-only change is applied in place after
+an in-progress answer and preserves the transcript. Provider, credential,
+thinking-level, or other agent-construction changes rebuild the affected agent
+and explicitly report that its in-memory transcript was discarded. The new
+config is validated first: if it is invalid, nothing changes and every session
+keeps its previous configuration. Does not start the daemon.
 .TP
 .I program \fR[\fIargs\fR...]
 Any other leading positional launches that program in the PTY instead of
@@ -166,6 +216,7 @@ The names
 .BR preflight ,
 .BR daemon ,
 .BR auth ,
+.BR model ,
 .BR status ,
 and
 .B reload
@@ -255,9 +306,10 @@ is the wrapped controlling terminal (present only once koshell has branded the
 child pts; absent in the coarse fallback). Its presence is the public "am I
 inside koshell" signal; koshell uses the fields to refuse a same-terminal nested
 launch and to let
-.B koshell status
+.BR "koshell status" ,
+.BR "koshell reload" ,
 and
-.B koshell reload
+.B koshell model
 address the current instance's daemon connection. Not meant to be set by hand.
 .TP
 .BR XDG_CONFIG_HOME ", " XDG_STATE_HOME ", " XDG_DATA_HOME ", " XDG_RUNTIME_DIR ", " XDG_CACHE_HOME
@@ -319,5 +371,8 @@ propagates the wrapped program's exit code faithfully, including
 signal-death codes.
 .B koshell preflight
 exits 0 only when koshell is ready to start.
+.B koshell model set
+exits 0 only when selection succeeds; cancellation of the interactive picker
+exits 0 without changing state.
 .SH SEE ALSO
 .BR koshell.toml (5)

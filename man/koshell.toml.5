@@ -1,4 +1,4 @@
-.TH KOSHELL.TOML 5 "2026-07-08" "koshell 0.1.0" "Koshell Manual"
+.TH KOSHELL.TOML 5 "2026-07-12" "koshell 0.1.0" "Koshell Manual"
 .SH NAME
 koshell.toml \- koshell AI provider and model configuration
 .SH SYNOPSIS
@@ -14,10 +14,11 @@ Koshell owns this configuration namespace end to end: nothing outside this
 file (and the documented environment-variable fallback for builtin
 providers) is consulted.
 .PP
-The config selects exactly one active model.
-There is no runtime model switching; the file is read when a conversation
-is created, so editing it takes effect on the next conversation (a new
-terminal), with no reload mechanism.
+The config selects exactly one default model for new conversations, and each
+live conversation has exactly one active model at any instant.
+.B koshell model
+can change a conversation's active model in place while preserving its
+transcript, independently of whether the default is also updated.
 .PP
 A missing or invalid config never breaks the terminal: it keeps working as
 a plain shell wrapper, and
@@ -41,11 +42,56 @@ The provider part is either a builtin provider name or the name of a
 custom
 .B [providers.NAME]
 block below.
+The value can be selected interactively with
+.BR "koshell model" ,
+listed with
+.BR "koshell model list" ,
+or set non-interactively with
+.BR "koshell model set provider/id" .
 .TP
 .B thinking_level
 Optional reasoning effort for models that support it.
 One of
 .BR off ", " minimal ", " low ", " medium ", " high ", " xhigh .
+.SH MODEL SELECTION
+.B koshell model
+opens a searchable picker over the daemon's live pi catalog and the custom
+models declared in this file.
+By default it shows only models for which the running daemon can resolve
+credentials;
+.B koshell model list --all
+shows the full catalog and marks unavailable entries.
+.PP
+Inside a koshell shell, selection changes the current conversation in place
+and saves the same choice as the default in this file.
+.B --session-only
+changes only the current conversation and leaves the file byte-for-byte
+unchanged.
+Outside koshell, selection can only update the future default.
+Other live terminal conversations are not changed.
+.PP
+A persistent selection changes only the root
+.B model
+assignment through a lock and same-directory atomic replacement.
+Comments, ordering, custom provider blocks, formatting, credentials, and
+existing permission bits are retained; a new file is mode 0600.
+A failed or cancelled selection changes neither the active model nor the file.
+.PP
+A runtime switch waits for an in-progress answer and preserves all transcript
+messages. If the retained history plus a bounded response reserve cannot fit
+the target context window, koshell rejects the switch rather than silently
+dropping or summarizing history.
+.PP
+Provider environment variables are inherited when the daemon starts. If a key
+was exported afterward, run
+.B koshell daemon restart
+before discovery; restarting still loses memory-only conversations.
+After manually editing this file, run
+.B koshell reload
+(or
+.BR "koshell reload --all" ).
+A model-only reload preserves transcripts; other agent-construction changes
+may rebuild the agent and report that its in-memory transcript was discarded.
 .SH PROVIDERS
 A
 .B [providers.NAME]
@@ -227,7 +273,9 @@ the shell profile.
 An absent file, a TOML parse error, a schema violation, an unknown model
 reference, or missing credentials all surface as an inline
 .B #?
-error with guidance on what to fix.
+error with guidance on what to fix. A missing file specifically points at
+.B koshell model
+for interactive setup.
 Koshell never falls back to another provider or model.
 .SH EXAMPLES
 Minimal config, key from the environment
