@@ -774,9 +774,10 @@ fn dispatch_trigger(
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead, BufReader};
-    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::os::unix::net::UnixListener;
     use std::sync::mpsc;
     use std::thread;
+    use std::time::Duration;
 
     use koshell_proto::ClientMessage;
 
@@ -802,8 +803,7 @@ mod tests {
         }
     }
 
-    fn read_line(stream: &UnixStream) -> String {
-        let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+    fn read_line(reader: &mut impl BufRead) -> String {
         let mut line = String::new();
         reader.read_line(&mut line).expect("read line");
         line
@@ -827,8 +827,9 @@ mod tests {
         let path_for_l1 = path.clone();
         let t1 = thread::spawn(move || {
             let (conn, _) = l1.accept().expect("accept l1");
-            let _ = read_line(&conn); // hello
-            drop(conn);
+            let mut reader = BufReader::new(conn);
+            let _ = read_line(&mut reader); // hello
+            drop(reader);
             drop(l1);
             let _ = std::fs::remove_file(&path_for_l1);
             closed_tx.send(()).expect("signal closed");
@@ -842,7 +843,9 @@ mod tests {
         // Establish the connection to the first daemon, then let it die.
         connect_daemon(&mut ipc_client, &mut spawner, &path, &meta, &tx);
         assert!(ipc_client.is_some(), "connected to the first daemon");
-        closed_rx.recv().expect("first daemon closed");
+        closed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first daemon closed");
         t1.join().expect("join t1");
 
         // Second daemon: a fresh listener at the same path (the restart). It must
@@ -851,8 +854,11 @@ mod tests {
         let (got_tx, got_rx) = mpsc::channel();
         let t2 = thread::spawn(move || {
             let (conn, _) = l2.accept().expect("accept l2");
-            let hello = read_line(&conn);
-            let request = read_line(&conn);
+            // Keep one buffered reader for the connection. Recreating it per line can
+            // discard a request prefetched alongside the hello from the socket.
+            let mut reader = BufReader::new(conn);
+            let hello = read_line(&mut reader);
+            let request = read_line(&mut reader);
             got_tx.send((hello, request)).expect("forward request");
         });
 
@@ -860,7 +866,9 @@ mod tests {
         let sent = send_request(&mut ipc_client, &mut spawner, &path, &meta, &tx, &request);
         assert!(sent, "the request must be delivered on the reconnect");
 
-        let (hello, request_line) = got_rx.recv().expect("second daemon received");
+        let (hello, request_line) = got_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second daemon received");
         assert!(hello.contains("\"type\":\"hello\""), "hello: {hello}");
         assert!(
             request_line.contains("\"type\":\"ai_request\"")
