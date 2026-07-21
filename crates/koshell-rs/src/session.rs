@@ -284,13 +284,15 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
         presentation.set_event_log(event_log_proc.clone());
         let mut request_seq: u64 = 0;
         loop {
-            // Trigger deadlines (receipt notice, stabilization tier, max-wait) and
-            // presentation deadlines (waiting notice, buffered-output max hold) bound
-            // the channel wait; with nothing pending, block until the next message.
+            // Trigger deadlines (receipt notice, stabilization tier, max-wait),
+            // presentation deadlines (waiting notice, buffered-output max hold), and the
+            // idle timeline-maintenance tick bound the channel wait; with nothing
+            // pending and an empty timeline, block until the next message.
             let wait_from = Instant::now();
             let timeout = [
                 state.next_deadline(wait_from),
                 presentation.next_deadline(wait_from),
+                state.next_maintenance_delay(wait_from),
             ]
             .into_iter()
             .flatten()

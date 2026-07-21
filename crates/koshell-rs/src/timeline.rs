@@ -1,7 +1,8 @@
 //! Bounded in-memory terminal timeline, ported from `reference/src/timeline.ts`. Pure
 //! data plus queries; no I/O. Events are appended in order, but a long-lived session is
-//! kept bounded by age-tiered snapshot downsampling and a recent-character budget for
-//! raw text (see [`InMemoryTimelineStore`] and `fix-0007-timeline-memory-retention.md`).
+//! kept bounded by age-tiered snapshot downsampling, a hard snapshot byte cap, and a
+//! recent-character budget for raw text (see [`InMemoryTimelineStore`],
+//! `fix-0007-timeline-memory-retention.md`, and `fix-0009-burst-snapshot-retention.md`).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -99,13 +100,20 @@ struct RetentionTier {
 /// coarse multi-scale history instead of every per-second repaint bounds memory to a
 /// few MB while preserving a browsable visual timeline.
 ///
+/// The freshest band has a floor spacing rather than "keep all": a snapshot is recorded
+/// per PTY read chunk, so fast output produces hundreds of full-screen snapshots per
+/// second and an uncapped fresh band ballooned to gigabytes within its first minute
+/// (observed at a 2.3 GB peak; see `fix-0009-burst-snapshot-retention.md`). 200 ms
+/// keeps the last minute far denser than any current consumer reads (`context.rs` uses
+/// the latest snapshot and the last ~20 changed ones) while bounding a burst.
+///
 /// In-memory only — nothing here is ever written to disk, upholding the privacy
 /// invariant of `design-0007-dogfooding-event-log.md`.
 const SNAPSHOT_TIERS: &[RetentionTier] = &[
     RetentionTier {
         max_age_ms: 60_000,
-        min_spacing_ms: 0,
-    }, // <= 1 min: keep all
+        min_spacing_ms: 200,
+    }, // <= 1 min: 1 / 200ms
     RetentionTier {
         max_age_ms: 300_000,
         min_spacing_ms: 5_000,
@@ -149,10 +157,27 @@ const RAW_TEXT_RETENTION_CHARS: usize = 32_000;
 /// pass so it does not run on every `record`.
 const COMPACT_EVERY: usize = 256;
 
+/// Hard cap on the total retained snapshot screen text, enforced unconditionally by
+/// compaction — newest snapshots first, dropping the oldest past the budget even when
+/// their age tier would keep them. The age tiers bound realistic retention to a few MB;
+/// this budget is the defense-in-depth guarantee that no tier-policy change or
+/// pathological workload can hold more than a fixed number of bytes. At the observed
+/// ~14 KB per full-screen snapshot it admits roughly 2 300 snapshots. Overshoot between
+/// compaction passes is at most [`COMPACT_EVERY`] events' worth (a few MB).
+const SNAPSHOT_RETENTION_BYTES: usize = 32 * 1024 * 1024;
+
+/// `entries` keeps its peak capacity across `Vec::retain`, so a compacted-away burst
+/// left the Vec's allocation pinned at burst size (36 MB observed). Compaction shrinks
+/// the Vec when it is at least this large and at most a quarter full; the threshold
+/// keeps the steady state free of realloc churn.
+const SHRINK_MIN_CAPACITY: usize = 1024;
+
 /// In-memory, bounded terminal timeline store with an injectable clock. Screen
-/// snapshots are downsampled by age ([`SNAPSHOT_TIERS`]); raw-text events are held to a
-/// recent-character budget ([`RAW_TEXT_RETENTION_CHARS`]); everything else ages out at
-/// [`MAX_AGE_MS`]. Compaction runs every [`COMPACT_EVERY`] records.
+/// snapshots are downsampled by age ([`SNAPSHOT_TIERS`]) under a hard byte cap
+/// ([`SNAPSHOT_RETENTION_BYTES`]); raw-text events are held to a recent-character
+/// budget ([`RAW_TEXT_RETENTION_CHARS`]); everything else ages out at [`MAX_AGE_MS`].
+/// Compaction runs every [`COMPACT_EVERY`] records, plus on the session loop's idle
+/// [`Self::maintain`] tick.
 pub struct InMemoryTimelineStore {
     entries: Vec<TimelineEntry>,
     now: Clock,
@@ -217,6 +242,7 @@ impl InMemoryTimelineStore {
         // Decide keep/drop newest-first; `keep[i]` mirrors `entries[i]`.
         let mut keep = vec![false; self.entries.len()];
         let mut last_snapshot_ts: Option<i64> = None;
+        let mut snapshot_budget = SNAPSHOT_RETENTION_BYTES;
         let mut pty_budget = RAW_TEXT_RETENTION_CHARS;
         let mut visible_budget = RAW_TEXT_RETENTION_CHARS;
         let mut input_budget = RAW_TEXT_RETENTION_CHARS;
@@ -224,8 +250,16 @@ impl InMemoryTimelineStore {
         for (idx, entry) in self.entries.iter().enumerate().rev() {
             let age = now.saturating_sub(entry.ts);
             keep[idx] = match &entry.event {
-                TerminalEvent::ScreenSnapshot { .. } => {
+                TerminalEvent::ScreenSnapshot { screen, .. } => {
+                    // The byte budget applies after the age tiers and saturates like the
+                    // raw-text budgets (the straddling snapshot is kept, so the newest
+                    // snapshot always survives); once it runs out, every older snapshot
+                    // is dropped regardless of tier.
                     keep_snapshot(age, entry.ts, &mut last_snapshot_ts)
+                        && take_from_budget(
+                            &mut snapshot_budget,
+                            screen.as_ref().map_or(0, |s| s.len()),
+                        )
                 }
                 TerminalEvent::PtyOutput { data } => {
                     take_from_budget(&mut pty_budget, data.chars().count())
@@ -251,6 +285,23 @@ impl InMemoryTimelineStore {
             idx += 1;
             keep_this
         });
+
+        // `retain` never returns capacity, so a burst's peak allocation would stay
+        // pinned for the session's lifetime once the entries age out.
+        if self.entries.capacity() >= SHRINK_MIN_CAPACITY
+            && self.entries.len() <= self.entries.capacity() / 4
+        {
+            self.entries.shrink_to_fit();
+        }
+    }
+
+    /// Re-applies the retention policy outside the record-driven cadence. Compaction
+    /// otherwise runs only inside [`Self::record`], so a burst followed by silence kept
+    /// its freshest-band snapshots forever (the ~400 MB idle instance of
+    /// `investigation-0002-burst-snapshot-retention-on-idle.md`). The session loop calls
+    /// this from a periodic idle tick so retained entries keep aging out.
+    pub fn maintain(&mut self) {
+        self.compact();
     }
 
     pub fn list_entries(&self) -> &[TimelineEntry] {
@@ -526,6 +577,91 @@ mod tests {
         );
         // The recent-window query is still fully served.
         assert_eq!(timeline.get_recent_pty_output(8_000).chars().count(), 8_000);
+    }
+
+    #[test]
+    fn thins_a_fast_burst_in_the_freshest_band() {
+        let (mut timeline, clock) = clocked();
+        // 40 seconds of one snapshot per 20 ms — a fast-output burst, 2000 raw
+        // snapshots, all inside the freshest band at compaction time.
+        for i in 0..2_000_i64 {
+            clock.store(i * 20, Ordering::SeqCst);
+            timeline.record(snapshot(&format!("s{i}"), 24, false, "x"));
+        }
+        timeline.compact();
+
+        // The 200 ms floor spacing bounds the burst to ~5 snapshots per second.
+        let count = snapshot_count(&timeline);
+        assert!(
+            (150..=210).contains(&count),
+            "a 2000-snapshot burst thins to ~200, got {count}"
+        );
+    }
+
+    #[test]
+    fn caps_retained_snapshot_bytes_even_when_the_tiers_keep_them() {
+        let (mut timeline, clock) = clocked();
+        // 50 seconds of 400 KB snapshots spaced 250 ms apart: the freshest band keeps
+        // all 200 (spacing clears the floor), but their 80 MB exceeds the byte cap.
+        let screen = "x".repeat(400_000);
+        for i in 0..200_i64 {
+            clock.store(i * 250, Ordering::SeqCst);
+            timeline.record(snapshot(&format!("s{i}"), 24, false, &screen));
+        }
+        timeline.compact();
+
+        let snapshots = timeline.list_screen_snapshots();
+        let ids: Vec<&str> = snapshots
+            .iter()
+            .filter_map(|e| match &e.event {
+                TerminalEvent::ScreenSnapshot { snapshot_id, .. } => Some(snapshot_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let retained_bytes: usize = snapshots
+            .iter()
+            .map(|e| match &e.event {
+                TerminalEvent::ScreenSnapshot { screen, .. } => {
+                    screen.as_ref().map_or(0, |s| s.len())
+                }
+                _ => 0,
+            })
+            .sum();
+
+        // At most the budget plus the one straddling snapshot; newest kept, oldest gone.
+        assert!(
+            retained_bytes <= SNAPSHOT_RETENTION_BYTES + 400_000,
+            "retained {retained_bytes} bytes"
+        );
+        assert!(snapshots.len() < 200, "dropped some, kept {}", ids.len());
+        assert!(ids.contains(&"s199"), "newest snapshot survives");
+        assert!(!ids.contains(&"s0"), "oldest snapshot is dropped");
+    }
+
+    #[test]
+    fn shrinks_pathological_entry_capacity_after_a_purge() {
+        let (mut timeline, clock) = clocked();
+        clock.store(1_000, Ordering::SeqCst);
+        // 3000 one-char output events all fit the raw-text char budget, so the entries
+        // Vec legitimately grows past the shrink threshold.
+        for _ in 0..3_000 {
+            timeline.record(TerminalEvent::PtyOutput {
+                data: "a".to_string(),
+            });
+        }
+        assert!(timeline.entries.capacity() >= SHRINK_MIN_CAPACITY);
+
+        // One budget-sized burst obsoletes the tail; the purge must return capacity.
+        timeline.record(TerminalEvent::PtyOutput {
+            data: "b".repeat(RAW_TEXT_RETENTION_CHARS),
+        });
+        timeline.compact();
+        assert!(timeline.list_entries().len() < 100);
+        assert!(
+            timeline.entries.capacity() < SHRINK_MIN_CAPACITY,
+            "capacity released after the purge, got {}",
+            timeline.entries.capacity()
+        );
     }
 
     #[test]

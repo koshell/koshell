@@ -65,6 +65,13 @@ const RECEIPT_NOTICE_DELAY: Duration = Duration::from_secs(1);
 /// A resting line longer than this never counts as prompt-like or short.
 const PROMPT_LIKE_MAX_CHARS: usize = 40;
 
+/// How often the timeline retention policy is re-applied while the session is otherwise
+/// idle. Record-driven compaction stops with the output that drives it, so a burst
+/// followed by silence used to keep its freshest-band snapshots resident forever (see
+/// `fix-0009-burst-snapshot-retention.md`). The tick is a once-a-minute O(entries) pass
+/// over a bounded store; it stops entirely once the timeline is empty.
+const TIMELINE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Characters that commonly end a prompt (`$`, `#`, `>`, `%`, `:`), plus interactive
 /// question/confirmation tails. Shapes only — no learned prompt templates.
 const PROMPT_TAIL_CHARS: &[char] = &['$', '#', '%', '>', ':', '?', '❯', '»', '›'];
@@ -229,6 +236,9 @@ pub struct SessionState {
     /// Dogfooding event log (design 0007); inert by default, so tests and callers
     /// that never inject one log nothing.
     event_log: EventLog,
+    /// When the idle timeline-maintenance pass last ran (see
+    /// [`TIMELINE_MAINTENANCE_INTERVAL`]).
+    last_timeline_maintenance: Instant,
 }
 
 impl SessionState {
@@ -246,6 +256,7 @@ impl SessionState {
             captured_since_output: false,
             span_settled: false,
             event_log: EventLog::default(),
+            last_timeline_maintenance: Instant::now(),
         }
     }
 
@@ -377,6 +388,23 @@ impl SessionState {
         self.record_snapshot();
     }
 
+    /// The delay until the next idle timeline-maintenance pass, or `None` when the
+    /// timeline is empty (nothing left to age out, so the session loop can block
+    /// indefinitely). Unlike [`Self::next_deadline`], this is not suspended on the
+    /// alternate screen — full-screen repaint-heavy programs are exactly the workloads
+    /// whose snapshots must keep aging out.
+    pub fn next_maintenance_delay(&self, now: Instant) -> Option<Duration> {
+        if self.timeline.list_entries().is_empty() {
+            return None;
+        }
+        let deadline = self.last_timeline_maintenance + TIMELINE_MAINTENANCE_INTERVAL;
+        Some(
+            deadline
+                .saturating_duration_since(now)
+                .max(Duration::from_millis(1)),
+        )
+    }
+
     /// The delay until the nearest pending-question deadline (receipt notice,
     /// stabilization tier, or max-wait), or `None` when there is nothing to wait for.
     /// Deadlines are suspended on the alternate screen; leaving it produces output,
@@ -413,6 +441,15 @@ impl SessionState {
     /// Applies time-based transitions: stabilization and max-wait fires, then receipt
     /// notices for questions that stay pending. Suspended on the alternate screen.
     pub fn poll(&mut self, now: Instant) -> Vec<Action> {
+        // Timeline maintenance runs before the pending/alt-screen early return: it is
+        // due precisely when nothing else is happening, and alt-screen sessions are the
+        // snapshot-heaviest.
+        if now.saturating_duration_since(self.last_timeline_maintenance)
+            >= TIMELINE_MAINTENANCE_INTERVAL
+        {
+            self.timeline.maintain();
+            self.last_timeline_maintenance = now;
+        }
         if self.pending.is_empty() || self.mirror.is_alt_screen() {
             return Vec::new();
         }
@@ -1138,6 +1175,30 @@ mod tests {
         state.record_output(b"\x1b[?1049l", t0 + Duration::from_secs(61));
         assert!(state.has_pending());
         assert!(state.next_deadline(t0 + Duration::from_secs(61)).is_some());
+    }
+
+    #[test]
+    fn maintenance_ticks_only_while_the_timeline_has_entries_and_reschedules_on_poll() {
+        let mut state = SessionState::new(80, 24, true);
+        let t0 = Instant::now();
+        // An empty timeline needs no maintenance wake-ups: the loop may block forever.
+        assert!(state.next_maintenance_delay(t0).is_none());
+
+        // Any recorded event arms the tick, due within one interval.
+        state.record_output(b"hello", t0);
+        let delay = state.next_maintenance_delay(t0).expect("tick armed");
+        assert!(delay <= TIMELINE_MAINTENANCE_INTERVAL);
+
+        // Overdue, the delay clamps to an immediate wake-up; poll() runs the pass
+        // (also on the alternate screen) and schedules the next tick an interval out.
+        let overdue = t0 + TIMELINE_MAINTENANCE_INTERVAL + Duration::from_secs(1);
+        assert_eq!(
+            state.next_maintenance_delay(overdue),
+            Some(Duration::from_millis(1))
+        );
+        state.poll(overdue);
+        let rescheduled = state.next_maintenance_delay(overdue).expect("still armed");
+        assert!(rescheduled >= TIMELINE_MAINTENANCE_INTERVAL - Duration::from_secs(1));
     }
 
     #[test]

@@ -135,7 +135,10 @@ activity-proportional growth that is never released:
   thousands of snapshots (tens of MB) before they age out and thin. This is
   transient and self-limiting; realistic workloads (a ~1 Hz `btop` repaint) sit
   at ~60. Add a floor spacing to the freshest band only if a real workload shows
-  a problematic spike.
+  a problematic spike. **Resolved by fix-0009**: a real workload showed a 2.3 GB
+  spike, and "transient" proved false for a burst followed by silence (record-
+  driven compaction never ran again). See
+  `fix-0009-burst-snapshot-retention.md`.
 - **The coarse multi-day tail has no consumer yet.** Context assembly
   (`context.rs`) only reads the recent window, so the ≤ 7-day snapshot history
   is currently forward-looking — retained for a future "what happened across
