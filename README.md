@@ -2,6 +2,8 @@
 
 Koshell is a human-centric shared terminal: AI beside your terminal, not above it.
 
+Website: [koshell.ai](https://koshell.ai)
+
 The project keeps the human as the primary terminal operator while giving AI enough
 shared terminal context to explain, diagnose, and assist — without turning the terminal
 into a separate chat room or an agent-owned execution loop. When the terminal raises a
