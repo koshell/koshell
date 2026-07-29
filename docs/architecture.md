@@ -36,6 +36,12 @@ terminal operator while AI assists from beside the shell.
     an idle compaction tick, so a long-lived session stays bounded even after an output
     burst goes quiet; see `fix-0007-timeline-memory-retention.md` and
     `fix-0009-burst-snapshot-retention.md`) and local terminal context;
+  - the bounded completed-command index: one stable id spans each real
+    `command_start`/`command_end` pair, marker-clean bytes between them are retained
+    per command (10 commands, 1 MiB each, 4 MiB per session, recent tail kept, every
+    omission reported), and the read-only tools serve it over the IPC round trip. It is
+    separate from the timeline and shares only the command id (see
+    `design-0020-completed-command-output-tools.md`);
   - shell integration (temporary rc files emitting OSC command-boundary markers) and
     `#?` trigger detection — the marker layer owns `#?` at the integrated shell prompt
     (start markers carry the full typed line, `command_end` is authoritative);
@@ -61,11 +67,21 @@ terminal operator while AI assists from beside the shell.
   existing AgentSession without losing messages. The read-only terminal tool loop is not
   wired yet, so each request
   relies on a bounded context package pushed by the terminal.
+  Koshell-owned custom tools are assembled per conversation from what the config
+  actually enables (`tools.ts`): with none the session keeps pi's `noTools: "all"`, and
+  with any it uses `noTools: "builtin"` so pi's own file, shell, edit, and write tools
+  stay disabled. The first occupant is `web_search`, backed by a dedicated search API
+  because pi's tool abstraction cannot carry a provider-native server tool and ships no
+  MCP client — see `design-0019-web-search-tool.md`. The static system prompt is built
+  to match the session's real tool set, so it never denies a capability the session has
+  or advertises one it lacks.
 
 ## Dependency boundaries
 
 - Terminal-core (Rust) must not depend on any LLM provider or the pi packages.
-- Provider/model/auth and the pi agent session live only in the AI daemon.
+- Provider/model/auth, the pi agent session, and the custom-tool catalog live only in
+  the AI daemon. `tools.ts` is the single place a Koshell capability becomes a pi tool,
+  so the observe-only boundary is auditable from one array.
 - The daemon's source uses `node:` APIs only; Bun is its runtime and packager, not an
   API surface, so the runtime choice stays reversible.
 - The two runtimes communicate only through `koshell-proto` messages.
@@ -86,20 +102,33 @@ crate docs and `design-0004-ipc-version-enforcement.md`).
 
 Messages (see `crates/koshell-proto`):
 
-- Terminal → daemon: `hello`, `ai_request` (carries the assembled context package),
-  `ai_cancel` (best-effort withdrawal after a user interrupt; see
-  `design-0006-interrupting-ai-responses.md`), auth request/prompt messages, model
-  list/show/set requests, instance status/reload requests, `tool_response` (reserved), and
-  `bye`.
-- Daemon → terminal: `ack`, then per AI request zero or more `ai_delta` chunks followed by
-  exactly one of `ai_response_end` or `ai_error` (a cancelled request still gets its
-  terminal marker); auth flow/status replies; model catalog/state/result replies; and
-  instance status/reload replies. `ai_tool_call` is reserved for the tool round-trip
-  stage.
+- Terminal → daemon: `hello` (carrying an optional capability list), `ai_request`
+  (carries the assembled context package), `ai_cancel` (best-effort withdrawal after a
+  user interrupt; see `design-0006-interrupting-ai-responses.md`), `tool_response`
+  (settles exactly one `ai_tool_call`), auth request/prompt messages, model
+  list/show/set requests, instance status/reload requests, and `bye`.
+- Daemon → terminal: `ack`, then per AI request zero or more `ai_delta` chunks,
+  `ai_tool_activity` lines, and `ai_tool_call`s, followed by exactly one of
+  `ai_response_end` or `ai_error` (a cancelled request still gets its terminal marker);
+  auth flow/status replies; model catalog/state/result replies; and instance
+  status/reload replies.
+
+`ai_tool_activity` is what makes the tool loop visible: the daemon announces every tool
+call — including `web_search`, which it serves itself and which therefore produces no
+other terminal-bound message — and the terminal renders it as a dim line so the user can
+watch the work and decide whether to interrupt. It carries ready-to-render display text
+rather than a code the terminal formats, so a new tool needs no matching terminal
+release (see `design-0021-visible-tool-activity.md`).
+
+The terminal advertises `command_output_tools_v1` in its `hello`, and the daemon
+registers terminal-backed tools only for connections that did — so a new daemon with an
+old terminal stays push-only rather than issuing calls that can never be answered, and a
+new terminal with an old daemon has its extra field ignored. Neither direction needs a
+version bump (see `design-0020-completed-command-output-tools.md`).
 
 ## Implementation status
 
-Status updated: 2026-07-12 09:07 CST +0800.
+Status updated: 2026-07-28 15:55 CST +0800.
 
 The current stage delivers the full Rust terminal-core and a pi-backed AI daemon: `#?`
 requests reach one FIFO-serialized conversation per terminal session and answers stream
@@ -112,12 +141,24 @@ the stabilization-based design of `design-0001-repl-command-completion.md`, incl
 pending-trigger interaction and Ctrl+C cancellation. Response presentation implements
 bounded stream/block separation and anchored streaming.
 
-Two dogfooding gaps remain on the core context path:
+The custom-tool seam is open: a conversation registers Koshell-owned pi tools from what
+`koshell.toml` enables, with pi's builtins still disabled. The optional `[search]` block
+adds a `web_search` tool (`design-0019-web-search-tool.md`). The terminal-side tool round
+trip is a separate, still-unimplemented path — see the first gap below.
 
-- Context is push-only. When command output exceeds the bounded pushed window, the agent
-  cannot retrieve older off-screen output; a real observed case left it with only the
-  current screen. The reserved `ai_tool_call` / `tool_response` round trip and read-only
-  terminal tool catalog are not implemented.
+The pull arm of the context contract is implemented for completed shell commands: the
+terminal keeps a bounded per-command output index, advertises it in the pushed
+`koshell_ai_context_v2` inventory, and serves `list_recent_commands` /
+`read_command_output` over the `ai_tool_call` / `tool_response` round trip, gated on the
+`command_output_tools_v1` hello capability. Output that has scrolled off the screen is
+therefore reachable — see `design-0020-completed-command-output-tools.md`.
+
+One dogfooding gap remains on the core context path, and the pull arm is deliberately
+narrow:
+
+- The catalog covers completed integrated-shell commands only. A still-running span,
+  REPL statements, commands typed over SSH, non-integrated shells, screen snapshots,
+  timeline ranges, and previous-question anchors are still not retrievable.
 - Conversations live only in daemon memory. Model selection and model-only reload now
   preserve the active transcript, but a provider/credential/thinking configuration
   rebuild, terminal disconnect, or daemon restart still has no transcript to resume.

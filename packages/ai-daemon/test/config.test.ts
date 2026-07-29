@@ -126,6 +126,113 @@ describe("loadConfig", () => {
   });
 });
 
+describe("[search]", () => {
+  it("is optional", () => {
+    expect(
+      loadConfig(write('model = "anthropic/claude-sonnet-4-5"')).search,
+    ).toBe(undefined);
+  });
+
+  it("accepts a backend with a key and defaults max_results", () => {
+    const config = loadConfig(
+      write(
+        [
+          'model = "anthropic/claude-sonnet-4-5"',
+          "",
+          "[search]",
+          'provider = "exa"',
+          'api_key = "exa-key"',
+        ].join("\n"),
+      ),
+    );
+    expect(config.search).toEqual({
+      provider: "exa",
+      api_key: "exa-key",
+      max_results: 5,
+    });
+  });
+
+  it("accepts a backend without a key, leaving it to the env var", () => {
+    const config = loadConfig(
+      write(
+        [
+          'model = "anthropic/claude-sonnet-4-5"',
+          "",
+          "[search]",
+          'provider = "exa"',
+        ].join("\n"),
+      ),
+    );
+    expect(config.search?.provider).toBe("exa");
+    expect(config.search?.api_key).toBe(undefined);
+  });
+
+  it("rejects an unknown backend at the config boundary", () => {
+    expect(() =>
+      loadConfig(
+        write(
+          [
+            'model = "anthropic/claude-sonnet-4-5"',
+            "",
+            "[search]",
+            'provider = "google"',
+          ].join("\n"),
+        ),
+      ),
+    ).toThrow(/search\.provider/);
+  });
+
+  // Tavily and Brave adapters were removed before shipping: never run against a live
+  // API, so they carried a supported integration's weight while proving nothing.
+  // Naming one is a config error, not a silently accepted value.
+  it("rejects a backend that was removed", () => {
+    expect(() =>
+      loadConfig(
+        write(
+          [
+            'model = "anthropic/claude-sonnet-4-5"',
+            "",
+            "[search]",
+            'provider = "brave"',
+          ].join("\n"),
+        ),
+      ),
+    ).toThrow(/search\.provider/);
+  });
+
+  it("rejects an unknown key in the block", () => {
+    expect(() =>
+      loadConfig(
+        write(
+          [
+            'model = "anthropic/claude-sonnet-4-5"',
+            "",
+            "[search]",
+            'provider = "exa"',
+            'endpoint = "https://example.test"',
+          ].join("\n"),
+        ),
+      ),
+    ).toThrow(ConfigError);
+  });
+
+  it("bounds max_results", () => {
+    expect(() =>
+      loadConfig(
+        write(
+          [
+            'model = "anthropic/claude-sonnet-4-5"',
+            "",
+            "[search]",
+            'provider = "exa"',
+            "max_results = 50",
+          ].join("\n"),
+        ),
+      ),
+    ).toThrow(/max_results/);
+  });
+});
+
 describe("resolveConfigPath", () => {
   it("honors XDG_CONFIG_HOME", () => {
     expect(resolveConfigPath()).toContain(join("koshell", "koshell.toml"));

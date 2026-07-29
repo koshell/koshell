@@ -52,6 +52,12 @@ pub struct TerminalContext {
     pub alt_screen: bool,
     pub primary_text: String,
     pub primary_source: PrimarySource,
+    /// Whether the chosen primary text lost its beginning to the size budget.
+    ///
+    /// Context fields are trimmed from the start, so without this the agent cannot
+    /// distinguish "this is the whole output" from "the beginning is missing" — and
+    /// that distinction is exactly what decides whether it should pull older evidence.
+    pub primary_text_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_screen: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -68,6 +74,13 @@ pub struct TerminalContextOptions {
     pub recent_visible_output_max_characters: Option<usize>,
     pub current_screen_max_characters: Option<usize>,
     pub recent_screen_changes_limit: Option<usize>,
+}
+
+/// Trims from the start to `max` characters, reporting whether anything was cut.
+fn trim_reporting(text: &str, max: usize) -> (String, bool) {
+    let trimmed = trim_start_to_max_characters(text, max);
+    let truncated = trimmed.chars().count() < text.chars().count();
+    (trimmed, truncated)
 }
 
 /// Fields extracted from the latest screen snapshot event.
@@ -109,30 +122,35 @@ pub fn build_terminal_context(
             .recent_input_max_characters
             .unwrap_or(DEFAULT_RECENT_INPUT_MAX_CHARACTERS),
     );
-    let recent_visible_output = get_recent_visible_output(
+    let (recent_visible_output, visible_output_truncated) = get_recent_visible_output(
         timeline,
         options
             .recent_visible_output_max_characters
             .unwrap_or(DEFAULT_RECENT_VISIBLE_OUTPUT_MAX_CHARACTERS),
     );
-    let recent_pty_output = timeline.get_recent_pty_output(
-        options
-            .recent_pty_output_max_characters
-            .unwrap_or(DEFAULT_RECENT_PTY_OUTPUT_MAX_CHARACTERS),
-    );
+    // The timeline's own recent-text budget already bounds this, so a full result here
+    // is itself evidence that older output exists outside the window.
+    let pty_budget = options
+        .recent_pty_output_max_characters
+        .unwrap_or(DEFAULT_RECENT_PTY_OUTPUT_MAX_CHARACTERS);
+    let recent_pty_output = timeline.get_recent_pty_output(pty_budget);
+    let pty_output_truncated = recent_pty_output.chars().count() >= pty_budget;
 
+    let mut screen_truncated = false;
     let current_screen = latest.as_ref().and_then(|snapshot| {
         snapshot
             .screen
             .as_deref()
             .filter(|s| !s.is_empty())
             .map(|s| {
-                trim_start_to_max_characters(
+                let (text, truncated) = trim_reporting(
                     s,
                     options
                         .current_screen_max_characters
                         .unwrap_or(DEFAULT_CURRENT_SCREEN_MAX_CHARACTERS),
-                )
+                );
+                screen_truncated = truncated;
+                text
             })
     });
 
@@ -151,6 +169,13 @@ pub fn build_terminal_context(
         &recent_pty_output,
     );
 
+    let primary_text_truncated = match primary_source {
+        PrimarySource::ScreenSnapshot => screen_truncated,
+        PrimarySource::VisibleOutput => visible_output_truncated,
+        PrimarySource::PtyOutput => pty_output_truncated,
+        PrimarySource::Empty => false,
+    };
+
     TerminalContext {
         recent_input,
         recent_pty_output,
@@ -159,6 +184,7 @@ pub fn build_terminal_context(
         alt_screen,
         primary_text,
         primary_source,
+        primary_text_truncated,
         current_screen,
         screen_rows: latest.as_ref().map(|s| s.rows),
         screen_columns: latest.as_ref().map(|s| s.columns),
@@ -176,7 +202,7 @@ fn get_recent_input(timeline: &InMemoryTimelineStore, max: usize) -> String {
     trim_start_to_max_characters(&text, max)
 }
 
-fn get_recent_visible_output(timeline: &InMemoryTimelineStore, max: usize) -> String {
+fn get_recent_visible_output(timeline: &InMemoryTimelineStore, max: usize) -> (String, bool) {
     let text: String = timeline
         .list_events()
         .filter_map(|event| match event {
@@ -184,7 +210,7 @@ fn get_recent_visible_output(timeline: &InMemoryTimelineStore, max: usize) -> St
             _ => None,
         })
         .collect();
-    trim_start_to_max_characters(&text, max)
+    trim_reporting(&text, max)
 }
 
 fn get_recent_screen_changes(

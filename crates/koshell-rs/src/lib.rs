@@ -3,6 +3,8 @@
 
 pub mod auth_cli;
 pub mod cli;
+pub mod command_history;
+pub mod command_tools;
 pub mod context;
 pub mod daemon_cli;
 pub mod daemon_spawn;

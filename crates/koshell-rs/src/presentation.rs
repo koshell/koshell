@@ -139,6 +139,11 @@ struct ActiveResponse {
     degrade_reason: Option<&'static str>,
     degrade_emitted: bool,
     mid_stream_input_chunks: u32,
+    /// Tool calls started and failed during this response (design 0021). Counted
+    /// per response so "did this answer use tools, and did the user interrupt it"
+    /// is one `response_end` line rather than a join across the log.
+    tool_calls: u32,
+    tool_failures: u32,
 }
 
 impl ActiveResponse {
@@ -162,6 +167,8 @@ impl ActiveResponse {
             degrade_reason: None,
             degrade_emitted: false,
             mid_stream_input_chunks: 0,
+            tool_calls: 0,
+            tool_failures: 0,
         }
     }
 
@@ -180,6 +187,8 @@ impl ActiveResponse {
             began_anchored: self.began_anchored,
             degraded_to_block: self.degrade_reason.is_some(),
             mid_stream_input_chunks: self.mid_stream_input_chunks,
+            tool_calls: self.tool_calls,
+            tool_failures: self.tool_failures,
         }
     }
 
@@ -194,6 +203,13 @@ impl ActiveResponse {
     /// rather than giving up (design 0010).
     fn holding_pty(&self) -> bool {
         self.mode == Mode::Stream && !self.anchored
+    }
+
+    /// True once the response is late enough that held command output must be
+    /// reported. The notice itself is conditional on output actually being held: a
+    /// slow answer that holds nothing says nothing.
+    fn stall_deadline_passed(&self, now: Instant) -> bool {
+        !self.stall_notice_shown && now >= self.dispatched_at + STALL_NOTICE_DELAY
     }
 }
 
@@ -281,6 +297,20 @@ fn release_held_block<W: Write>(
     if active.started {
         active.resume_header_pending = true;
     }
+}
+
+/// Reports that command output is held behind a stalled answer and that Ctrl+C
+/// releases it (design 0010). Fires at most once per response, and only while output
+/// is actually held — the invariant is that a hung daemon cannot hold command output
+/// *silently*, not that every slow answer is announced twice.
+fn stall_notice<W: Write>(active: &mut ActiveResponse, out: &mut W, state: &mut SessionState) {
+    active.stall_notice_shown = true;
+    active.receipt_shown = true;
+    notice(
+        "still no answer — press Ctrl+C to stop the AI and release the held command output",
+        out,
+        state,
+    );
 }
 
 /// Appends the erase sequence for a live region: bottom-up from the cursor row to
@@ -563,6 +593,11 @@ impl Presentation {
                     state,
                     now,
                 );
+            } else if active.stall_deadline_passed(now) {
+                // The stall deadline passed while nothing was held, so `poll` stayed
+                // silent (design 0010 revision). Output arriving now is the first thing
+                // actually held, and the invariant is that held output is never silent.
+                stall_notice(active, out, state);
             }
             return;
         }
@@ -579,11 +614,15 @@ impl Presentation {
         if !active.receipt_shown && active.nothing_rendered() {
             next = Some(active.dispatched_at + RECEIPT_NOTICE_DELAY);
         }
-        // Once the stall notice has fired the hold no longer runs on a clock — the
-        // fuse is event-driven, so a PTY message is what wakes the loop next.
+        // Once the stall deadline is reached the hold no longer runs on a clock — the
+        // fuse and the stall notice are both event-driven from there, so a PTY message
+        // is what wakes the loop next. Scheduling a deadline already in the past would
+        // spin the processor on a zero-length wait.
         if active.holding_pty() && !active.stall_notice_shown {
             let stall = active.dispatched_at + STALL_NOTICE_DELAY;
-            next = Some(next.map_or(stall, |n| n.min(stall)));
+            if stall > now {
+                next = Some(next.map_or(stall, |n| n.min(stall)));
+            }
         }
         next.map(|deadline| deadline.saturating_duration_since(now))
     }
@@ -608,19 +647,15 @@ impl Presentation {
         }
         // Stall notice (design 0010): the answer is late but the held output is not
         // force-flushed — the user decides when to release it with Ctrl+C, so the
-        // answer and command output never mix on their own.
+        // answer and command output never mix on their own. It fires only when output
+        // is actually held; a slow answer that holds nothing needs no notice, because
+        // the waiting notice above already said the answer is pending and Ctrl+C
+        // already stops it.
         if active.holding_pty()
-            && !active.stall_notice_shown
-            && now >= active.dispatched_at + STALL_NOTICE_DELAY
+            && active.stall_deadline_passed(now)
+            && !active.buffered_pty.is_empty()
         {
-            active.stall_notice_shown = true;
-            active.receipt_shown = true;
-            let message = if active.buffered_pty.is_empty() {
-                "still no answer — press Ctrl+C to stop waiting for the AI"
-            } else {
-                "still no answer — press Ctrl+C to stop the AI and release the held command output"
-            };
-            notice(message, out, state);
+            stall_notice(active, out, state);
         }
     }
 
@@ -647,11 +682,83 @@ impl Presentation {
             } => {
                 self.finish(request_id, Some(message), out, state, now);
             }
+            ServerMessage::AiToolActivity {
+                request_id,
+                tool_name,
+                phase,
+                message,
+            } => {
+                self.on_tool_activity(request_id, tool_name, phase, message, out, state);
+            }
             // The interactive session never sends a status_request or an auth
             // request, so their replies are not expected here; ignore them (and
             // any future additive message types) defensively.
             _ => {}
         }
+    }
+
+    /// Renders one tool-activity line, so the user can see what the AI is doing
+    /// while it does it and interrupt if it is not what they wanted.
+    ///
+    /// The line is a seam in the answer, and the design 0010 rule applies: the answer
+    /// and anything else stay in separate labeled blocks. Both stream paths therefore
+    /// arrange for the resumed answer to be relabeled rather than continuing as if
+    /// nothing had been printed between.
+    ///
+    /// This is also the terminal's only sighting of a daemon-served tool — `web_search`
+    /// reaches it no other way — so every announcement is logged, including the ones
+    /// that render nothing.
+    fn on_tool_activity<W: Write>(
+        &mut self,
+        request_id: &str,
+        tool_name: &str,
+        phase: &str,
+        message: &str,
+        out: &mut W,
+        state: &mut SessionState,
+    ) {
+        // A locally aborted request keeps rendering nothing, exactly like its deltas;
+        // an unknown id is a stale reply. Both are still recorded: an announcement the
+        // user never saw because they had just interrupted is precisely the case the
+        // dogfooding question is about.
+        let mut rendered = false;
+        if !self.aborted.contains(request_id)
+            && let Some(active) = self.active.as_mut()
+            && active.request_id == request_id
+        {
+            // An unrecognized future phase counts as neither, so a later `progress`
+            // phase cannot silently inflate the call count.
+            match phase {
+                "started" => active.tool_calls += 1,
+                "failed" => active.tool_failures += 1,
+                _ => {}
+            }
+            // Showing the work *is* the receipt: the delayed "waiting for the AI answer"
+            // notice would only repeat what this line already says.
+            active.receipt_shown = true;
+
+            if active.anchored {
+                notice_above_live(message, out, state);
+                // The row above the live region is now this notice, not the AI tail, so
+                // the resume point is gone. Dropping it makes the next delta reprint the
+                // `[koshell ai]` header and start a fresh block below the notice, instead
+                // of failing the tail check and degrading the rest of the answer to one
+                // block at the end.
+                active.ai_end = None;
+            } else {
+                notice(message, out, state);
+                if active.started {
+                    active.resume_header_pending = true;
+                }
+            }
+            rendered = true;
+        }
+        self.event_log.emit(Event::ToolActivity {
+            request_id: request_id.to_string(),
+            tool_name: crate::event_log::identifier(tool_name),
+            phase: crate::event_log::identifier(phase),
+            rendered,
+        });
     }
 
     fn on_delta<W: Write>(
@@ -837,6 +944,24 @@ mod tests {
         ServerMessage::AiDelta {
             request_id: request_id.to_string(),
             delta: text.to_string(),
+        }
+    }
+
+    fn tool_activity(request_id: &str, message: &str) -> ServerMessage {
+        tool_activity_of(request_id, "web_search", "started", message)
+    }
+
+    fn tool_activity_of(
+        request_id: &str,
+        tool_name: &str,
+        phase: &str,
+        message: &str,
+    ) -> ServerMessage {
+        ServerMessage::AiToolActivity {
+            request_id: request_id.to_string(),
+            tool_name: tool_name.to_string(),
+            phase: phase.to_string(),
+            message: message.to_string(),
         }
     }
 
@@ -1090,6 +1215,211 @@ mod tests {
             text.ends_with("$ typed"),
             "the held output flushes on interrupt: {text:?}"
         );
+    }
+
+    // Tool work used to be invisible: web_search runs entirely inside the daemon, and
+    // the command readers were intercepted before presentation. The user could not
+    // tell a slow lookup from a hung daemon, which is exactly the moment they need to
+    // decide whether to press Ctrl+C.
+    #[test]
+    fn tool_activity_is_shown_before_the_answer_arrives() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.handle_server_message(
+            &tool_activity("r1", "searching the web (exa): homebrew shallow clone"),
+            &mut out,
+            &mut state,
+            now,
+        );
+
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(
+            text.contains("searching the web (exa): homebrew shallow clone"),
+            "the tool line names what the AI is doing: {text:?}"
+        );
+        assert!(
+            text.contains("[koshell]"),
+            "the tool line is self-identifying: {text:?}"
+        );
+
+        // Showing the work is the receipt; the waiting notice must not also fire.
+        let waited = now + RECEIPT_NOTICE_DELAY + Duration::from_millis(10);
+        let before = String::from_utf8_lossy(&out).to_string();
+        presentation.poll(waited, &mut out, &mut state);
+        assert_eq!(
+            String::from_utf8_lossy(&out).to_string(),
+            before,
+            "the tool line already told the user the answer is pending"
+        );
+    }
+
+    // Design 0010's rule applies to this seam like any other: the answer and
+    // everything else stay in separate labeled blocks.
+    #[test]
+    fn a_mid_answer_tool_line_relabels_the_resumed_answer() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.handle_server_message(&delta("r1", "Checking"), &mut out, &mut state, now);
+        presentation.handle_server_message(
+            &tool_activity("r1", "looking up your recent commands"),
+            &mut out,
+            &mut state,
+            now,
+        );
+        presentation.handle_server_message(&delta("r1", "Found it."), &mut out, &mut state, now);
+
+        let text = String::from_utf8_lossy(&out).to_string();
+        let header_count = text.matches("[koshell ai]").count();
+        assert_eq!(
+            header_count, 2,
+            "the answer resumes under a fresh header after the tool line: {text:?}"
+        );
+        let tool_at = text
+            .find("looking up your recent commands")
+            .expect("tool line");
+        let resumed_at = text.find("Found it.").expect("resumed answer");
+        assert!(
+            tool_at < resumed_at,
+            "the tool line precedes the resumption"
+        );
+    }
+
+    // On the anchored path the row above the live region is the AI tail, and the
+    // tail check degrades the response when something else takes that row. Dropping
+    // the resume point instead re-anchors cleanly, so using a tool does not cost the
+    // rest of the answer its streaming.
+    #[test]
+    fn an_anchored_tool_line_re_anchors_instead_of_degrading() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        let setup = b"2\r\n>>> ";
+        state.record_output(setup, now);
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.handle_server_message(&delta("r1", "Looking"), &mut out, &mut state, now);
+        presentation.handle_server_message(
+            &tool_activity("r1", "searching the web (exa): brew error"),
+            &mut out,
+            &mut state,
+            now,
+        );
+        presentation.handle_server_message(&delta("r1", "Answer."), &mut out, &mut state, now);
+        presentation.handle_server_message(&end("r1"), &mut out, &mut state, now);
+
+        let (screen, _) = replay_screen(80, setup, &out);
+        assert!(
+            screen.contains("searching the web (exa): brew error"),
+            "the tool line is on screen: {screen:?}"
+        );
+        assert!(
+            screen.contains("Answer."),
+            "the answer continued after the tool line: {screen:?}"
+        );
+        // The live prompt is still the last line: the answer stayed anchored above it
+        // rather than degrading into one block appended at the end.
+        assert!(
+            screen.trim_end().ends_with(">>>"),
+            "the live prompt remains the last line: {screen:?}"
+        );
+    }
+
+    #[test]
+    fn tool_activity_for_an_interrupted_request_renders_nothing() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.handle_server_message(&delta("r1", "Working"), &mut out, &mut state, now);
+        presentation.user_interrupt(&mut out, &mut state, now);
+        let before = String::from_utf8_lossy(&out).to_string();
+
+        presentation.handle_server_message(
+            &tool_activity("r1", "searching the web (exa): late"),
+            &mut out,
+            &mut state,
+            now,
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out).to_string(),
+            before,
+            "a withdrawn request renders no further tool lines"
+        );
+    }
+
+    #[test]
+    fn tool_activity_for_an_unknown_request_renders_nothing() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.handle_server_message(
+            &tool_activity("r2", "stale activity"),
+            &mut out,
+            &mut state,
+            now,
+        );
+        assert!(out.is_empty(), "a stale request id renders nothing");
+    }
+
+    #[test]
+    fn a_stalled_answer_holding_nothing_stays_silent() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        presentation.note_dispatch("r1", false, &state, now);
+
+        // The one-second waiting notice still fires: the answer is pending.
+        let waited = now + RECEIPT_NOTICE_DELAY + Duration::from_millis(10);
+        presentation.poll(waited, &mut out, &mut state);
+        let waiting = String::from_utf8_lossy(&out).to_string();
+        assert!(waiting.contains("waiting for the AI answer"));
+
+        // At the stall deadline nothing is held, so there is nothing to report.
+        let stalled = now + STALL_NOTICE_DELAY + Duration::from_millis(10);
+        presentation.poll(stalled, &mut out, &mut state);
+        assert_eq!(
+            String::from_utf8_lossy(&out).to_string(),
+            waiting,
+            "a slow answer that holds no command output prints no stall notice"
+        );
+        assert!(
+            presentation.next_deadline(stalled).is_none(),
+            "the passed deadline is not rescheduled onto a zero-length wait"
+        );
+
+        // Output arriving after the deadline is the first thing actually held, and
+        // held output is never silent (design 0010).
+        presentation.pty_output(b"$ ", &mut out, &mut state, stalled);
+        let text = String::from_utf8_lossy(&out).to_string();
+        assert!(
+            text.contains("press Ctrl+C"),
+            "late held output still reports itself: {text:?}"
+        );
+        assert!(
+            !text.contains("$ "),
+            "reporting the hold does not flush it: {text:?}"
+        );
+
+        // And it fires at most once.
+        let before = String::from_utf8_lossy(&out).to_string();
+        presentation.pty_output(b"more", &mut out, &mut state, stalled);
+        assert_eq!(String::from_utf8_lossy(&out).to_string(), before);
     }
 
     #[test]
@@ -1493,6 +1823,7 @@ mod tests {
                 command: Some("python3".to_string()),
                 exit_code: None,
                 cwd: None,
+                executed: true,
             },
             now,
         );
@@ -1832,5 +2163,154 @@ mod tests {
         let events = drain_events(&rx);
         assert_eq!(events.last().unwrap()["event"], "response_end");
         assert_eq!(events.last().unwrap()["mid_stream_input_chunks"], 0);
+    }
+
+    // "How often does the agent pull, and does the user interrupt when it does"
+    // is only answerable if every announcement is recorded — including the ones
+    // for tools the daemon serves itself, which reach the terminal no other way.
+    #[test]
+    fn tool_activity_is_logged_and_counted_on_the_response_end() {
+        let (log, rx) = EventLog::capture();
+        let mut presentation = Presentation::new();
+        presentation.set_event_log(log);
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.handle_server_message(
+            &tool_activity_of(
+                "r1",
+                "web_search",
+                "started",
+                "searching the web (exa): brew",
+            ),
+            &mut out,
+            &mut state,
+            now,
+        );
+        presentation.handle_server_message(
+            &tool_activity_of("r1", "web_search", "failed", "web search failed (timeout)"),
+            &mut out,
+            &mut state,
+            now,
+        );
+        presentation.handle_server_message(
+            &tool_activity_of(
+                "r1",
+                "list_recent_commands",
+                "started",
+                "looking up your recent commands",
+            ),
+            &mut out,
+            &mut state,
+            now,
+        );
+        presentation.handle_server_message(&delta("r1", "Answer."), &mut out, &mut state, now);
+        presentation.handle_server_message(&end("r1"), &mut out, &mut state, now);
+
+        let events = drain_events(&rx);
+        let activity: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|event| event["event"] == "tool_activity")
+            .collect();
+        assert_eq!(
+            activity.len(),
+            3,
+            "every announcement is logged: {events:?}"
+        );
+        assert_eq!(activity[0]["tool_name"], "web_search");
+        assert_eq!(activity[0]["phase"], "started");
+        assert_eq!(activity[0]["rendered"], true);
+        assert_eq!(activity[1]["phase"], "failed");
+        assert_eq!(activity[2]["tool_name"], "list_recent_commands");
+
+        let end_event = events.last().unwrap();
+        assert_eq!(end_event["event"], "response_end");
+        // Failures are counted apart from calls, so a retried search is not read
+        // as two separate pulls.
+        assert_eq!(end_event["tool_calls"], 2);
+        assert_eq!(end_event["tool_failures"], 1);
+    }
+
+    #[test]
+    fn a_response_without_tools_reports_zero() {
+        let (log, rx) = EventLog::capture();
+        let mut presentation = Presentation::new();
+        presentation.set_event_log(log);
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.handle_server_message(
+            &delta("r1", "Straight answer."),
+            &mut out,
+            &mut state,
+            now,
+        );
+        presentation.handle_server_message(&end("r1"), &mut out, &mut state, now);
+
+        let end_event = drain_events(&rx).pop().expect("response_end");
+        assert_eq!(end_event["tool_calls"], 0);
+        assert_eq!(end_event["tool_failures"], 0);
+    }
+
+    // The interrupted-mid-call case is the whole point of the metric, so it must be
+    // recorded even though nothing was drawn for it.
+    #[test]
+    fn a_tool_call_the_user_never_saw_is_still_logged() {
+        let (log, rx) = EventLog::capture();
+        let mut presentation = Presentation::new();
+        presentation.set_event_log(log);
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.handle_server_message(&delta("r1", "Working"), &mut out, &mut state, now);
+        presentation.user_interrupt(&mut out, &mut state, now);
+        let after_interrupt = out.len();
+        presentation.handle_server_message(
+            &tool_activity("r1", "searching the web (exa): late"),
+            &mut out,
+            &mut state,
+            now,
+        );
+
+        assert_eq!(
+            out.len(),
+            after_interrupt,
+            "a withdrawn request draws nothing"
+        );
+        let logged = drain_events(&rx)
+            .pop()
+            .expect("the activity is still recorded");
+        assert_eq!(logged["event"], "tool_activity");
+        assert_eq!(logged["rendered"], false);
+    }
+
+    // The tool name and phase arrive over the socket; the log is not a channel for
+    // whatever they happen to contain.
+    #[test]
+    fn a_tool_name_that_is_not_an_identifier_is_bounded_before_it_is_logged() {
+        let (log, rx) = EventLog::capture();
+        let mut presentation = Presentation::new();
+        presentation.set_event_log(log);
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.handle_server_message(
+            &tool_activity_of("r1", "cat /home/me/.ssh/id_rsa", "Started!", "running"),
+            &mut out,
+            &mut state,
+            now,
+        );
+
+        let logged = drain_events(&rx).pop().expect("one activity event");
+        assert_eq!(logged["tool_name"], "other");
+        assert_eq!(logged["phase"], "other");
     }
 }

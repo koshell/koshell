@@ -5,7 +5,8 @@
 //! Privacy invariant: the event structs have no field that could carry screen
 //! content or PTY bytes. The only free-text fields in the schema are the
 //! question the user typed after `#?`, the request id, and the shell program
-//! path; everything else is an enum tag, a flag, a count, or a duration.
+//! path; everything else is an enum tag, a flag, a count, a duration, or a
+//! bounded identifier (see [`identifier`]).
 //!
 //! Writes are fail-silent: if the file cannot be opened or a write fails, the
 //! log degrades to inert (one warning in the debug log) and the shell is never
@@ -85,7 +86,55 @@ pub enum Event {
         began_anchored: bool,
         degraded_to_block: bool,
         mid_stream_input_chunks: u32,
+        tool_calls: u32,
+        tool_failures: u32,
     },
+    /// One tool call announced by the daemon (design 0021). This is the only
+    /// record of the tools the daemon serves itself — `web_search` never reaches
+    /// the terminal any other way — so it is what makes "how often does the agent
+    /// pull" measurable at all. `rendered` is false when the line was suppressed
+    /// (a request the user already withdrew, or a stale id), which is exactly the
+    /// interrupted-mid-call case worth counting rather than dropping.
+    ToolActivity {
+        request_id: String,
+        tool_name: String,
+        phase: String,
+        rendered: bool,
+    },
+    /// One tool call the terminal served locally (design 0020): the command
+    /// readers only, with the outcome and how long the read took. Microseconds,
+    /// because this is an in-memory read on the processor thread — a millisecond
+    /// field would record zero and hide a regression.
+    ToolCall {
+        request_id: String,
+        tool_name: String,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        duration_us: u64,
+    },
+}
+
+/// Bounds a tool name, phase, or error code before it reaches the log.
+///
+/// These values arrive over the socket, so they are the first fields in the
+/// schema the terminal does not author itself. The privacy invariant is
+/// structural, and it stays that way by construction: anything that is not a
+/// short lowercase identifier is recorded as `other` rather than written
+/// through. A daemon that grows a new tool still logs its name; a malformed or
+/// oversized value can carry nothing.
+pub fn identifier(value: &str) -> String {
+    const MAX: usize = 32;
+    let usable = !value.is_empty()
+        && value.len() <= MAX
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+    if usable {
+        value.to_string()
+    } else {
+        "other".to_string()
+    }
 }
 
 /// The envelope every line carries: wall-clock epoch milliseconds stamped at
@@ -267,6 +316,8 @@ mod tests {
             began_anchored: true,
             degraded_to_block: false,
             mid_stream_input_chunks: 2,
+            tool_calls: 3,
+            tool_failures: 1,
         });
         let value: serde_json::Value =
             serde_json::from_str(&rx.recv().expect("one line")).expect("valid JSON");
@@ -279,5 +330,47 @@ mod tests {
         assert_eq!(value["began_anchored"], true);
         assert_eq!(value["degraded_to_block"], false);
         assert_eq!(value["mid_stream_input_chunks"], 2);
+        assert_eq!(value["tool_calls"], 3);
+        assert_eq!(value["tool_failures"], 1);
+    }
+
+    #[test]
+    fn a_successful_tool_call_carries_no_error_code() {
+        let (log, rx) = EventLog::capture();
+        log.emit(Event::ToolCall {
+            request_id: "koshell-req-1".to_string(),
+            tool_name: "read_command_output".to_string(),
+            ok: true,
+            code: None,
+            duration_us: 42,
+        });
+        let value: serde_json::Value =
+            serde_json::from_str(&rx.recv().expect("one line")).expect("valid JSON");
+        assert_eq!(value["event"], "tool_call");
+        assert_eq!(value["tool_name"], "read_command_output");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["duration_us"], 42);
+        assert!(value.get("code").is_none(), "no failure, no code: {value}");
+    }
+
+    // The tool name and phase are the first schema fields the terminal does not
+    // author, so the log must not widen into a channel for whatever arrives.
+    #[test]
+    fn a_wire_identifier_that_is_not_a_short_lowercase_name_becomes_other() {
+        assert_eq!(identifier("web_search"), "web_search");
+        assert_eq!(identifier("started"), "started");
+        assert_eq!(identifier("read_command_output"), "read_command_output");
+
+        for hostile in [
+            "",
+            "Web Search",
+            "error: /home/me/.ssh/id_rsa not found",
+            "tool-1",
+            "ls\r\nrm -rf /",
+            "webséarch",
+            &"a".repeat(33),
+        ] {
+            assert_eq!(identifier(hostile), "other", "for {hostile:?}");
+        }
     }
 }

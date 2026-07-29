@@ -257,6 +257,152 @@ describe("parseClientMessage", () => {
   });
 });
 
+describe("capability negotiation and tool round trip", () => {
+  const hello = (extra: Record<string, unknown>) =>
+    JSON.stringify({
+      type: "hello",
+      protocol_version: 1,
+      terminal_session_id: "koshell-42",
+      cwd: "/tmp",
+      shell: "/bin/zsh",
+      rows: 24,
+      cols: 80,
+      ...extra,
+    });
+
+  it("parses an advertised capability list", () => {
+    const message = parseClientMessage(
+      hello({ capabilities: ["command_output_tools_v1"] }),
+    );
+    expect(message).toMatchObject({
+      type: "hello",
+      capabilities: ["command_output_tools_v1"],
+    });
+  });
+
+  // An older terminal sends no list at all; that must mean "no capabilities",
+  // not a rejected handshake.
+  it("treats a hello without capabilities as capability-free", () => {
+    const message = parseClientMessage(hello({}));
+    expect(message?.type).toBe("hello");
+    expect(
+      message !== null && message.type === "hello" ? message.capabilities : "x",
+    ).toBeUndefined();
+  });
+
+  // The hello shape is frozen: a capability list this daemon cannot read must never
+  // cost the connection.
+  it("drops malformed capability entries without rejecting the hello", () => {
+    const message = parseClientMessage(
+      hello({
+        capabilities: ["command_output_tools_v1", 7, null, "future_v9"],
+      }),
+    );
+    expect(message).toMatchObject({
+      capabilities: ["command_output_tools_v1", "future_v9"],
+    });
+
+    const notAnArray = parseClientMessage(hello({ capabilities: "nope" }));
+    expect(notAnArray?.type).toBe("hello");
+  });
+
+  it("parses a successful tool_response", () => {
+    const message = parseClientMessage(
+      JSON.stringify({
+        type: "tool_response",
+        request_id: "request-1",
+        tool_call_id: "tool-1",
+        ok: true,
+        result: { commands: [] },
+      }),
+    );
+    expect(message).toEqual({
+      type: "tool_response",
+      request_id: "request-1",
+      tool_call_id: "tool-1",
+      ok: true,
+      result: { commands: [] },
+    });
+  });
+
+  it("parses a structured tool failure", () => {
+    const message = parseClientMessage(
+      JSON.stringify({
+        type: "tool_response",
+        request_id: "request-1",
+        tool_call_id: "tool-1",
+        ok: false,
+        error: {
+          code: "output_evicted",
+          message: "gone",
+          details: { earliestOffset: 42 },
+        },
+      }),
+    );
+    expect(message).toMatchObject({
+      ok: false,
+      error: {
+        code: "output_evicted",
+        message: "gone",
+        details: { earliestOffset: 42 },
+      },
+    });
+  });
+
+  // A failure with no readable reason would settle the call with nothing to tell the
+  // model, so it is rejected at the wire boundary instead.
+  it("rejects a failure without a well-formed error", () => {
+    for (const error of [
+      undefined,
+      null,
+      "boom",
+      { code: "x" },
+      { message: "y" },
+    ]) {
+      const line = JSON.stringify({
+        type: "tool_response",
+        request_id: "request-1",
+        tool_call_id: "tool-1",
+        ok: false,
+        error,
+      });
+      expect(parseClientMessage(line)).toBeNull();
+    }
+  });
+
+  it("rejects a tool_response missing its identifiers", () => {
+    for (const partial of [
+      { tool_call_id: "tool-1", ok: true },
+      { request_id: "request-1", ok: true },
+      { request_id: "request-1", tool_call_id: "tool-1" },
+      { request_id: "request-1", tool_call_id: "tool-1", ok: "yes" },
+    ]) {
+      const line = JSON.stringify({ type: "tool_response", ...partial });
+      expect(parseClientMessage(line)).toBeNull();
+    }
+  });
+
+  it("serializes an ai_tool_call", () => {
+    expect(
+      serializeServerMessage({
+        type: "ai_tool_call",
+        request_id: "request-1",
+        tool_call_id: "tool-1",
+        tool_name: "read_command_output",
+        arguments: { commandId: "command-3", offset: 8000 },
+      }),
+    ).toBe(
+      `${JSON.stringify({
+        type: "ai_tool_call",
+        request_id: "request-1",
+        tool_call_id: "tool-1",
+        tool_name: "read_command_output",
+        arguments: { commandId: "command-3", offset: 8000 },
+      })}\n`,
+    );
+  });
+});
+
 describe("serializeServerMessage", () => {
   // Exact wire lines, locked in step with the Rust proto tests
   // (crates/koshell-proto/src/lib.rs).

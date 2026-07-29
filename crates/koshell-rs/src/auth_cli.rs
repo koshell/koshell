@@ -134,6 +134,9 @@ fn drive(
             shell: "koshell-auth".to_string(),
             rows: 0,
             cols: 0,
+            // A throwaway CLI connection, not a terminal session: it owns no
+            // SessionState, so it can serve no terminal-backed tool.
+            capabilities: Vec::new(),
         },
     )?;
     send_line(&mut writer, &request_for(action, &request_id))?;

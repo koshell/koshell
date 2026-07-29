@@ -329,6 +329,10 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
                                 // (since removed) just fails the chdir and is ignored.
                                 if let Some(dir) = &marker.cwd {
                                     let _ = std::env::set_current_dir(dir);
+                                    // Also the directory a command span records: the
+                                    // marker fires from precmd, so the value standing
+                                    // when the next command starts is that command's.
+                                    state.note_cwd(dir.clone());
                                 }
                             }
                             Segment::Marker(marker) => {
@@ -336,6 +340,27 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
                             }
                         }
                     }
+                }
+                // A tool call is intercepted before presentation: it is a data request
+                // against the state this process already owns, not something the user
+                // should see. It is served synchronously here — the processor thread is
+                // the only writer of `state`, so the read needs no lock and cannot race
+                // the PTY — and answered only on the connection it arrived on.
+                Some(Msg::Daemon(ServerMessage::AiToolCall {
+                    request_id,
+                    tool_call_id,
+                    tool_name,
+                    arguments,
+                })) => {
+                    serve_tool_call(
+                        &mut ipc_client,
+                        &state,
+                        &event_log_proc,
+                        &request_id,
+                        &tool_call_id,
+                        &tool_name,
+                        &arguments,
+                    );
                 }
                 Some(Msg::Daemon(message)) => {
                     presentation.handle_server_message(&message, &mut stdout, &mut state, now);
@@ -376,11 +401,20 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
                         }
                     }
                 }
-                Some(Msg::Exit) => break,
+                Some(Msg::Exit) => {
+                    // The shell is gone, so an open span will never get its
+                    // `command_end`. Discard it rather than close it with invented
+                    // boundaries.
+                    state.end_session();
+                    break;
+                }
                 None => {}
             }
             actions.extend(state.poll(now));
             presentation.poll(now, &mut stdout, &mut state);
+            for warning in state.take_command_history_warnings() {
+                log::warn!("command index: {warning}");
+            }
 
             for action in actions {
                 match action {
@@ -587,6 +621,71 @@ fn reap_child(child: &mut (dyn portable_pty::Child + Send + Sync), child_pid: Op
 /// prompt under the cursor stays the last line (the notice is inserted above it).
 fn present_notice(stdout: &mut std::io::Stdout, state: &mut SessionState, text: &str) {
     crate::presentation::notice_before_prompt(text, stdout, state);
+}
+
+/// Executes one daemon-initiated tool call against the terminal's own session state
+/// and answers it on the same connection.
+///
+/// Failures are structured `ok: false` responses, not silence: an unanswered call
+/// would hang the daemon's agent turn until its timeout, and the agent would lose the
+/// chance to answer from the evidence it already has. A dropped connection is the one
+/// case with nothing to send — the daemon settles it by disposal instead.
+fn serve_tool_call(
+    ipc_client: &mut Option<IpcClient>,
+    state: &SessionState,
+    event_log: &EventLog,
+    request_id: &str,
+    tool_call_id: &str,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+) {
+    let started = Instant::now();
+    let outcome = crate::command_tools::execute(state, tool_name, arguments);
+    // Metadata only (design 0007): the outcome and how long the read took, never the
+    // arguments, the command text, or a byte of output. The announcement events record
+    // that a tool ran; this records how well it ran, which is what says whether the
+    // 5-second bridge timeout and the retention bounds are set anywhere near right.
+    event_log.emit(Event::ToolCall {
+        request_id: request_id.to_string(),
+        tool_name: event_log::identifier(tool_name),
+        ok: outcome.is_ok(),
+        code: outcome
+            .as_ref()
+            .err()
+            .map(|error| event_log::identifier(&error.code)),
+        duration_us: started.elapsed().as_micros() as u64,
+    });
+
+    let response = match outcome {
+        Ok(result) => {
+            log::debug!("tool [{request_id}/{tool_call_id}] {tool_name} ok");
+            ClientMessage::ToolResponse {
+                request_id: request_id.to_string(),
+                tool_call_id: tool_call_id.to_string(),
+                ok: true,
+                result: Some(result),
+                error: None,
+            }
+        }
+        Err(error) => {
+            log::info!(
+                "tool [{request_id}/{tool_call_id}] {tool_name} failed: {}",
+                error.code
+            );
+            ClientMessage::ToolResponse {
+                request_id: request_id.to_string(),
+                tool_call_id: tool_call_id.to_string(),
+                ok: false,
+                result: None,
+                error: Some(error),
+            }
+        }
+    };
+    if let Some(client) = ipc_client.as_mut()
+        && client.send(&response).is_err()
+    {
+        *ipc_client = None;
+    }
 }
 
 /// Sends a best-effort `ai_cancel` for a locally aborted request. The local

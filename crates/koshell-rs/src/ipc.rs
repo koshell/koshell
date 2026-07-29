@@ -7,7 +7,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
-use koshell_proto::{ClientMessage, PROTOCOL_VERSION, ServerMessage};
+use koshell_proto::{
+    CAPABILITY_COMMAND_OUTPUT_TOOLS_V1, ClientMessage, PROTOCOL_VERSION, ServerMessage,
+};
 
 /// A connected client to the AI daemon (the write half).
 pub struct IpcClient {
@@ -110,7 +112,10 @@ pub fn current_session_id() -> Option<String> {
     crate::shell::koshell_session_id(&value).map(str::to_string)
 }
 
-/// Builds a `hello` handshake for a new connection.
+/// Builds a `hello` handshake for a new connection, advertising what this terminal
+/// can serve. The daemon registers terminal-backed tools only for advertised
+/// capabilities, so this list is what keeps a new daemon from calling into an old
+/// terminal.
 pub fn hello(cwd: String, shell: String, rows: u16, cols: u16) -> ClientMessage {
     ClientMessage::Hello {
         protocol_version: PROTOCOL_VERSION,
@@ -119,6 +124,7 @@ pub fn hello(cwd: String, shell: String, rows: u16, cols: u16) -> ClientMessage 
         shell,
         rows,
         cols,
+        capabilities: vec![CAPABILITY_COMMAND_OUTPUT_TOOLS_V1.to_string()],
     }
 }
 

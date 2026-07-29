@@ -154,11 +154,17 @@ instance's active model and conversation state.
 
 Conversations are currently memory-only. Model switches no longer discard them, but a
 provider-definition rebuild, terminal disconnect, or daemon restart still leaves no
-conversation to resume. Terminal context is likewise bounded:
-the daemon receives the current screen and a recent pushed window, but it cannot yet pull
-older off-screen output. In dogfooding, output longer than one screen can therefore leave
-the AI with only the currently visible portion. Transcript persistence and the read-only
-terminal context tool loop are not implemented yet.
+conversation to resume; transcript persistence is not implemented.
+
+Terminal context is no longer push-only. Alongside the current screen and a bounded
+recent window, koshell keeps an index of your recent completed commands and their full
+output, and the AI can read it on demand — so a question about output that has scrolled
+off the screen is answered from the real output rather than from what happens to be
+visible. Retention is memory-only and bounded: the 10 most recent completed commands, up
+to 1 MiB per command and 4 MiB per session, keeping the recent tail and reporting exactly
+what was dropped. Nothing is written to disk. Only completed commands from the integrated
+bash/zsh shell are indexed — not a still-running command, a REPL statement, or a command
+typed over SSH. See `docs/design-0020-completed-command-output-tools.md`.
 
 A custom provider is a full block (`api`, `base_url`, `api_key`, and at least one
 model); this is also how you pin a non-default API type such as `openai-responses`:
@@ -181,6 +187,46 @@ source-preserving atomic replacement, retaining comments, formatting, custom pro
 and file permissions. If the config is missing or invalid, the terminal keeps working
 and `#?` reports what to fix inline. See
 `docs/design-0018-model-discovery-and-runtime-switching.md`.
+
+### Web search (optional)
+
+An optional `[search]` block lets the AI look something up when the terminal evidence
+alone cannot answer — an unrecognized error string, a tool's current flags, anything
+newer than the model's training data:
+
+```toml
+[search]
+provider = "exa"          # the only backend
+# api_key = "..."         # or export EXA_API_KEY
+```
+
+> [Exa](https://exa.ai) is the sole backend, and its adapter follows Exa's own published
+> guidance for agent use. Searching works against the live API as of 2026-07-29; the
+> failure paths (expired credits, rate limiting, timeouts) are still covered only by
+> tests. A call costs roughly $0.007.
+
+Without the block, no search tool exists and the AI is told it cannot fetch anything —
+it is never registered-but-broken. Search goes through a dedicated search API rather
+than the model provider's own: the embedded agent library exposes function-calling
+tools only, so provider-native search (Anthropic, OpenAI, Gemini) cannot be reached
+through the configured model, and a dedicated API keeps the capability identical across
+every supported provider. Calling it sends the query — not terminal content — to the
+search vendor, and the query is printed to your terminal as it goes. See
+`docs/design-0019-web-search-tool.md`.
+
+### Watching the AI work
+
+Whenever the AI uses a tool, koshell prints a dim line saying so before it happens:
+
+```text
+[koshell] searching the web (exa): brew shallow clone error
+[koshell] reading the output of command-3 from character 8000
+```
+
+So a `#?` never sits silent while something runs — you can see what it is doing, and
+Ctrl+C stops it if that is not what you wanted. Failures are reported too; a successful
+call is implied by the answer that follows. See
+`docs/design-0021-visible-tool-activity.md`.
 
 Both processes log at a configurable level, set by `--log-level <level>` or the
 `KOSHELL_LOG` environment variable (the argument wins). The terminal owns the screen,

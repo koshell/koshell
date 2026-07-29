@@ -257,6 +257,40 @@ The daemon answers using the model configured in
 .IR koshell.toml ;
 see
 .BR koshell.toml (5).
+.SS What the AI can see
+Each question pushes a small, bounded context package: the question, trigger
+metadata, a recent window of terminal text, and the current screen.
+.PP
+Beyond that, the AI can read the output of your recent completed commands on
+demand \(em including the parts that have scrolled off the screen. koshell keeps
+a memory-only index of the 10 most recent completed commands, holding at most
+1 MiB of output per command and 4 MiB per terminal session; past those bounds
+the recent tail is kept and the AI is told exactly what was dropped. Nothing is
+written to disk, and the index dies with the terminal session.
+.PP
+Only completed commands from the integrated bash or zsh shell are indexed. A
+command still running, a statement typed inside a REPL, a command run over SSH,
+and anything in a non-integrated shell are not.
+.PP
+The AI observes; it cannot run commands, write to the terminal, read files, or
+reach another terminal session. Reading a command's output sends that text to
+the configured model provider.
+.SS Watching the AI work
+Every tool the AI uses is announced on your terminal as a dim
+.B [koshell]
+line before it runs \(em which command output it is reading, or which query it
+is sending to the configured search provider:
+.PP
+.nf
+[koshell] searching the web (exa): brew shallow clone error
+[koshell] reading the output of command-3 from character 8000
+.fi
+.PP
+So a
+.B #?
+never sits silent while work is in progress: you can see what it is doing and
+press Ctrl+C if that is not what you wanted. Failures are announced with their
+reason; a successful call is implied by the answer that follows.
 .SH ENVIRONMENT
 .TP
 .B KOSHELL_LOG
@@ -363,7 +397,11 @@ values from
 are never written here.
 .TP
 .I $XDG_DATA_HOME/koshell/events.jsonl
-Local dogfooding event log (append-only JSONL, metadata only); disable with
+Local dogfooding event log (append-only JSONL): the text you typed after
+.BR #? ,
+plus timings, presentation decisions, and tool names and outcomes. Never
+screen content, command output, program input, or AI answers. Nothing is
+uploaded; disable it entirely with
 .BR KOSHELL_NO_EVENT_LOG .
 .SH EXIT STATUS
 .B koshell

@@ -19,8 +19,10 @@ import {
 
 import { type KoshellConfig, loadConfig } from "./config.ts";
 import type { Logger } from "./logging.ts";
-import { SYSTEM_PROMPT } from "./prompt.ts";
+import { buildSystemPrompt } from "./prompt.ts";
 import { resolveModel, resolveProvider } from "./provider.ts";
+import type { ToolBridge } from "./tool-bridge.ts";
+import { type AnnounceTool, createCustomTools } from "./tools.ts";
 
 export interface AskOptions {
   prompt: string;
@@ -49,6 +51,16 @@ export interface KoshellAgent {
 export interface AgentFactoryOptions {
   cwd: string;
   log: Logger;
+  /**
+   * The terminal tool round trip for this connection, present only when the terminal
+   * advertised `command_output_tools_v1`. Absent keeps the conversation push-only.
+   */
+  bridge?: ToolBridge | undefined;
+  /**
+   * Reports each tool call to the user's terminal so the work is visible while it
+   * happens. Absent leaves the tool loop silent (tests, non-terminal callers).
+   */
+  announce?: AnnounceTool | undefined;
 }
 
 export type AgentFactory = (
@@ -80,10 +92,14 @@ export function configurationFingerprint(config: KoshellConfig): string {
   return JSON.stringify({
     thinking_level: config.thinking_level ?? null,
     providers: config.providers,
+    // The tool catalog and the system prompt are both built from `[search]` at
+    // session creation, and neither can be swapped in place the way a model can. A
+    // change here must therefore rebuild the conversation, not switch it.
+    search: config.search ?? null,
   });
 }
 
-function createResourceLoader(): ResourceLoader {
+function createResourceLoader(systemPrompt: string): ResourceLoader {
   return {
     getExtensions: () => ({
       extensions: [],
@@ -94,7 +110,7 @@ function createResourceLoader(): ResourceLoader {
     getPrompts: () => ({ prompts: [], diagnostics: [] }),
     getThemes: () => ({ themes: [], diagnostics: [] }),
     getAgentsFiles: () => ({ agentsFiles: [] }),
-    getSystemPrompt: () => SYSTEM_PROMPT,
+    getSystemPrompt: () => systemPrompt,
     getAppendSystemPrompt: () => [],
     extendResources: () => undefined,
     reload: () => Promise.resolve(),
@@ -104,7 +120,7 @@ function createResourceLoader(): ResourceLoader {
 // Creates the production factory. Kept behind the AgentFactory seam so the server
 // is testable with a fake agent.
 export function createPiAgentFactory(): AgentFactory {
-  return async ({ cwd, log }) => {
+  return async ({ cwd, log, bridge, announce }) => {
     // Read the config when constructing a conversation. `koshell model` can
     // later switch this session in place; other config changes rebuild it via
     // reload. A ConfigError propagates as the #? failure shown inline.
@@ -112,10 +128,35 @@ export function createPiAgentFactory(): AgentFactory {
     const { authStorage, modelRegistry, model, thinkingLevel } =
       resolveProvider(config);
 
+    // Custom tools are assembled from what is actually configured. With none, the
+    // session keeps `noTools: "all"` (pi's builtins plus custom tools all disabled),
+    // which is the historical push-only behavior. With some, `noTools: "builtin"`
+    // enables exactly these while pi's file, shell, edit, and write tools stay off —
+    // Koshell's observe-only boundary is what this array contains.
+    const customTools = createCustomTools({
+      config,
+      env: process.env,
+      log,
+      bridge,
+      announce,
+    });
+    if (customTools.length > 0) {
+      log.info(
+        `custom tools active: ${customTools.map((tool) => tool.name).join(", ")}`,
+      );
+    }
+    const toolNames = new Set(customTools.map((tool) => tool.name));
+
     const { session } = await createAgentSession({
       cwd,
-      resourceLoader: createResourceLoader(),
-      noTools: "all",
+      resourceLoader: createResourceLoader(
+        buildSystemPrompt({
+          webSearch: toolNames.has("web_search"),
+          commandOutput: toolNames.has("read_command_output"),
+        }),
+      ),
+      noTools: customTools.length > 0 ? "builtin" : "all",
+      ...(customTools.length > 0 ? { customTools } : {}),
       sessionManager: SessionManager.inMemory(cwd),
       settingsManager: SettingsManager.inMemory({
         compaction: { enabled: false },

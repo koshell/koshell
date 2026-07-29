@@ -28,6 +28,7 @@ import { resolveProvider } from "./provider.ts";
 import {
   type AiRequestMessage,
   type AuthLoginMessage,
+  CAPABILITY_COMMAND_OUTPUT_TOOLS_V1,
   type HelloMessage,
   type ModelSetMessage,
   PROTOCOL_VERSION,
@@ -35,6 +36,7 @@ import {
   parseClientMessage,
   serializeServerMessage,
 } from "./protocol.ts";
+import { ToolBridge } from "./tool-bridge.ts";
 
 // A snapshot of the daemon's identity and load, for `status_request`.
 export interface DaemonStatus {
@@ -157,6 +159,10 @@ export class TerminalConnection {
   // so a cancel that raced past its request's completion cannot linger.
   private readonly cancelled = new Set<string>();
   private runningRequestId: string | undefined;
+  // The terminal tool round trip, created on a hello that advertised the capability.
+  // Absent keeps this conversation push-only, which is exactly what an older terminal
+  // gets: the daemon must not register a tool the connection cannot serve.
+  private bridge: ToolBridge | undefined;
   // The one in-flight `koshell auth login` on this connection, with the
   // resolvers of prompts the client has not answered yet. Aborting the
   // controller resolves every pending prompt with null (see handleAuthLogin),
@@ -183,7 +189,7 @@ export class TerminalConnection {
       return;
     }
     switch (message.type) {
-      case "hello":
+      case "hello": {
         if (message.protocol_version !== PROTOCOL_VERSION) {
           this.hello = undefined;
           this.helloRejection =
@@ -206,10 +212,34 @@ export class TerminalConnection {
           this.sessionId = message.terminal_session_id;
           this.options.registerSession?.(this.sessionId, this);
         }
+        if (
+          message.capabilities?.includes(CAPABILITY_COMMAND_OUTPUT_TOOLS_V1) ===
+          true
+        ) {
+          this.bridge ??= new ToolBridge({
+            send: (call) => {
+              this.send({
+                type: "ai_tool_call",
+                request_id: call.requestId,
+                tool_call_id: call.toolCallId,
+                tool_name: call.toolName,
+                arguments: call.args,
+              });
+            },
+            log: this.options.log,
+          });
+        }
+        // Log the negotiated mode: "push-only" is the normal older-terminal case,
+        // and it is the first thing to check when the agent never pulls.
+        const mode =
+          this.bridge === undefined
+            ? " [push-only]"
+            : ` [capabilities: ${(message.capabilities ?? []).join(",")}]`;
         this.options.log.info(
-          `hello from ${message.terminal_session_id} (${message.shell}, ${String(message.cols)}x${String(message.rows)}) cwd=${message.cwd}`,
+          `hello from ${message.terminal_session_id} (${message.shell}, ${String(message.cols)}x${String(message.rows)}) cwd=${message.cwd}${mode}`,
         );
         break;
+      }
       case "ai_request":
         if (this.helloRejection !== undefined) {
           // Keep the per-request contract (ack, then exactly one terminal
@@ -246,6 +276,23 @@ export class TerminalConnection {
             })
             .catch(() => undefined);
         }
+        break;
+      case "tool_response":
+        // Settling is the bridge's job: it owns the pending map and drops unknown,
+        // duplicate, mismatched-request, and late responses without presentation.
+        this.bridge?.settle(
+          message.request_id,
+          message.tool_call_id,
+          message.ok
+            ? { ok: true, result: message.result }
+            : {
+                ok: false,
+                error: message.error ?? {
+                  code: "invalid_response",
+                  message: "the terminal reported a failure without a reason",
+                },
+              },
+        );
         break;
       case "bye":
         this.options.log.info(`bye from ${message.terminal_session_id}`);
@@ -597,6 +644,10 @@ export class TerminalConnection {
       this.options.unregisterSession?.(this.sessionId, this);
     }
     this.activeLogin?.controller.abort();
+    // Outstanding tool calls can never be answered once the socket is gone; settle
+    // them so the agent turn unwinds instead of waiting out its timeouts.
+    this.bridge?.dispose();
+    this.bridge = undefined;
     void this.agent
       ?.then((agent) => {
         agent.dispose();
@@ -739,6 +790,11 @@ export class TerminalConnection {
       return;
     }
     this.runningRequestId = message.request_id;
+    // Tool calls are bound to the FIFO-active request: the conversation serializes
+    // prompts, so this window is exactly the span during which a tool result can
+    // still reach the model. It also resets the per-question call and character
+    // budgets.
+    this.bridge?.beginRequest(message.request_id);
     try {
       const agent = await this.getAgent();
       if (this.cancelled.has(message.request_id)) {
@@ -769,6 +825,10 @@ export class TerminalConnection {
     } finally {
       this.cancelled.delete(message.request_id);
       this.runningRequestId = undefined;
+      // Rejects anything still outstanding. A call whose answer arrives after this
+      // has nowhere to go, and leaving it pending would keep a timer alive past the
+      // turn that owned it.
+      this.bridge?.endRequest();
     }
   }
 
@@ -777,6 +837,24 @@ export class TerminalConnection {
       .createAgent({
         cwd: this.hello?.cwd ?? process.cwd(),
         log: this.options.log,
+        bridge: this.bridge,
+        // Bound to the FIFO-active request: one conversation serializes prompts, so
+        // the running request is unambiguously the one this tool call belongs to.
+        // Outside a request there is no answer being rendered, so nothing to attach
+        // the line to and nothing worth interrupting.
+        announce: (activity) => {
+          const requestId = this.runningRequestId;
+          if (requestId === undefined) {
+            return;
+          }
+          this.send({
+            type: "ai_tool_activity",
+            request_id: requestId,
+            tool_name: activity.toolName,
+            phase: activity.phase,
+            message: activity.message,
+          });
+        },
       })
       .then((agent) => {
         // Cache live state so `koshell status` and model-only reload can read it

@@ -27,6 +27,25 @@ use serde::{Deserialize, Serialize};
 /// evolution rules in the crate docs).
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Capability name for the read-only completed-command tools
+/// (`list_recent_commands`, `read_command_output`). A terminal advertises it in
+/// [`ClientMessage::Hello`]; the daemon registers those tools only for connections
+/// that did.
+pub const CAPABILITY_COMMAND_OUTPUT_TOOLS_V1: &str = "command_output_tools_v1";
+
+/// A structured tool failure, safe to hand to the model as a normal tool result.
+///
+/// `code` is a stable identifier the daemon can branch on and the prompt can explain;
+/// `message` is human-readable. Neither carries terminal content beyond what the tool
+/// was already allowed to return.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolError {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
 /// A message sent from the terminal process to the AI daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -39,6 +58,19 @@ pub enum ClientMessage {
         shell: String,
         rows: u16,
         cols: u16,
+        /// Optional capability names this terminal can serve, e.g.
+        /// [`CAPABILITY_COMMAND_OUTPUT_TOOLS_V1`].
+        ///
+        /// This is the negotiation that keeps a mixed-version fleet honest in both
+        /// directions. The daemon registers a terminal-backed tool only when the
+        /// connection advertised it, so a new daemon with an old terminal stays
+        /// push-only instead of issuing calls that can never be answered. An old
+        /// daemon simply ignores the extra field, per the additive-evolution rule, so
+        /// a new terminal degrades the same way. Neither needs a version bump.
+        ///
+        /// Frozen-shape compatible: absent means "no capabilities".
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        capabilities: Vec<String>,
     },
     /// A `#?` question raised in the terminal, with the terminal context the
     /// daemon should ground its answer in.
@@ -61,12 +93,21 @@ pub enum ClientMessage {
     /// the request with its usual single end/error marker; a daemon that does not
     /// know this message type ignores it, per the additive-evolution rule.
     AiCancel { request_id: String },
-    /// Response to a daemon-initiated context tool call. Reserved for the next
-    /// stage (tool round-trips); not produced yet.
+    /// Settles exactly one daemon-initiated [`ServerMessage::AiToolCall`].
+    ///
+    /// A success carries `ok: true` and exactly one `result`; a failure carries
+    /// `ok: false` and exactly one `error`. Both cross the wire as untrusted JSON and
+    /// are validated at each runtime boundary before becoming typed values. Unknown,
+    /// duplicate, mismatched-request, and late responses are ignored and logged
+    /// without terminal presentation — a settled call never re-settles.
     ToolResponse {
         request_id: String,
         tool_call_id: String,
-        result: serde_json::Value,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ToolError>,
     },
     /// Graceful shutdown of a terminal session.
     Bye { terminal_session_id: String },
@@ -195,9 +236,10 @@ pub struct ModelCatalogEntry {
 /// A message sent from the AI daemon back to the terminal process.
 ///
 /// Per request, the daemon sends `ack` first (the request was parsed and
-/// enqueued), then zero or more `ai_delta` chunks, then exactly one of
-/// `ai_response_end` or `ai_error`. `ai_tool_call` is reserved for the tool
-/// round-trip stage.
+/// enqueued), then zero or more `ai_delta` chunks and `ai_tool_call`s, then exactly
+/// one of `ai_response_end` or `ai_error`. Each `ai_tool_call` is settled by one
+/// `tool_response` from the terminal; several may be outstanding at once, and a
+/// cancelled request still gets its single terminal marker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
@@ -210,6 +252,48 @@ pub enum ServerMessage {
     AiResponseEnd { request_id: String },
     /// Terminal failure marker: no further messages follow for this request.
     AiError { request_id: String, message: String },
+    /// Reports what the AI is doing mid-answer so the user can watch the work and
+    /// decide whether to interrupt it.
+    ///
+    /// The daemon announces *every* tool call, including ones it serves itself
+    /// (`web_search` never touches the terminal), so this is the only message that
+    /// makes the whole tool loop visible. Without it a `#?` can sit silent for
+    /// seconds with no way to tell a slow search from a hung daemon.
+    ///
+    /// `message` is ready-to-render display text authored by the daemon rather than a
+    /// code the terminal formats: a daemon that gains a tool then needs no matching
+    /// terminal release, and an older terminal renders a new tool's line correctly.
+    /// `phase` is a free-form string for the same reason — an unknown phase renders
+    /// as an ordinary line instead of failing to parse.
+    AiToolActivity {
+        request_id: String,
+        tool_name: String,
+        /// `started` or `failed`.
+        phase: String,
+        message: String,
+    },
+    /// Asks the terminal to run one read-only context tool against the session state
+    /// it already owns, answered by exactly one [`ClientMessage::ToolResponse`] with
+    /// the same `tool_call_id`.
+    ///
+    /// This is the pull arm of the context contract: the pushed package stays small
+    /// and the agent fetches the exploratory tail only when it needs it. `arguments`
+    /// is opaque JSON validated by the terminal before use — an unknown tool name or
+    /// a malformed argument object becomes a structured `ok: false` response, never a
+    /// terminal-side panic.
+    ///
+    /// No tool reachable through this message writes to the PTY, runs a process, reads
+    /// a file, or reaches another terminal session. The terminal answers only on the
+    /// connection the call arrived on.
+    ///
+    /// Additive: only sent to connections that advertised the matching capability in
+    /// their `hello`, so an older terminal never receives one.
+    AiToolCall {
+        request_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        arguments: serde_json::Value,
+    },
     /// Reply to [`ClientMessage::StatusRequest`]: the daemon's identity and load.
     /// `version` is the daemon package version; `connections` is the live terminal
     /// count at reply time. Additive: an older terminal's IPC reader ignores it.

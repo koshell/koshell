@@ -89,6 +89,9 @@ fn request(path: &Path, message: ClientMessage, request_id: &str) -> anyhow::Res
             shell: "koshell-model".to_string(),
             rows,
             cols,
+            // A throwaway CLI connection, not a terminal session: it owns no
+            // SessionState, so it can serve no terminal-backed tool.
+            capabilities: Vec::new(),
         },
     )?;
     send_line(&mut writer, &message)?;

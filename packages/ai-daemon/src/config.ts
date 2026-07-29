@@ -96,6 +96,34 @@ const ProviderSchema = z.strictObject({
   models: z.array(ModelDefSchema).min(1).optional(),
 });
 
+// Web-search backends Koshell can call. pi's tool abstraction carries no provider
+// server-tool passthrough (its `Tool` is name/description/parameters only, and every
+// API adapter converts to a plain function schema), so Anthropic's `web_search`,
+// OpenAI's `web_search`, and Gemini's `google_search` grounding are all unreachable
+// through the configured model. Search is therefore a Koshell-owned custom tool over a
+// dedicated search API, which also keeps it independent of which of pi's 30+ providers
+// the user selected. See `search.ts`.
+// `exa` is the only backend, and the adapter follows Exa's own published guidance for
+// agent workflows. Tavily and Brave adapters existed briefly and were removed before
+// this ever shipped: both were written from vendor documentation, never run against
+// the live service, and covered only by fixtures derived from those same documents —
+// so they carried the maintenance weight of a supported integration while proving
+// nothing. `provider` stays a required enum rather than being dropped so that the
+// second backend, if one is ever warranted, needs no config-shape change.
+const SEARCH_BACKENDS = ["exa"] as const;
+const SearchBackendSchema = z.enum(SEARCH_BACKENDS);
+
+// Absent `[search]` means no web_search tool is registered at all — not a tool that
+// fails at call time. An agent that is never told the tool exists cannot promise the
+// user a search it cannot run.
+const SearchSchema = z.strictObject({
+  provider: SearchBackendSchema,
+  api_key: z.string().min(1).optional(),
+  base_url: z.string().min(1).optional(),
+  // Results requested per call, before the per-call character budget trims them.
+  max_results: z.number().int().positive().max(20).default(5),
+});
+
 const ConfigSchema = z
   .strictObject({
     // The single active model as "provider/id". Split on the first "/", so a
@@ -104,6 +132,7 @@ const ConfigSchema = z
     model: z.string().min(1),
     thinking_level: ThinkingLevelSchema.optional(),
     providers: z.record(z.string(), ProviderSchema).default({}),
+    search: SearchSchema.optional(),
   })
   .superRefine((cfg, ctx) => {
     const slash = cfg.model.indexOf("/");
@@ -139,6 +168,8 @@ const ConfigSchema = z
 export type KoshellConfig = z.infer<typeof ConfigSchema>;
 export type ProviderConfig = z.infer<typeof ProviderSchema>;
 export type ModelDef = z.infer<typeof ModelDefSchema>;
+export type SearchConfig = z.infer<typeof SearchSchema>;
+export type SearchBackend = (typeof SEARCH_BACKENDS)[number];
 
 // Resolves the config path, following XDG: $XDG_CONFIG_HOME/koshell/koshell.toml,
 // falling back to ~/.config/koshell/koshell.toml.

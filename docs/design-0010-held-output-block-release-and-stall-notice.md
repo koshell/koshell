@@ -4,6 +4,13 @@ Date: 2026-07-08 12:19:29 CST
 
 Status: implemented.
 
+Revised 2026-07-28: the stall notice is now conditional on output actually being held.
+Its no-output wording (`still no answer — press Ctrl+C to stop waiting for the AI`) was
+noise — it repeated what the one-second waiting notice already said, and Ctrl+C already
+stops a streaming answer, so it announced nothing new. It is removed. The held-output
+wording is unchanged and still fires, because it is what carries the invariant below.
+See "Conditional stall notice".
+
 ## Why
 
 Design 0002's buffered-stream prototype held the bounded side (the returning prompt)
@@ -81,6 +88,31 @@ answer during a release.
   on the stall notice until the user presses Ctrl+C. Accepted: the notice states the
   recovery path, and this is the deliberate trade for never mixing the two streams.
 
+## Conditional stall notice
+
+Revised 2026-07-28.
+
+The stall notice originally fired on a pure timer, with wording that adapted to whether
+anything was held. The no-output branch was removed: it fired 30 s into any slow answer
+and told the user only that the answer was slow (already covered by the one-second
+waiting notice) and that Ctrl+C stops it (already true and already documented by the
+interrupt path). It made a working-but-slow provider look like a fault.
+
+The invariant is unchanged — **a hung daemon can never hold command output silently** —
+because it was only ever carried by the held-output branch. That branch now fires from
+two places instead of one:
+
+- `poll` at `STALL_NOTICE_DELAY`, when output is already held (the common case: the
+  returning prompt arrives right after `command_end`);
+- `pty_output`, when the deadline has already passed and this write is the first thing
+  actually held. `ActiveResponse::stall_deadline_passed` is the shared predicate.
+
+`next_deadline` stops scheduling the stall deadline once it is in the past rather than
+once the notice has fired. Without that guard the notice's new precondition would leave
+`stall_notice_shown` false past the deadline, and `saturating_duration_since` would hand
+the processor a zero-length channel wait — a spin. From the deadline onward the hold is
+event-driven: both the fuse and the notice are reached through `pty_output`.
+
 ## Verification
 
 - `presentation.rs` unit tests: `pty_buffer_fuse_releases_a_block_and_keeps_buffering`
@@ -88,6 +120,10 @@ answer during a release.
   (answer → boundary block → relabeled answer, in order), `max_hold_holds_and_prompts_ctrl_c`
   (stall notice holds the output, `next_deadline` goes quiet, Ctrl+C releases behind a
   boundary), and the updated `interrupt_flushes_the_held_prompt_in_buffered_stream_mode`.
+- 2026-07-28 revision: `a_stalled_answer_holding_nothing_stays_silent` (the waiting
+  notice fires, the stall deadline passes silently with nothing held, `next_deadline`
+  goes quiet rather than returning zero, then the first late PTY write reports the hold
+  without flushing it, once).
 - `cargo test`, `cargo clippy --all-targets`, `cargo fmt --check` pass.
 - Manual real-PTY smoke: a stalled answer holds the prompt and offers Ctrl+C; flooding
   over 256 KiB of typed-ahead output yields an emergency notice, one command-output

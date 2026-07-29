@@ -253,6 +253,73 @@ Optional table of per-million-token prices used only for usage accounting:
 .BR input ", " output ", " cache_read ", " cache_write
 (each defaults to 0).
 .RE
+.SH WEB SEARCH
+The optional
+.B [search]
+block gives the AI one read-only
+.B web_search
+tool, used when the terminal evidence alone cannot answer a question \(em an
+unrecognized error string, a tool's current flags, or anything newer than the
+model's training data.
+.PP
+Without this block no search tool is registered at all, and the AI is told it
+cannot fetch anything. It is never registered-but-broken: a block with no
+resolvable key logs a warning and leaves the tool off, so the AI cannot promise
+a lookup it cannot perform.
+.PP
+Search is a Koshell-owned tool over a dedicated search API rather than the model
+provider's own search. The embedded agent library exposes function-calling tools
+only, so provider-native server tools (Anthropic
+.BR web_search ,
+OpenAI
+.BR web_search ,
+Gemini
+.BR google_search
+grounding) cannot be reached through the configured model. A dedicated API also
+keeps search working identically across every supported provider.
+.PP
+The adapter follows Exa's own published guidance for agent use, and searching
+has been exercised against the live API as of 2026-07-29. The failure paths \(em
+expired credits, rate limiting, timeouts \(em are still covered only by tests. A
+call costs roughly $0.007 at the default
+.BR max_results .
+.TP
+.B provider
+Required. Currently
+.B exa
+is the only accepted value; a search API is a per-vendor request and response
+shape, so a backend that has never been called is a liability rather than a
+feature, and none other is carried.
+.TP
+.B api_key
+Optional. Falls back to
+.BR EXA_API_KEY .
+Takes the same three forms as a provider
+.B api_key
+(see
+.B CREDENTIALS
+below).
+.TP
+.B base_url
+Optional endpoint override, for a proxy or a self-hosted gateway.
+.TP
+.B max_results
+Optional integer, 1\(en20, default 5.
+.PP
+Calling the tool sends the query \(em not terminal content \(em to the
+configured search API, which is a different vendor from the model provider. The
+query is printed to your terminal as the search starts, so the one outbound
+transfer koshell makes on your behalf is visible; see
+.BR koshell (1).
+Each call is bounded by a 10-second timeout, and the AI is instructed to search
+at most twice per question and to treat results as untrusted third-party text.
+.PP
+Changing
+.B [search]
+rebuilds the conversation on
+.BR "koshell reload" ,
+because the tool catalog and system prompt are fixed when the conversation is
+created; unlike a model change, it cannot be applied in place.
 .SH CREDENTIALS
 .B api_key
 values take three forms:
@@ -306,6 +373,16 @@ api_key = "$MYCORP_API_KEY"
 
   [[providers.mycorp.models]]
   id = "mycorp-large"
+.fi
+.PP
+Web search enabled, key from
+.BR EXA_API_KEY :
+.PP
+.nf
+model = "anthropic/claude-sonnet-4-5"
+
+[search]
+provider = "exa"
 .fi
 .SH SEE ALSO
 .BR koshell (1)

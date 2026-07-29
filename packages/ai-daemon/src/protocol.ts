@@ -3,6 +3,12 @@
 
 export const PROTOCOL_VERSION = 1;
 
+// Capability name for the read-only completed-command tools. A terminal advertises
+// it in its hello; the daemon registers those tools only for connections that did, so
+// a new daemon with an old terminal stays push-only instead of issuing calls that can
+// never be answered. Additive: no protocol version bump.
+export const CAPABILITY_COMMAND_OUTPUT_TOOLS_V1 = "command_output_tools_v1";
+
 export interface HelloMessage {
   type: "hello";
   protocol_version: number;
@@ -11,6 +17,8 @@ export interface HelloMessage {
   shell: string;
   rows: number;
   cols: number;
+  // Absent on an older terminal, which means "no capabilities".
+  capabilities?: string[];
 }
 
 export interface AiRequestMessage {
@@ -28,6 +36,25 @@ export interface AiRequestMessage {
 export interface AiCancelMessage {
   type: "ai_cancel";
   request_id: string;
+}
+
+// Structured tool failure, safe to hand to the model as a normal tool result.
+export interface ToolErrorPayload {
+  code: string;
+  message: string;
+  details?: unknown;
+}
+
+// Settles exactly one `ai_tool_call`. A success carries ok:true and one `result`; a
+// failure carries ok:false and one `error`. Both are untrusted JSON validated here at
+// the wire boundary. Unknown, duplicate, mismatched, and late responses are dropped.
+export interface ToolResponseMessage {
+  type: "tool_response";
+  request_id: string;
+  tool_call_id: string;
+  ok: boolean;
+  result?: unknown;
+  error?: ToolErrorPayload;
 }
 
 export interface ByeMessage {
@@ -124,6 +151,7 @@ export type ClientMessage =
   | HelloMessage
   | AiRequestMessage
   | AiCancelMessage
+  | ToolResponseMessage
   | ByeMessage
   | StatusRequestMessage
   | AuthLoginMessage
@@ -158,6 +186,30 @@ export interface AiErrorMessage {
   type: "ai_error";
   request_id: string;
   message: string;
+}
+
+// Reports what the AI is doing mid-answer so the user can watch and interrupt.
+// Announced for every tool call, including ones the daemon serves itself
+// (web_search never reaches the terminal), so this is the only message that makes the
+// whole tool loop visible. `message` is ready-to-render display text authored here,
+// so a new tool needs no matching terminal release.
+export interface AiToolActivityMessage {
+  type: "ai_tool_activity";
+  request_id: string;
+  tool_name: string;
+  phase: "started" | "failed";
+  message: string;
+}
+
+// Asks the terminal to run one read-only context tool against the session state it
+// owns, settled by exactly one `tool_response` with the same tool_call_id. Only sent
+// to connections that advertised the matching capability.
+export interface AiToolCallMessage {
+  type: "ai_tool_call";
+  request_id: string;
+  tool_call_id: string;
+  tool_name: string;
+  arguments: unknown;
 }
 
 // Reply to `status_request`. `version` is the daemon package version;
@@ -316,6 +368,8 @@ export type ServerMessage =
   | AiDeltaMessage
   | AiResponseEndMessage
   | AiErrorMessage
+  | AiToolActivityMessage
+  | AiToolCallMessage
   | StatusMessage
   | AuthUrlMessage
   | AuthDeviceCodeMessage
@@ -362,7 +416,7 @@ export function parseClientMessage(line: string): ClientMessage | null {
         typeof value.rows === "number" &&
         typeof value.cols === "number"
       ) {
-        return {
+        const message: HelloMessage = {
           type: "hello",
           protocol_version: value.protocol_version,
           terminal_session_id: value.terminal_session_id,
@@ -371,6 +425,15 @@ export function parseClientMessage(line: string): ClientMessage | null {
           rows: value.rows,
           cols: value.cols,
         };
+        // Unknown or malformed entries are dropped rather than rejecting the
+        // handshake: the hello shape is frozen, so a capability list this daemon
+        // does not understand must never cost the connection.
+        if (Array.isArray(value.capabilities)) {
+          message.capabilities = value.capabilities.filter(
+            (entry): entry is string => typeof entry === "string",
+          );
+        }
+        return message;
       }
       return null;
     case "ai_request":
@@ -396,6 +459,40 @@ export function parseClientMessage(line: string): ClientMessage | null {
         };
       }
       return null;
+    case "tool_response": {
+      if (
+        typeof value.request_id !== "string" ||
+        typeof value.tool_call_id !== "string" ||
+        typeof value.ok !== "boolean"
+      ) {
+        return null;
+      }
+      const message: ToolResponseMessage = {
+        type: "tool_response",
+        request_id: value.request_id,
+        tool_call_id: value.tool_call_id,
+        ok: value.ok,
+      };
+      if (value.ok) {
+        message.result = value.result;
+      } else {
+        // A failure without a well-formed error is itself malformed: the caller
+        // would otherwise settle the call with nothing to tell the model.
+        if (
+          !isRecord(value.error) ||
+          typeof value.error.code !== "string" ||
+          typeof value.error.message !== "string"
+        ) {
+          return null;
+        }
+        message.error = {
+          code: value.error.code,
+          message: value.error.message,
+          details: value.error.details,
+        };
+      }
+      return message;
+    }
     case "bye":
       if (typeof value.terminal_session_id === "string") {
         return {

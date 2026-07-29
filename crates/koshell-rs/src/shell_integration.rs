@@ -63,6 +63,14 @@ pub struct ShellIntegrationMarker {
     pub exit_code: Option<i32>,
     /// The absolute working directory, present only on [`MarkerKind::Cwd`] markers.
     pub cwd: Option<String>,
+    /// Whether the shell actually ran a command for this line.
+    ///
+    /// The precmd fallback emits a synthetic start/end pair for a comment-only `#?`
+    /// line so the trigger still fires from an authoritative boundary. No command ran,
+    /// so such a pair must not become a command-history span. Absent means `true`: an
+    /// older shell rc (a long-lived session whose rc predates this field) emits real
+    /// markers without it, and treating those as executed is the correct reading.
+    pub executed: bool,
 }
 
 /// How to launch the child shell, including any generated rc file.
@@ -128,6 +136,10 @@ pub fn parse_marker_payload(payload: &[u8]) -> Option<ShellIntegrationMarker> {
         .get("cwd")
         .and_then(|c| c.as_str())
         .map(str::to_string);
+    let executed = value
+        .get("executed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
     Some(ShellIntegrationMarker {
         kind,
         command,
@@ -137,6 +149,7 @@ pub fn parse_marker_payload(payload: &[u8]) -> Option<ShellIntegrationMarker> {
             None
         },
         cwd: if kind == MarkerKind::Cwd { cwd } else { None },
+        executed,
     })
 }
 
@@ -156,6 +169,10 @@ pub fn format_marker(marker: &ShellIntegrationMarker) -> Vec<u8> {
     }
     if let Some(cwd) = &marker.cwd {
         json["cwd"] = serde_json::Value::String(cwd.clone());
+    }
+    // Omitted when true, matching the shell hooks: absent means executed.
+    if !marker.executed {
+        json["executed"] = serde_json::Value::Bool(false);
     }
     let payload = BASE64.encode(serde_json::to_vec(&json).unwrap_or_default());
     let mut out = Vec::new();
@@ -361,13 +378,17 @@ __koshell_emit_marker() {
   local type="$1"
   local command="$2"
   local exit_code="${3:-}"
+  local executed="${4:-}"
   local escaped_command
   escaped_command=$(__koshell_json_escape "$command")
+  __koshell_payload='{"type":"'"$type"'","command":"'"$escaped_command"'"'
   if [ -n "$exit_code" ]; then
-    __koshell_payload='{"type":"'"$type"'","command":"'"$escaped_command"'","exitCode":'"$exit_code"'}'
-  else
-    __koshell_payload='{"type":"'"$type"'","command":"'"$escaped_command"'"}'
+    __koshell_payload="$__koshell_payload"',"exitCode":'"$exit_code"
   fi
+  if [ "$executed" = "false" ]; then
+    __koshell_payload="$__koshell_payload"',"executed":false'
+  fi
+  __koshell_payload="$__koshell_payload"'}'
   printf '\033]777;koshell;%s\007' "$(__koshell_base64 "$__koshell_payload")"
 }
 __koshell_emit_start() {
@@ -375,6 +396,15 @@ __koshell_emit_start() {
 }
 __koshell_emit_end() {
   __koshell_emit_marker "command_end" "$2" "$1"
+}
+# Trigger-only markers for a comment-only `#?` line. The shell ran no command, so these
+# carry executed:false and must not open or complete a command-history span; they exist
+# only so `#?` fires from an authoritative boundary instead of stabilization.
+__koshell_emit_synthetic_start() {
+  __koshell_emit_marker "command_start" "$1" "" "false"
+}
+__koshell_emit_synthetic_end() {
+  __koshell_emit_marker "command_end" "$2" "$1" "false"
 }
 __koshell_emit_cwd() {
   local escaped_cwd
@@ -433,8 +463,8 @@ __koshell_prompt_command() {
     else
       case "$history_command" in
         *'#?'*)
-          __koshell_emit_start "$history_command"
-          __koshell_emit_end "$exit_status" "$history_command"
+          __koshell_emit_synthetic_start "$history_command"
+          __koshell_emit_synthetic_end "$exit_status" "$history_command"
           ;;
       esac
     fi
@@ -568,8 +598,8 @@ __koshell_zsh_precmd() {
   else
     case "$__koshell_zsh_pending_line" in
       *'#?'*)
-        __koshell_emit_start "$__koshell_zsh_pending_line"
-        __koshell_emit_end "$exit_status" "$__koshell_zsh_pending_line"
+        __koshell_emit_synthetic_start "$__koshell_zsh_pending_line"
+        __koshell_emit_synthetic_end "$exit_status" "$__koshell_zsh_pending_line"
         ;;
     esac
   fi
@@ -593,6 +623,7 @@ mod tests {
             command: Some("ls #? explain".to_string()),
             exit_code: None,
             cwd: None,
+            executed: true,
         };
         let bytes = format_marker(&marker);
         assert!(bytes.starts_with(MARKER_PREFIX));
@@ -608,6 +639,7 @@ mod tests {
             command: Some("false".to_string()),
             exit_code: Some(1),
             cwd: None,
+            executed: true,
         };
         let bytes = format_marker(&marker);
         let payload = &bytes[MARKER_PREFIX.len()..bytes.len() - 1];
@@ -621,10 +653,72 @@ mod tests {
             command: None,
             exit_code: None,
             cwd: Some("/home/user/project".to_string()),
+            executed: true,
         };
         let bytes = format_marker(&marker);
         let payload = &bytes[MARKER_PREFIX.len()..bytes.len() - 1];
         assert_eq!(parse_marker_payload(payload), Some(marker));
+    }
+
+    // The synthetic pair a comment-only `#?` line produces: it must survive the wire
+    // as executed:false, or the command index invents a command that never ran.
+    #[test]
+    fn round_trips_a_synthetic_trigger_only_marker() {
+        for kind in [MarkerKind::CommandStart, MarkerKind::CommandEnd] {
+            let marker = ShellIntegrationMarker {
+                kind,
+                command: Some("#? why".to_string()),
+                exit_code: if kind == MarkerKind::CommandEnd {
+                    Some(0)
+                } else {
+                    None
+                },
+                cwd: None,
+                executed: false,
+            };
+            let bytes = format_marker(&marker);
+            let payload = &bytes[MARKER_PREFIX.len()..bytes.len() - 1];
+            assert_eq!(parse_marker_payload(payload), Some(marker));
+        }
+    }
+
+    // Backward compatibility: a long-lived session whose rc predates the field emits
+    // real markers without it, and those really did run a command.
+    #[test]
+    fn a_marker_without_the_executed_field_is_executed() {
+        let payload = BASE64.encode(br#"{"type":"command_start","command":"ls"}"#);
+        let marker = parse_marker_payload(payload.as_bytes()).unwrap();
+        assert!(marker.executed);
+    }
+
+    #[test]
+    fn the_shell_hooks_emit_synthetic_markers_for_comment_only_lines() {
+        // Both shells route the comment-only `#?` fallback through the synthetic
+        // emitters, and only through those.
+        for hooks in [BASH_HOOKS, ZSH_HOOKS] {
+            assert!(
+                hooks.contains("__koshell_emit_synthetic_start"),
+                "the comment-only fallback uses the synthetic start emitter"
+            );
+            assert!(
+                hooks.contains("__koshell_emit_synthetic_end"),
+                "the comment-only fallback uses the synthetic end emitter"
+            );
+        }
+        assert!(
+            SHARED_SHELL_FUNCTIONS.contains(r#","executed":false"#),
+            "the marker emitter can write the executed:false field"
+        );
+        assert!(
+            SHARED_SHELL_FUNCTIONS
+                .contains(r#"__koshell_emit_marker "command_start" "$1" "" "false""#),
+            "the synthetic start emitter marks the pair as not executed"
+        );
+        assert!(
+            SHARED_SHELL_FUNCTIONS
+                .contains(r#"__koshell_emit_marker "command_end" "$2" "$1" "false""#),
+            "the synthetic end emitter marks the pair as not executed"
+        );
     }
 
     #[test]
@@ -642,6 +736,7 @@ mod tests {
             command: Some("ls".to_string()),
             exit_code: None,
             cwd: None,
+            executed: true,
         });
         let mut stream = b"before".to_vec();
         stream.extend_from_slice(&marker);
@@ -657,6 +752,7 @@ mod tests {
                     command: Some("ls".to_string()),
                     exit_code: None,
                     cwd: None,
+                    executed: true,
                 }),
                 Segment::Visible(b"after".to_vec()),
             ]
@@ -671,6 +767,7 @@ mod tests {
             command: Some("ls #? explain".to_string()),
             exit_code: Some(0),
             cwd: None,
+            executed: true,
         });
         // Split the marker in the middle of the prefix.
         let split = 5;

@@ -27,6 +27,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use crate::command_history::CommandHistory;
 use crate::context::{TerminalContextOptions, build_terminal_context};
 use crate::event_log::{Event, EventLog};
 use crate::mirror::TerminalMirror;
@@ -35,7 +36,12 @@ use crate::shell_integration::{MarkerKind, ShellIntegrationMarker};
 use crate::timeline::{InMemoryTimelineStore, TerminalEvent};
 
 /// The stable AI context contract version (kept in sync with the daemon).
-const AI_CONTEXT_CONTRACT_VERSION: &str = "koshell_ai_context_v1";
+/// Version of the pushed context package.
+///
+/// v2 adds `dynamicContext.primaryTextTruncated` and the `pullContext` inventory. The
+/// daemon decodes defensively, so a v1 terminal talking to a v2 daemon simply carries
+/// no inventory and stays push-only.
+const AI_CONTEXT_CONTRACT_VERSION: &str = "koshell_ai_context_v2";
 
 /// The `#?` trigger token.
 const TRIGGER_TOKEN: &str = "#?";
@@ -215,7 +221,17 @@ pub struct SessionState {
     mirror: TerminalMirror,
     previous_snapshot: Option<(String, String)>,
     next_snapshot_id: u64,
-    next_command_id: u64,
+    /// Bounded per-command output index, the terminal side of the read-only pull tools.
+    /// Independent of the timeline's session-wide recent-text window: they share a
+    /// command id and nothing else.
+    command_history: CommandHistory,
+    /// Counter for AI request ids. Separate from command ids: a request is not a
+    /// command, and sharing one counter made request ids skip and command ids advance
+    /// for reasons unrelated to the shell.
+    next_request_id: u64,
+    /// The working directory reported by the most recent `cwd` marker, copied into a
+    /// span when one opens. `None` until the first prompt.
+    latest_cwd: Option<String>,
     command_active: bool,
     /// Whether shell-integration markers exist in this session. When they do, the marker
     /// layer owns `#?` at the shell prompt exclusively and submit-time mirror capture is
@@ -248,7 +264,9 @@ impl SessionState {
             mirror: TerminalMirror::new(columns, rows),
             previous_snapshot: None,
             next_snapshot_id: 1,
-            next_command_id: 1,
+            command_history: CommandHistory::new(),
+            next_request_id: 1,
+            latest_cwd: None,
             command_active: false,
             shell_integrated,
             pending: VecDeque::new(),
@@ -263,6 +281,28 @@ impl SessionState {
     /// Injects the session's event log; emit points stay inert without one.
     pub fn set_event_log(&mut self, event_log: EventLog) {
         self.event_log = event_log;
+    }
+
+    /// Records the inner shell's working directory from a `cwd` marker. The session
+    /// loop intercepts those markers before [`Self::handle_marker`] to mirror the
+    /// process cwd, so it hands the value here as well.
+    pub fn note_cwd(&mut self, cwd: String) {
+        self.latest_cwd = Some(cwd);
+    }
+
+    /// The bounded command-output index, for the read-only pull tools.
+    pub fn command_history(&self) -> &CommandHistory {
+        &self.command_history
+    }
+
+    /// Drains command-index warnings (an abandoned span) for the caller to log.
+    pub fn take_command_history_warnings(&mut self) -> Vec<String> {
+        self.command_history.take_warnings()
+    }
+
+    /// Discards an unfinished capture when the shell exits.
+    pub fn end_session(&mut self) {
+        self.command_history.abandon_active();
     }
 
     /// Whether the alternate screen is active (a full-screen program owns the
@@ -370,6 +410,10 @@ impl SessionState {
         self.timeline.record(TerminalEvent::PtyOutput {
             data: String::from_utf8_lossy(visible).into_owned(),
         });
+        // These bytes are already marker-clean (the scanner split them out), so the
+        // command index never sees a koshell marker. It captures only inside an open
+        // span, which excludes the echoed command line and the returning prompt.
+        self.command_history.record_output(visible);
         self.mirror.write(visible);
         self.record_snapshot();
         self.last_output_at = Some(now);
@@ -572,22 +616,37 @@ impl SessionState {
                     }
                 }
                 if let Some(command) = marker.command {
-                    let command_id = self.next_command_id();
                     self.command_active = true;
+                    // Only a real command opens a span. A synthetic pair (the
+                    // comment-only `#?` fallback) ran nothing, so indexing it would
+                    // invent a command and attach the next prompt's bytes to it.
+                    let command_id = if marker.executed {
+                        self.command_history
+                            .begin(&command, self.latest_cwd.clone())
+                    } else {
+                        String::new()
+                    };
                     self.timeline.record(TerminalEvent::CommandStart {
                         command_id,
                         command,
-                        cwd: None,
+                        cwd: self.latest_cwd.clone(),
                     });
                 }
                 Vec::new()
             }
             MarkerKind::CommandEnd => {
                 let command = marker.command.unwrap_or_default();
-                let command_id = self.next_command_id();
                 self.command_active = false;
+                // Closes the span its own start opened, so one stable id spans the
+                // whole command. An end with no open span (a synthetic pair, or a
+                // start whose marker was lost) closes nothing and creates no row.
+                let command_id = if marker.executed {
+                    self.command_history.end(marker.exit_code)
+                } else {
+                    None
+                };
                 self.timeline.record(TerminalEvent::CommandEnd {
-                    command_id,
+                    command_id: command_id.unwrap_or_default(),
                     command: command.clone(),
                     exit_code: marker.exit_code,
                     duration_ms: None,
@@ -694,7 +753,8 @@ impl SessionState {
     ) -> Action {
         let context_package =
             self.build_context_package(&question, form, completion, exit_code, still_running);
-        let request_id = format!("request-{}", self.next_command_id());
+        let request_id = format!("request-{}", self.next_request_id);
+        self.next_request_id += 1;
         self.timeline.record(TerminalEvent::AiRequest {
             request_id,
             question: question.clone(),
@@ -706,12 +766,6 @@ impl SessionState {
             submitted_at,
             context_package,
         })
-    }
-
-    fn next_command_id(&mut self) -> String {
-        let id = format!("command-{}", self.next_command_id);
-        self.next_command_id += 1;
-        id
     }
 
     fn build_context_package(
@@ -731,12 +785,21 @@ impl SessionState {
         if let Some(exit_code) = exit_code {
             trigger["exitCode"] = serde_json::Value::Number(exit_code.into());
         }
+        // `dynamicContext` carries `primaryTextTruncated`: the push budget trims from
+        // the start, so the agent must be able to tell "this is all there was" from
+        // "the beginning is missing". That distinction is what makes the pull
+        // instruction deterministic rather than a guess.
+        let dynamic_context = serde_json::to_value(&context).unwrap_or(serde_json::Value::Null);
         serde_json::json!({
             "contractVersion": AI_CONTEXT_CONTRACT_VERSION,
             "question": question,
             "trigger": trigger,
-            "dynamicContext": serde_json::to_value(&context)
-                .unwrap_or(serde_json::Value::Null),
+            "dynamicContext": dynamic_context,
+            // The anti-passivity mechanism: advertise what can be fetched, so failing
+            // to pull is an instruction-following problem rather than a curiosity one.
+            "pullContext": {
+                "commandOutput": crate::command_tools::pull_inventory(self),
+            },
         })
     }
 }
@@ -797,6 +860,7 @@ mod tests {
             command: Some(command.to_string()),
             exit_code: Some(exit_code),
             cwd: None,
+            executed: true,
         }
     }
 
@@ -806,6 +870,7 @@ mod tests {
             command: Some(command.to_string()),
             exit_code: None,
             cwd: None,
+            executed: true,
         }
     }
 
