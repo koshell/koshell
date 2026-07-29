@@ -6,7 +6,9 @@ import { join } from "node:path";
 import {
   ConfigError,
   loadConfig,
+  loadUserInstructions,
   resolveConfigPath,
+  resolveUserInstructionsPath,
   splitModelRef,
 } from "../src/config.ts";
 
@@ -236,6 +238,67 @@ describe("[search]", () => {
 describe("resolveConfigPath", () => {
   it("honors XDG_CONFIG_HOME", () => {
     expect(resolveConfigPath()).toContain(join("koshell", "koshell.toml"));
+  });
+});
+
+describe("loadUserInstructions", () => {
+  function writeInstructions(contents: string): string {
+    const path = join(dir, "AGENTS.md");
+    writeFileSync(path, contents);
+    return path;
+  }
+
+  it("sits next to koshell.toml in the config directory", () => {
+    expect(resolveUserInstructionsPath()).toContain(
+      join("koshell", "AGENTS.md"),
+    );
+  });
+
+  // The overwhelmingly common case. It is not a problem and must not be reported
+  // as one — the file is optional and most users will never create it.
+  it("returns nothing when the file does not exist", () => {
+    expect(loadUserInstructions(join(dir, "AGENTS.md"))).toBeUndefined();
+  });
+
+  // A file the user emptied out means "no instructions", not "an empty instruction".
+  it("treats a blank file as no instructions", () => {
+    expect(
+      loadUserInstructions(writeInstructions("\n  \n\t\n")),
+    ).toBeUndefined();
+  });
+
+  it("returns the trimmed text and its path", () => {
+    const path = writeInstructions("\n# Style\n\nBe blunt.\n\n");
+    expect(loadUserInstructions(path)).toEqual({
+      path,
+      text: "# Style\n\nBe blunt.",
+      truncated: false,
+    });
+  });
+
+  // Unbounded, this text would be prepended to every `#?` for the life of the
+  // conversation and would quietly spend the budget the terminal evidence needs.
+  it("keeps the head of an oversized file and says it was cut", () => {
+    const loaded = loadUserInstructions(
+      writeInstructions(`FIRST LINE\n${"x".repeat(40_000)}`),
+    );
+    expect(loaded?.truncated).toBe(true);
+    expect(loaded?.text.startsWith("FIRST LINE")).toBe(true);
+    expect(loaded?.text.length).toBeLessThan(20_000);
+  });
+
+  // Slicing bytes can split a multi-byte character; a stray replacement character
+  // in the middle of the user's own words is worse than one lost character.
+  it("does not leave a broken character at the truncation point", () => {
+    const loaded = loadUserInstructions(writeInstructions("语".repeat(20_000)));
+    expect(loaded?.truncated).toBe(true);
+    expect(loaded?.text).not.toContain("�");
+  });
+
+  // A wrong permission bit must not silently drop instructions the user believes
+  // are in force; the caller reports this once and answers anyway.
+  it("throws rather than silently skipping an unreadable file", () => {
+    expect(() => loadUserInstructions(dir)).toThrow(ConfigError);
   });
 });
 

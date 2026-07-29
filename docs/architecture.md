@@ -75,7 +75,11 @@ terminal operator while AI assists from beside the shell.
   dedicated search API because pi's tool abstraction cannot carry a provider-native
   server tool and ships no MCP client — see `design-0019-web-search-tool.md`. The static
   system prompt is built to match the session's real tool set, so it never denies a
-  capability the session has or advertises one it lacks.
+  capability the session has or advertises one it lacks, and it appends the user's own
+  `AGENTS.md` from the config directory when there is one
+  (`design-0022-user-instructions-agents-md.md`). That file is user-global: pi's
+  cwd-walking context-file discovery stays disabled, so the assistant's behavior does not
+  change as the user moves around the filesystem.
 
 ## Dependency boundaries
 

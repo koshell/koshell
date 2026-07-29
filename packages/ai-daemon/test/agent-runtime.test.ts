@@ -53,4 +53,34 @@ describe("model switch safety", () => {
       }),
     );
   });
+
+  // AGENTS.md is baked into the system prompt at session creation, so `koshell reload`
+  // has to rebuild after an edit rather than switch in place — otherwise the file looks
+  // live but the running conversation keeps the text it started with.
+  it("treats edited user instructions as a construction change", () => {
+    const config = {
+      model: "test/one",
+      thinking_level: "high" as const,
+      providers: {},
+    };
+    const instructions = {
+      path: "/config/AGENTS.md",
+      text: "Be blunt.",
+      truncated: false,
+    };
+    expect(configurationFingerprint(config, instructions)).not.toBe(
+      configurationFingerprint(config, undefined),
+    );
+    expect(configurationFingerprint(config, instructions)).not.toBe(
+      configurationFingerprint(config, { ...instructions, text: "Be gentle." }),
+    );
+    // Rewriting the file to identical bytes is not worth losing a transcript over,
+    // which is why the text is compared rather than an mtime.
+    expect(configurationFingerprint(config, instructions)).toBe(
+      configurationFingerprint(config, {
+        ...instructions,
+        path: "/elsewhere/AGENTS.md",
+      }),
+    );
+  });
 });

@@ -320,6 +320,40 @@ rebuilds the conversation on
 .BR "koshell reload" ,
 because the tool catalog and system prompt are fixed when the conversation is
 created; unlike a model change, it cannot be applied in place.
+.SH USER INSTRUCTIONS
+An optional
+.I AGENTS.md
+in the same directory as this file
+.RI ( ~/.config/koshell/AGENTS.md
+by default) holds standing instructions for the AI, in plain Markdown.
+It is loaded into every conversation.
+.PP
+The file decides tone, depth, format, and language, and takes precedence over
+koshell's own style guidance.
+It cannot loosen the boundary: koshell still only observes and explains, still
+grounds claims in the terminal context, and still never claims to have run
+anything.
+It is trusted input \(em only you can write it, in a directory only you control,
+the same trust model as your shell profile.
+.PP
+Unlike the repository-root
+.I AGENTS.md
+that coding agents discover by walking up from the working directory, this one
+is user-global.
+Koshell never loads a project's file because you changed directory.
+.PP
+The file is optional and an absent or blank one is not an error.
+It is capped at 16 KiB, keeping the beginning, because its text is charged
+against every
+.B #?
+in the conversation; when it is cut, the AI is told that it is seeing only part.
+An unreadable file is reported in the daemon log and then stepped over.
+.PP
+Editing it takes effect on
+.BR "koshell reload" ,
+which rebuilds the conversation and reports that its transcript was discarded
+\(em the system prompt is fixed when a conversation is created, so unlike a
+model change it cannot be applied in place.
 .SH CREDENTIALS
 .B api_key
 values take three forms:

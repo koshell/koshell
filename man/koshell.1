@@ -189,6 +189,21 @@ a conversation exists, the active model, and the working directory, plus a
 daemon summary (pid, version, uptime, connections). Run inside a koshell
 shell; it identifies the instance through
 .BR KOSHELL .
+.IP
+It also reports the
+.I AGENTS.md
+described under
+.B USER INSTRUCTIONS
+in
+.BR koshell.toml (5):
+the path searched, whether a file was loaded and how large it is, and whether
+the running conversation was built from that file's present contents.
+The path is printed even when nothing is there, so a file created in the wrong
+place is visible rather than silently ignored.
+A conversation started before the file was written or last edited is reported
+as such;
+.B koshell reload
+applies it.
 .TP
 .B reload \fR[\fB\-\-all\fR]
 Re-read
@@ -357,6 +372,14 @@ AI provider and model configuration (default
 .IR ~/.config/koshell/koshell.toml );
 see
 .BR koshell.toml (5).
+.TP
+.I $XDG_CONFIG_HOME/koshell/AGENTS.md
+Optional standing instructions for the AI, loaded into every conversation;
+see
+.BR koshell.toml (5).
+.B koshell status
+reports whether it was found and whether the current conversation is still
+using its present contents.
 .TP
 .I $XDG_CONFIG_HOME/koshell/no-auto
 Presence disables the auto-wrap snippet.

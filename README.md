@@ -166,6 +166,43 @@ what was dropped. Nothing is written to disk. Only completed commands from the i
 bash/zsh shell are indexed — not a still-running command, a REPL statement, or a command
 typed over SSH. See `docs/design-0020-completed-command-output-tools.md`.
 
+### Your own instructions (optional)
+
+Drop an `AGENTS.md` next to your config — `~/.config/koshell/AGENTS.md` — and koshell
+loads it into every conversation:
+
+```markdown
+Answer in Japanese, and skip the preamble.
+Mark inferences as inferences; don't dress a guess as something the terminal showed.
+Before suggesting a command, say what it changes or deletes.
+```
+
+It is yours: tone, depth, format, and language come from this file and take precedence
+over koshell's own style guidance. It cannot loosen the boundary — koshell still only
+observes and explains, and still never claims to have run anything. Unlike the repo-root
+`AGENTS.md` that coding agents read, this one is user-global and koshell never picks up a
+project's file just because you `cd`'d into it. It is capped at 16 KiB (the file is
+charged against every `#?` in the conversation) and says so in the prompt when it had to
+cut. Editing it takes effect on `koshell reload`, which rebuilds the conversation and
+discards its transcript.
+
+`koshell status` reports it — the path searched (even when nothing is there, so a file
+written to the wrong place is visible), its size, and whether the running conversation
+is still using its current contents:
+
+```text
+  instructions: /home/you/.config/koshell/AGENTS.md (412 B)
+                (changed since this conversation started — `koshell reload` applies it)
+```
+
+See `docs/design-0022-user-instructions-agents-md.md`.
+
+Two things are not left to that file, because neither is a matter of taste: koshell will
+not quote a credential back out of your output, and when it sees one on screen it says so
+— whatever was visible went to the model provider along with your question. And when you
+ask what it can see or do, it answers from the tools it was actually given rather than
+guessing.
+
 A custom provider is a full block (`api`, `base_url`, `api_key`, and at least one
 model); this is also how you pin a non-default API type such as `openai-responses`:
 

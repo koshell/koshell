@@ -313,6 +313,25 @@ export interface ReloadMessage {
 // Reply to `instance_status_request`. `known` is whether the daemon has a live
 // connection for that session_id; per-connection fields are set only when
 // known, while the daemon-global fields are always present.
+// The user's AGENTS.md as the daemon sees it (design 0022). Reported by the daemon
+// rather than resolved terminal-side because the two processes can disagree about
+// XDG_CONFIG_HOME, and the path that matters is the one actually read. `path` is
+// always present so a typo shows as "nothing at this path" instead of silence.
+export interface InstructionsStatusData {
+  path: string;
+  /** Absent when the file is missing or blank — the same outcome either way. */
+  bytes?: number;
+  truncated: boolean;
+  /** Set when the file exists but could not be read, carrying why. */
+  error?: string;
+  /**
+   * Whether the live conversation was built from the file's current text. False
+   * means it was edited afterwards, so it is on disk but not in effect until
+   * `koshell reload`. Absent when there is no conversation to compare against.
+   */
+  current?: boolean;
+}
+
 export interface InstanceStatusMessage {
   type: "instance_status";
   known: boolean;
@@ -321,6 +340,7 @@ export interface InstanceStatusMessage {
   shell?: string;
   model?: string;
   conversation: boolean;
+  instructions?: InstructionsStatusData;
   daemon_pid: number;
   uptime_ms: number;
   version: string;

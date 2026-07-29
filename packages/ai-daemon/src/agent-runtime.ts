@@ -17,7 +17,12 @@ import {
   type ResourceLoader,
 } from "@earendil-works/pi-coding-agent";
 
-import { type KoshellConfig, loadConfig } from "./config.ts";
+import {
+  type KoshellConfig,
+  loadConfig,
+  loadUserInstructions,
+  type UserInstructions,
+} from "./config.ts";
 import type { Logger } from "./logging.ts";
 import { buildSystemPrompt } from "./prompt.ts";
 import { resolveModel, resolveProvider } from "./provider.ts";
@@ -37,6 +42,10 @@ export interface KoshellAgent {
   // Stable serialization of provider/thinking construction inputs, excluding the
   // root default model. `koshell reload` uses it to prove a change is model-only.
   readonly configurationFingerprint?: string;
+  // The AGENTS.md text this conversation's system prompt was built from, if any.
+  // Kept so `koshell status` can say whether the file on disk is still the one in
+  // effect — an edit lands only on `koshell reload`, and nothing else would show it.
+  readonly userInstructions?: string;
   // Switches this AgentSession in place, preserving its transcript. Optional only
   // for lightweight injected test agents; the production pi agent implements it.
   setModel?(modelId: string): Promise<void>;
@@ -88,7 +97,10 @@ export function assertModelSwitchCapacity(
   }
 }
 
-export function configurationFingerprint(config: KoshellConfig): string {
+export function configurationFingerprint(
+  config: KoshellConfig,
+  userInstructions?: UserInstructions,
+): string {
   return JSON.stringify({
     thinking_level: config.thinking_level ?? null,
     providers: config.providers,
@@ -96,6 +108,12 @@ export function configurationFingerprint(config: KoshellConfig): string {
     // session creation, and neither can be swapped in place the way a model can. A
     // change here must therefore rebuild the conversation, not switch it.
     search: config.search ?? null,
+    // AGENTS.md is part of the system prompt, so editing it is an agent-construction
+    // change like the rest of this object — `koshell reload` must rebuild rather than
+    // switch, and will report that the transcript was discarded. The text itself is
+    // hashed in rather than the mtime: rewriting a file to identical bytes is not a
+    // change worth losing a conversation over.
+    instructions: userInstructions?.text ?? null,
   });
 }
 
@@ -127,6 +145,24 @@ export function createPiAgentFactory(): AgentFactory {
     const config = loadConfig();
     const { authStorage, modelRegistry, model, thinkingLevel } =
       resolveProvider(config);
+
+    // The user's standing instructions, read at the same boundary as the config. An
+    // unreadable file is reported and then stepped over: `#?` must still answer, and
+    // saying so once is better than silently dropping instructions the user believes
+    // are in force. A missing file is the ordinary case and says nothing.
+    let userInstructions: UserInstructions | undefined;
+    try {
+      userInstructions = loadUserInstructions();
+    } catch (error) {
+      log.warn(
+        `ignoring user instructions: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (userInstructions !== undefined) {
+      log.info(
+        `user instructions loaded from ${userInstructions.path}${userInstructions.truncated ? " (truncated)" : ""}`,
+      );
+    }
 
     // Custom tools are assembled from what is actually configured. With none, the
     // session keeps `noTools: "all"` (pi's builtins plus custom tools all disabled),
@@ -160,6 +196,7 @@ export function createPiAgentFactory(): AgentFactory {
             ? { webSearch: { backend: searchBackend } }
             : {}),
           commandOutput: toolNames.has("read_command_output"),
+          userInstructions,
         }),
       ),
       noTools: customTools.length > 0 ? "builtin" : "all",
@@ -218,7 +255,13 @@ export function createPiAgentFactory(): AgentFactory {
       get modelId(): string {
         return currentModelId;
       },
-      configurationFingerprint: configurationFingerprint(config),
+      configurationFingerprint: configurationFingerprint(
+        config,
+        userInstructions,
+      ),
+      ...(userInstructions !== undefined
+        ? { userInstructions: userInstructions.text }
+        : {}),
       async setModel(modelId: string): Promise<void> {
         // `koshell auth login/logout` can mutate the shared credential file after
         // this conversation was created. Refresh it before validating the target.

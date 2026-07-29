@@ -43,6 +43,7 @@ pub fn run() -> i32 {
                 shell,
                 model,
                 conversation,
+                instructions,
                 daemon_pid,
                 uptime_ms,
                 version,
@@ -61,6 +62,14 @@ pub fn run() -> i32 {
                     "  conversation: {}",
                     if conversation { "active" } else { "none" }
                 );
+                // Absent only from a daemon that predates this field; saying nothing
+                // is right there, since an older daemon genuinely does not read the
+                // file and reporting "none" would be a different, wrong claim.
+                if let Some(instructions) = instructions {
+                    for line in format_instructions(&instructions) {
+                        println!("{line}");
+                    }
+                }
                 if !known {
                     println!("  (no conversation yet on this instance — run a `#?` to start one)");
                 }
@@ -84,6 +93,57 @@ pub fn run() -> i32 {
             println!("  daemon:       not running");
             1
         }
+    }
+}
+
+/// Renders the AGENTS.md line(s) (design 0022).
+///
+/// The path is printed in every case, including "none". That is the whole point of
+/// reporting this: the failure it exists to make visible is a file the user created
+/// somewhere the daemon does not look, and "none" alone would leave them re-reading
+/// a correct-looking file rather than a wrong path.
+fn format_instructions(status: &koshell_proto::InstructionsStatus) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(error) = &status.error {
+        lines.push(format!("  instructions: unreadable — {error}"));
+        lines.push(format!("                {}", status.path));
+        return lines;
+    }
+    match status.bytes {
+        None => lines.push(format!("  instructions: none at {}", status.path)),
+        Some(bytes) => {
+            let truncated = if status.truncated {
+                ", truncated to the head"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "  instructions: {} ({}{truncated})",
+                status.path,
+                format_size(bytes)
+            ));
+        }
+    }
+    // Only ever false when a conversation exists and was built from different text,
+    // which is the second confusion this reporting exists for: the file is right, and
+    // the running conversation simply predates it.
+    if status.current == Some(false) {
+        lines.push(
+            "                (changed since this conversation started — `koshell reload` \
+             applies it)"
+                .to_string(),
+        );
+    }
+    lines
+}
+
+/// Bytes as a short human string. Instruction files are small; KiB is the ceiling
+/// that matters because the daemon refuses to load more than 16 of them.
+fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
     }
 }
 
@@ -137,6 +197,7 @@ mod tests {
                 shell: Some("/bin/zsh".to_string()),
                 model: Some("anthropic/claude-sonnet-4-5".to_string()),
                 conversation: true,
+                instructions: None,
                 daemon_pid: 1234,
                 uptime_ms: 9000,
                 version: "0.1.0".to_string(),
@@ -167,6 +228,78 @@ mod tests {
             }
             other => panic!("unexpected reply: {other:?}"),
         }
+    }
+
+    fn instructions(bytes: Option<u64>) -> koshell_proto::InstructionsStatus {
+        koshell_proto::InstructionsStatus {
+            path: "/home/u/.config/koshell/AGENTS.md".to_string(),
+            bytes,
+            truncated: false,
+            error: None,
+            current: None,
+        }
+    }
+
+    // The path is on the "none" line too: the failure this reporting exists for is a
+    // file created where the daemon does not look, and a bare "none" would send the
+    // user back to re-read a file that was never the problem.
+    #[test]
+    fn absent_instructions_still_name_the_path_searched() {
+        let lines = format_instructions(&instructions(None));
+        assert_eq!(
+            lines,
+            vec!["  instructions: none at /home/u/.config/koshell/AGENTS.md"]
+        );
+    }
+
+    #[test]
+    fn loaded_instructions_report_their_size() {
+        let lines = format_instructions(&instructions(Some(2048)));
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("/home/u/.config/koshell/AGENTS.md"));
+        assert!(lines[0].contains("2.0 KiB"));
+    }
+
+    #[test]
+    fn truncation_is_stated_rather_than_implied_by_the_size() {
+        let lines = format_instructions(&koshell_proto::InstructionsStatus {
+            truncated: true,
+            ..instructions(Some(16384))
+        });
+        assert!(lines[0].contains("truncated to the head"));
+    }
+
+    // A file that is right on disk but not yet in the running conversation is the
+    // second confusion; without this line it looks identical to one being followed.
+    #[test]
+    fn an_edited_file_says_reload_applies_it() {
+        let lines = format_instructions(&koshell_proto::InstructionsStatus {
+            current: Some(false),
+            ..instructions(Some(100))
+        });
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].contains("koshell reload"));
+    }
+
+    #[test]
+    fn a_file_matching_the_conversation_adds_no_second_line() {
+        let lines = format_instructions(&koshell_proto::InstructionsStatus {
+            current: Some(true),
+            ..instructions(Some(100))
+        });
+        assert_eq!(lines.len(), 1);
+    }
+
+    // A wrong permission bit must not read as "you have no instructions file".
+    #[test]
+    fn an_unreadable_file_reports_why_and_where() {
+        let lines = format_instructions(&koshell_proto::InstructionsStatus {
+            error: Some("EACCES: permission denied".to_string()),
+            ..instructions(None)
+        });
+        assert!(lines[0].contains("unreadable"));
+        assert!(lines[0].contains("permission denied"));
+        assert!(lines[1].contains("/home/u/.config/koshell/AGENTS.md"));
     }
 
     #[test]

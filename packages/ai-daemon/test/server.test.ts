@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { AuthStorage } from "@earendil-works/pi-coding-agent";
 import {
@@ -16,7 +19,11 @@ import {
 import type { KoshellConfig } from "../src/config.ts";
 import type { Logger } from "../src/logging.ts";
 import { PROTOCOL_VERSION } from "../src/protocol.ts";
-import { TerminalConnection, type MessageSink } from "../src/server.ts";
+import {
+  TerminalConnection,
+  instructionsStatus,
+  type MessageSink,
+} from "../src/server.ts";
 
 const noop = (): void => undefined;
 
@@ -897,10 +904,13 @@ describe("TerminalConnection reload and status", () => {
     connection.handleLine(aiRequestLine("r1"));
     await settle();
 
-    const outcome = await connection.reloadFromConfig({
-      ...original,
-      model: "test/new",
-    });
+    const outcome = await connection.reloadFromConfig(
+      {
+        ...original,
+        model: "test/new",
+      },
+      undefined,
+    );
 
     expect(outcome).toBe("switched");
     expect(model).toBe("test/new");
@@ -932,11 +942,14 @@ describe("TerminalConnection reload and status", () => {
     connection.handleLine(aiRequestLine("r1"));
     await settle();
 
-    const outcome = await connection.reloadFromConfig({
-      model: "test/old",
-      thinking_level: "low",
-      providers: {},
-    });
+    const outcome = await connection.reloadFromConfig(
+      {
+        model: "test/old",
+        thinking_level: "low",
+        providers: {},
+      },
+      undefined,
+    );
 
     expect(outcome).toBe("rebuilt");
     expect(disposed).toBe(true);
@@ -1158,5 +1171,74 @@ describe("TerminalConnection model discovery and switching", () => {
     await settle();
     expect(types(lines)).toEqual(["ack", "model_result"]);
     expect(lines[1]).toContain('"configured_model":"anthropic/new"');
+  });
+});
+
+// `koshell status` reports AGENTS.md so two silent failures become visible: a file
+// created where the daemon does not look, and a file edited after the conversation
+// that is using it was built (design 0022).
+describe("instructionsStatus", () => {
+  let dir: string;
+  const path = (): string => join(dir, "AGENTS.md");
+
+  const setup = (): void => {
+    dir = mkdtempSync(join(tmpdir(), "koshell-status-"));
+  };
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // The path is reported whether or not anything is there — that is what turns a
+  // wrong directory from silence into an answer.
+  it("names the path it searched even when nothing is there", () => {
+    setup();
+    const status = instructionsStatus(undefined, false, path());
+    expect(status.path).toBe(path());
+    expect(status.bytes).toBeUndefined();
+    expect(status.error).toBeUndefined();
+  });
+
+  it("reports the loaded size", () => {
+    setup();
+    writeFileSync(path(), "Be blunt.\n");
+    expect(instructionsStatus(undefined, false, path()).bytes).toBe(9);
+  });
+
+  // Without a conversation there is nothing for the file to be current with, and
+  // claiming either answer would be a guess.
+  it("omits currency when no conversation exists yet", () => {
+    setup();
+    writeFileSync(path(), "Be blunt.");
+    expect(
+      instructionsStatus(undefined, false, path()).current,
+    ).toBeUndefined();
+  });
+
+  it("marks the file current when the conversation used the same text", () => {
+    setup();
+    writeFileSync(path(), "Be blunt.");
+    expect(instructionsStatus("Be blunt.", true, path()).current).toBe(true);
+  });
+
+  it("marks the file stale after an edit the conversation has not seen", () => {
+    setup();
+    writeFileSync(path(), "Be gentle.");
+    expect(instructionsStatus("Be blunt.", true, path()).current).toBe(false);
+  });
+
+  // Creating the file mid-conversation is the same situation as editing it: present
+  // on disk, absent from the running prompt.
+  it("marks a newly created file stale against a conversation built without one", () => {
+    setup();
+    writeFileSync(path(), "Be blunt.");
+    expect(instructionsStatus(undefined, true, path()).current).toBe(false);
+  });
+
+  // A permission problem must not render as "you have no instructions file".
+  it("reports an unreadable file as an error rather than as absent", () => {
+    setup();
+    const status = instructionsStatus(undefined, false, dir);
+    expect(status.error).toBeDefined();
+    expect(status.bytes).toBeUndefined();
   });
 });

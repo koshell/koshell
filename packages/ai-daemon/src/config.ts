@@ -171,14 +171,79 @@ export type ModelDef = z.infer<typeof ModelDefSchema>;
 export type SearchConfig = z.infer<typeof SearchSchema>;
 export type SearchBackend = (typeof SEARCH_BACKENDS)[number];
 
-// Resolves the config path, following XDG: $XDG_CONFIG_HOME/koshell/koshell.toml,
-// falling back to ~/.config/koshell/koshell.toml.
-export function resolveConfigPath(): string {
+// Resolves Koshell's config directory, following XDG: $XDG_CONFIG_HOME/koshell,
+// falling back to ~/.config/koshell.
+export function resolveConfigDir(): string {
   const configHome = process.env.XDG_CONFIG_HOME;
   if (configHome !== undefined && configHome.length > 0) {
-    return join(configHome, "koshell", "koshell.toml");
+    return join(configHome, "koshell");
   }
-  return join(homedir(), ".config", "koshell", "koshell.toml");
+  return join(homedir(), ".config", "koshell");
+}
+
+export function resolveConfigPath(): string {
+  return join(resolveConfigDir(), "koshell.toml");
+}
+
+/** The optional standing-instructions file, alongside `koshell.toml`. */
+export const USER_INSTRUCTIONS_FILENAME = "AGENTS.md";
+
+// A hard ceiling, because this text is prepended to every `#?` for the life of the
+// conversation: an unbounded file would silently spend the context budget that the
+// terminal evidence needs. The head is kept rather than the tail — the opposite of
+// how terminal context is trimmed — because instructions are written most-important
+// first, whereas terminal output ends with the part being asked about.
+const USER_INSTRUCTIONS_MAX_BYTES = 16 * 1024;
+
+export interface UserInstructions {
+  /** Absolute path, quoted to the model so it can name what it is following. */
+  path: string;
+  text: string;
+  /** True when the file exceeded the byte ceiling and only its head was kept. */
+  truncated: boolean;
+}
+
+export function resolveUserInstructionsPath(): string {
+  return join(resolveConfigDir(), USER_INSTRUCTIONS_FILENAME);
+}
+
+// Reads the optional AGENTS.md next to `koshell.toml`. Absent or blank returns
+// undefined, which is the common case and not a problem. An unreadable file throws,
+// so the caller can say so once rather than silently answering without instructions
+// the user believes are in force — a wrong permission bit should not be invisible.
+export function loadUserInstructions(
+  pathOverride?: string,
+): UserInstructions | undefined {
+  const path = pathOverride ?? resolveUserInstructionsPath();
+
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return undefined;
+    }
+    throw new ConfigError(
+      `cannot read ${path}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  const text = raw.trim();
+  if (text.length === 0) {
+    return undefined;
+  }
+
+  const bytes = Buffer.from(text, "utf8");
+  if (bytes.byteLength <= USER_INSTRUCTIONS_MAX_BYTES) {
+    return { path, text, truncated: false };
+  }
+  // Decode with the replacement-free default and drop a trailing partial character:
+  // slicing bytes can split a multi-byte sequence, and a stray U+FFFD in the middle
+  // of the user's instructions is worse than one lost character.
+  const head = new TextDecoder("utf-8", { fatal: false })
+    .decode(bytes.subarray(0, USER_INSTRUCTIONS_MAX_BYTES))
+    .replace(/�$/, "");
+  return { path, text: head.trimEnd(), truncated: true };
 }
 
 // Parses and validates config text. Exported for the source-preserving model

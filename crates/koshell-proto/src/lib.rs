@@ -192,6 +192,35 @@ pub enum ClientMessage {
     },
 }
 
+/// The user's optional `AGENTS.md` as the daemon sees it, in
+/// [`ServerMessage::InstanceStatus`] (design 0022).
+///
+/// Reported by the daemon rather than resolved by the terminal on purpose: the two
+/// processes can disagree about `XDG_CONFIG_HOME`, and the path that matters is the
+/// one the daemon actually reads. `path` is therefore always present, so a typo or a
+/// wrong directory shows up as "no file at *this* path" instead of silence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstructionsStatus {
+    /// Absolute path the daemon looks at, whether or not anything is there.
+    pub path: String,
+    /// Size of the loaded instruction text. Absent when the file is missing or blank,
+    /// which are the same outcome: no instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// The file exceeded the daemon's ceiling and only its head is in the prompt.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Set when the file exists but could not be read, carrying why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Whether the live conversation was built from the file's current text. `false`
+    /// means the file was edited after the conversation started, so it is on disk but
+    /// not in effect until `koshell reload`. Absent when there is no conversation to
+    /// compare against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<bool>,
+}
+
 /// One choice offered by [`ServerMessage::AuthSelect`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthSelectOption {
@@ -382,6 +411,8 @@ pub enum ServerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
         conversation: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instructions: Option<InstructionsStatus>,
         daemon_pid: u32,
         uptime_ms: u64,
         version: String,
@@ -760,6 +791,13 @@ mod tests {
             shell: Some("/bin/zsh".into()),
             model: Some("anthropic/claude-sonnet-4-5".into()),
             conversation: true,
+            instructions: Some(InstructionsStatus {
+                path: "/home/u/.config/koshell/AGENTS.md".into(),
+                bytes: Some(2048),
+                truncated: false,
+                error: None,
+                current: Some(false),
+            }),
             daemon_pid: 1234,
             uptime_ms: 9000,
             version: "0.1.0".into(),
@@ -773,6 +811,7 @@ mod tests {
                 known,
                 model,
                 conversation,
+                instructions,
                 connections,
                 ..
             } => {
@@ -780,6 +819,9 @@ mod tests {
                 assert_eq!(model.as_deref(), Some("anthropic/claude-sonnet-4-5"));
                 assert!(conversation);
                 assert_eq!(connections, 2);
+                let instructions = instructions.expect("instructions reported");
+                assert_eq!(instructions.bytes, Some(2048));
+                assert_eq!(instructions.current, Some(false));
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -793,6 +835,7 @@ mod tests {
             shell: None,
             model: None,
             conversation: false,
+            instructions: None,
             daemon_pid: 1234,
             uptime_ms: 9000,
             version: "0.1.0".into(),
@@ -802,6 +845,9 @@ mod tests {
         .unwrap();
         assert!(!unknown.contains("\"cwd\""));
         assert!(unknown.contains("\"known\":false"));
+        // A daemon that does not report the file omits the key entirely, which a
+        // newer terminal must be able to tell apart from "there is no file".
+        assert!(!unknown.contains("\"instructions\""));
     }
 
     #[test]

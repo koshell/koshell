@@ -15,7 +15,13 @@ import {
   runAuthLogout,
 } from "./auth-flow.ts";
 import { openAuthStorage } from "./auth-store.ts";
-import { type KoshellConfig, loadConfig } from "./config.ts";
+import {
+  type KoshellConfig,
+  loadConfig,
+  loadUserInstructions,
+  resolveUserInstructionsPath,
+  type UserInstructions,
+} from "./config.ts";
 import { NdjsonDecoder } from "./framing.ts";
 import type { Logger } from "./logging.ts";
 import {
@@ -30,6 +36,7 @@ import {
   type AuthLoginMessage,
   CAPABILITY_COMMAND_OUTPUT_TOOLS_V1,
   type HelloMessage,
+  type InstructionsStatusData,
   type ModelSetMessage,
   PROTOCOL_VERSION,
   type ServerMessage,
@@ -65,6 +72,7 @@ export interface InstanceStatusData {
   shell?: string;
   model?: string;
   conversation: boolean;
+  instructions?: InstructionsStatusData;
   daemon_pid: number;
   uptime_ms: number;
   version: string;
@@ -129,6 +137,39 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+// The AGENTS.md half of `koshell status` (design 0022).
+//
+// Read fresh on every call, so the answer describes the file as it is now rather than
+// as it was when some conversation started. Comparing it against the text the live
+// conversation was built from is the other half: on disk and in effect are different
+// things, and only `koshell reload` closes the gap. Reporting one without the other
+// would make an edited-but-unapplied file indistinguishable from one being followed.
+export function instructionsStatus(
+  conversationText: string | undefined,
+  hasConversation: boolean,
+  pathOverride?: string,
+): InstructionsStatusData {
+  const path = pathOverride ?? resolveUserInstructionsPath();
+  let loaded: UserInstructions | undefined;
+  try {
+    loaded = loadUserInstructions(path);
+  } catch (error) {
+    return { path, truncated: false, error: errorText(error) };
+  }
+  const status: InstructionsStatusData = {
+    path,
+    truncated: loaded?.truncated ?? false,
+  };
+  if (loaded !== undefined) {
+    status.bytes = Buffer.byteLength(loaded.text, "utf8");
+  }
+  // Only meaningful once there is a conversation that could have been built from it.
+  if (hasConversation) {
+    status.current = loaded?.text === conversationText;
+  }
+  return status;
+}
+
 // One terminal connection: holds the hello metadata and one lazy persistent agent
 // conversation, and serializes ai_requests FIFO (pi forbids concurrent prompts on
 // one session). The conversation is discarded when the terminal disconnects; a
@@ -150,6 +191,9 @@ export class TerminalConnection {
   // `koshell status` can read it without awaiting; cleared with the agent.
   private modelId: string | undefined;
   private agentConfigurationFingerprint: string | undefined;
+  // The AGENTS.md text the live agent was built from, so status can tell an edited
+  // file (on disk, not yet in effect) from one that is actually being followed.
+  private agentUserInstructions: string | undefined;
   // This connection's terminal_session_id, learned from hello; the key it is
   // registered under so it can unregister itself on close.
   private sessionId: string | undefined;
@@ -656,6 +700,7 @@ export class TerminalConnection {
     this.agent = undefined;
     this.modelId = undefined;
     this.agentConfigurationFingerprint = undefined;
+    this.agentUserInstructions = undefined;
   }
 
   private enqueueControl<T>(operation: () => Promise<T>): Promise<T> {
@@ -699,6 +744,7 @@ export class TerminalConnection {
   // all other changes conservatively rebuild and report that history is lost.
   reloadFromConfig(
     config: KoshellConfig,
+    userInstructions: UserInstructions | undefined,
   ): Promise<"none" | "switched" | "rebuilt"> {
     return this.enqueueControl(async () => {
       const pending = this.agent;
@@ -708,7 +754,7 @@ export class TerminalConnection {
       const agent = await pending;
       if (
         this.agentConfigurationFingerprint ===
-          configurationFingerprint(config) &&
+          configurationFingerprint(config, userInstructions) &&
         agent.setModel !== undefined
       ) {
         await agent.setModel(config.model);
@@ -718,6 +764,7 @@ export class TerminalConnection {
       this.agent = undefined;
       this.modelId = undefined;
       this.agentConfigurationFingerprint = undefined;
+      this.agentUserInstructions = undefined;
       agent.dispose();
       return "rebuilt";
     });
@@ -739,6 +786,7 @@ export class TerminalConnection {
       this.agent = undefined;
       this.modelId = undefined;
       this.agentConfigurationFingerprint = undefined;
+      this.agentUserInstructions = undefined;
       if (pending !== undefined) {
         try {
           (await pending).dispose();
@@ -759,13 +807,19 @@ export class TerminalConnection {
     shell?: string;
     model?: string;
     conversation: boolean;
+    /** The AGENTS.md text this conversation was built from, if any. */
+    userInstructions?: string;
   } {
     const snapshot: {
       cwd?: string;
       shell?: string;
       model?: string;
       conversation: boolean;
+      userInstructions?: string;
     } = { conversation: this.agent !== undefined };
+    if (this.agentUserInstructions !== undefined) {
+      snapshot.userInstructions = this.agentUserInstructions;
+    }
     if (this.hello?.cwd !== undefined) {
       snapshot.cwd = this.hello.cwd;
     }
@@ -861,6 +915,7 @@ export class TerminalConnection {
         // without awaiting the agent promise.
         this.modelId = agent.modelId;
         this.agentConfigurationFingerprint = agent.configurationFingerprint;
+        this.agentUserInstructions = agent.userInstructions;
         return agent;
       })
       .catch((error: unknown) => {
@@ -870,6 +925,7 @@ export class TerminalConnection {
         this.agent = undefined;
         this.modelId = undefined;
         this.agentConfigurationFingerprint = undefined;
+        this.agentUserInstructions = undefined;
         throw error;
       });
     return this.agent;
@@ -938,9 +994,13 @@ export function startDaemon(
   // and say that history was discarded.
   const reload = async (sessionId?: string): Promise<ReloadOutcome> => {
     let config: KoshellConfig;
+    let userInstructions: UserInstructions | undefined;
     try {
       config = loadConfig();
       resolveProvider(config);
+      // Read here as well as in the agent factory, because the fingerprint compared
+      // below has to describe the same inputs the next agent will be built from.
+      userInstructions = loadUserInstructions();
     } catch (error) {
       return {
         ok: false,
@@ -956,7 +1016,9 @@ export function startDaemon(
           );
     try {
       const outcomes = await Promise.all(
-        targets.map((connection) => connection.reloadFromConfig(config)),
+        targets.map((connection) =>
+          connection.reloadFromConfig(config, userInstructions),
+        ),
       );
       const switched = outcomes.filter(
         (outcome) => outcome === "switched",
@@ -999,6 +1061,10 @@ export function startDaemon(
       known: connection !== undefined,
       session_id: sessionId,
       conversation: snapshot?.conversation ?? false,
+      instructions: instructionsStatus(
+        snapshot?.userInstructions,
+        snapshot?.conversation ?? false,
+      ),
       daemon_pid: process.pid,
       uptime_ms: Date.now() - startedAt,
       version: options.version,
