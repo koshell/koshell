@@ -64,17 +64,18 @@ terminal operator while AI assists from beside the shell.
   and credentials into pi, supports stored OAuth credentials without reading pi's
   configuration files, exposes the live pi/custom model catalog, and source-preservingly
   updates the configured default. A live conversation switches models through pi's
-  existing AgentSession without losing messages. The read-only terminal tool loop is not
-  wired yet, so each request
-  relies on a bounded context package pushed by the terminal.
+  existing AgentSession without losing messages. Each request still carries a bounded
+  context package pushed by the terminal, and the read-only tool loop now supplements it:
+  the daemon can pull the full output of completed commands back from the terminal that
+  asked (`design-0020-completed-command-output-tools.md`).
   Koshell-owned custom tools are assembled per conversation from what the config
-  actually enables (`tools.ts`): with none the session keeps pi's `noTools: "all"`, and
-  with any it uses `noTools: "builtin"` so pi's own file, shell, edit, and write tools
-  stay disabled. The first occupant is `web_search`, backed by a dedicated search API
-  because pi's tool abstraction cannot carry a provider-native server tool and ships no
-  MCP client — see `design-0019-web-search-tool.md`. The static system prompt is built
-  to match the session's real tool set, so it never denies a capability the session has
-  or advertises one it lacks.
+  actually enables and what the connected terminal advertises (`tools.ts`): with none the
+  session keeps pi's `noTools: "all"`, and with any it uses `noTools: "builtin"` so pi's
+  own file, shell, edit, and write tools stay disabled. `web_search` is backed by a
+  dedicated search API because pi's tool abstraction cannot carry a provider-native
+  server tool and ships no MCP client — see `design-0019-web-search-tool.md`. The static
+  system prompt is built to match the session's real tool set, so it never denies a
+  capability the session has or advertises one it lacks.
 
 ## Dependency boundaries
 

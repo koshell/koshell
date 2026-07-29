@@ -104,6 +104,27 @@ registered and failing when called. Two failure modes motivate this:
 A `[search]` block whose key resolves to nothing logs a warning and leaves the tool off.
 Optional capabilities never fail conversation creation: `#?` must still answer.
 
+### The prompt names the backend, 2026-07-29
+
+`buildSystemPrompt` originally took `webSearch: boolean`, and the tool description named
+no vendor. That was enough for the agent to _use_ search and not enough for it to
+describe what it had: asked directly which search it was using, it answered that it had
+no such tool. The backend name existed only in `renderSearchResponse`'s
+`Web search (exa) for:` header, which is not in context until a search has already run —
+so the one question a user is likely to ask before trusting the capability was the one it
+could not answer.
+
+The option is now `webSearch?: { backend: string }`, and the backend is interpolated into
+both the system prompt's capability clause and the tool description. Carrying the name
+rather than a boolean is what makes the wrong state unrepresentable: there is no way to
+say "search is on" without saying what it is on top of. `agent-runtime.ts` reads the
+provider off the config only when the tool actually registered, so the prompt cannot name
+a vendor the session has no way to reach.
+
+The prompt also states that the backend is a dedicated search vendor rather than the
+model provider's own search. Without that, an agent on Anthropic or OpenAI has every
+reason to assume it is calling its own provider's search — and would say so.
+
 ## Configuration
 
 ```toml
@@ -223,8 +244,45 @@ emits unconditionally on success and that never appeared. Worth remembering as a
 verification hazard — for a long-lived daemon, "the code on disk is new" and "the code
 that ran is new" are different claims, and only the second one is evidence.
 
-Still unverified: every failure branch (402, 429, timeout, unreachable, malformed
-envelope) and the `livecrawlTimeout` bound, none of which a successful call exercises.
+## Failure-path verification, 2026-07-29 11:00 CST
+
+The success run above left every failure branch unverified. Three of them are now
+verified too, by `packages/ai-daemon/scripts/search-live-check.ts` (`bun run
+search:live` in the daemon package) — opt-in, outside `bun run check`, because one case
+is billed and another takes ten seconds.
+
+The script exists because `test/search.test.ts` structurally cannot close this gap. Those
+tests hand a fake fetch a status code _we chose_ and assert we map it as intended; they
+say nothing about which status the live service returns. That is the same seam the dead
+`summary`/`text` fallback slipped through — fixtures asserted a defensive path worked
+while the real API made it unreachable. Each case below asserts something a fixture
+cannot reach:
+
+- **401 → `search_unauthorized`.** A deliberately invalid key against the real endpoint.
+  Exa answers **HTTP 401** (confirmed directly, not inferred from the mapped code, since
+  `httpErrorCode` folds 401 and 403 together). This is the failure a user actually meets
+  — a typo'd, revoked, or unexported key — and it costs nothing to check, needs no
+  credential, and sends no terminal content.
+- **Refused connection → `search_unreachable`.** A local port with nothing listening.
+- **No response → `timeout` after 10s.** A local server that accepts and then answers
+  nothing. This is the only way to exercise the real `AbortSignal.timeout` end to end; a
+  fake fetch rejecting on demand proves nothing about the timeout itself. The local
+  hanging server is deliberate — pointing at an unroutable address would return "host
+  unreachable" on some networks and hang on others, making the assertion depend on where
+  it ran.
+
+Still unverified, and why: **402** (credits exhausted or budget exceeded) cannot be
+produced on demand without an account that is genuinely out of balance. The script says
+so rather than pretending to cover it, and names the way to close it — run with `--paid`
+from such an account, and the success case failing with `search_payment_required` _is_
+the evidence. **429** would require deliberately hammering a vendor's rate limiter, which
+is not a reasonable thing to do to close a documentation gap. The malformed-envelope
+branch and the `livecrawlTimeout` bound remain fixture-covered.
+
+The billed success case (`--paid`, needs `EXA_API_KEY`, ~$0.007) is in the script too, so
+the 2026-07-29 success run is now repeatable rather than a one-off. It asserts more than
+"no error": at least one result must carry a non-empty snippet, which fails loudly if the
+request shape ever drifts back to a content mode Exa does not return.
 
 Exa reports `costDollars` per call. It is written to the daemon log only — it is not
 evidence, so it never reaches the model, and it is a vendor's number rather than a
@@ -268,10 +326,11 @@ would be the least visible thing it does.
 
 ## Open issues
 
-- The success path is live-verified (2026-07-29, above), but the **failure paths are not**:
-  the 402, 429, timeout, unreachable, and "no usable results" branches have only ever
-  been exercised against fixtures. A vendor changing its envelope degrades to "no usable
-  results" rather than breaking, so a wrong guess about the error shape fails quietly.
+- The success path, 401, unreachable, and timeout are live-verified (2026-07-29, above).
+  **402, 429, and the malformed envelope are not**, for the reasons given in that
+  section. The envelope case is the one that fails quietly: a vendor changing its shape
+  degrades to "no usable results" rather than breaking, so a wrong guess about it looks
+  like a search that found nothing.
 - `web_search` returns excerpts only; there is no page-fetch tool. A result whose answer
   lies outside the returned highlights cannot be read further. This couples to the
   two-search bound: not being able to read a promising page raises the value of
@@ -288,10 +347,11 @@ would be the least visible thing it does.
 
 - ~~Smoke Exa against its live API, checking that `highlights` arrives populated.~~ Done
   2026-07-29; see the verification section above.
-- Exercise the failure branches against the live API before treating them as more than
-  plausible — at minimum a bad key (401) and an exhausted or budget-capped account
-  (402), since those two are the ones a user actually meets. The others can stay
-  fixture-covered.
+- ~~Exercise the failure branches against the live API — at minimum a bad key (401) and
+  an exhausted account (402).~~ 401 done 2026-07-29, along with unreachable and timeout.
+  402 remains: run `bun run search:live --paid` from an account that is actually out of
+  balance, and record the resulting `search_payment_required`. 429 and the malformed
+  envelope stay fixture-covered by choice.
 - Add a second backend only when a concrete need appears, and only with the same
   standard Exa was held to: a live smoke plus a pass over that vendor's own agent
   guidance. A backend that cannot meet both does not go in behind a warning.

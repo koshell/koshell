@@ -146,12 +146,19 @@ export function createPiAgentFactory(): AgentFactory {
       );
     }
     const toolNames = new Set(customTools.map((tool) => tool.name));
+    // Read the backend off the config only when the tool actually registered, so the
+    // prompt cannot name a search vendor a session has no way to reach.
+    const searchBackend = toolNames.has("web_search")
+      ? config.search?.provider
+      : undefined;
 
     const { session } = await createAgentSession({
       cwd,
       resourceLoader: createResourceLoader(
         buildSystemPrompt({
-          webSearch: toolNames.has("web_search"),
+          ...(searchBackend !== undefined
+            ? { webSearch: { backend: searchBackend } }
+            : {}),
           commandOutput: toolNames.has("read_command_output"),
         }),
       ),

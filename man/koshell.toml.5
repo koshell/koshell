@@ -278,10 +278,10 @@ Gemini
 grounding) cannot be reached through the configured model. A dedicated API also
 keeps search working identically across every supported provider.
 .PP
-The adapter follows Exa's own published guidance for agent use, and searching
-has been exercised against the live API as of 2026-07-29. The failure paths \(em
-expired credits, rate limiting, timeouts \(em are still covered only by tests. A
-call costs roughly $0.007 at the default
+The adapter follows Exa's own published guidance for agent use. As of 2026-07-29
+the live API is verified for searching, a rejected key, an unreachable endpoint,
+and a timeout; expired credits and rate limiting are still covered only by
+tests. A call costs roughly $0.007 at the default
 .BR max_results .
 .TP
 .B provider

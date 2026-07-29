@@ -201,9 +201,9 @@ provider = "exa"          # the only backend
 ```
 
 > [Exa](https://exa.ai) is the sole backend, and its adapter follows Exa's own published
-> guidance for agent use. Searching works against the live API as of 2026-07-29; the
-> failure paths (expired credits, rate limiting, timeouts) are still covered only by
-> tests. A call costs roughly $0.007.
+> guidance for agent use. As of 2026-07-29 the live API is verified for searching, a bad
+> key, an unreachable endpoint, and a timeout; expired credits and rate limiting are
+> still covered only by tests. A call costs roughly $0.007.
 
 Without the block, no search tool exists and the AI is told it cannot fetch anything —
 it is never registered-but-broken. Search goes through a dedicated search API rather
@@ -246,9 +246,10 @@ Koshell is a hybrid monorepo with two runtimes:
 - **`koshell-ai-daemon` (Bun, shared)** — one process per user session, auto-spawned by
   the terminal and single-instance per user (the socket is the lock). Receives `#?`
   requests over IPC, owns Koshell provider/model/auth resolution, and runs one pi-backed
-  streaming agent conversation per terminal session. The read-only terminal context tool
-  loop is not wired yet, so context is push-only. Its source uses `node:` APIs only, so
-  Bun is the runtime and packager, not an API dependency.
+  streaming agent conversation per terminal session. It also owns the custom-tool seam:
+  `web_search` runs entirely inside the daemon, while the completed-command readers are
+  proxied back to the terminal that asked. Its source uses `node:` APIs only, so Bun is
+  the runtime and packager, not an API dependency.
 
 The two communicate over newline-delimited JSON (JSONL) on a Unix domain socket.
 
