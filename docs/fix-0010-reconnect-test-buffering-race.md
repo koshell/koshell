@@ -1,8 +1,13 @@
-# Fix 0009 — reconnect test buffering race
+# Fix 0010 — reconnect test buffering race
 
 Date: 2026-07-16 10:00:07 CST (+0800)
 
 Status: implemented.
+
+Originally numbered 0009. It was written on 2026-07-16 but landed after
+`fix-0009-burst-snapshot-retention.md`, which had already taken that number, so
+it was renumbered on 2026-07-29. Commit `7c80411` still carries the file under
+the old name.
 
 ## Why
 
