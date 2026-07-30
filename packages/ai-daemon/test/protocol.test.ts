@@ -45,6 +45,19 @@ describe("parseClientMessage", () => {
     });
   });
 
+  it("parses a conversation_reset, which carries nothing but its type", () => {
+    // Per-connection by construction (design 0023): a session_id would be meaningless
+    // here, and an extra field must not make the message unparseable either.
+    expect(
+      parseClientMessage(JSON.stringify({ type: "conversation_reset" })),
+    ).toEqual({ type: "conversation_reset" });
+    expect(
+      parseClientMessage(
+        JSON.stringify({ type: "conversation_reset", session_id: "koshell-1" }),
+      ),
+    ).toEqual({ type: "conversation_reset" });
+  });
+
   it("parses auth_login and auth_logout", () => {
     expect(
       parseClientMessage(

@@ -321,6 +321,18 @@ export class TerminalConnection {
             .catch(() => undefined);
         }
         break;
+      case "conversation_reset": {
+        // `koshell new` / `koshell clear` (design 0023). Same teardown `koshell
+        // reload` uses, minus the config re-read: the next ai_request rebuilds the
+        // agent from the config this connection already has. No reply — the
+        // terminal has already presented the outcome.
+        const had = this.resetAgent();
+        this.options.log.info(
+          `conversation reset for ${this.sessionId ?? "an unregistered session"}` +
+            (had ? "" : " (none was live)"),
+        );
+        break;
+      }
       case "tool_response":
         // Settling is the bridge's job: it owns the pending map and drops unknown,
         // duplicate, mismatched-request, and late responses without presentation.

@@ -156,6 +156,23 @@ Conversations are currently memory-only. Model switches no longer discard them, 
 provider-definition rebuild, terminal disconnect, or daemon restart still leaves no
 conversation to resume; transcript persistence is not implemented.
 
+To start over on purpose, without touching configuration:
+
+```bash
+koshell new      # discard the AI conversation; the screen and its context stay
+koshell clear    # clear the screen, the context the AI can read, AND the conversation
+```
+
+The two cover the two kinds of history a terminal conversation accumulates: `new` drops
+what the AI _remembers_, `clear` also drops what it can _see_ — the screen (scrollback
+included), the recent-output window, the screen snapshots, and the completed-command index
+below. Reach for `clear` when you want the next `#?` to know nothing about the stretch of
+terminal you just finished with; it is the plain `clear` gesture extended to everything
+koshell kept about that screen. Both act on the current terminal and must run inside
+koshell. Since `koshell clear` is koshell's own, the system `clear` binary needs a path form
+to run in the PTY (`koshell /usr/bin/clear`) — plain `clear` is untouched. See
+`docs/design-0023-new-and-clear-commands.md`.
+
 Terminal context is no longer push-only. Alongside the current screen and a bounded
 recent window, koshell keeps an index of your recent completed commands and their full
 output, and the AI can read it on demand — so a question about output that has scrolled

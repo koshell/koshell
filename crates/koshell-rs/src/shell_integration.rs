@@ -1,6 +1,12 @@
 //! Shell integration: generate temporary bash/zsh rc files that emit OSC 777 command
 //! boundary markers, and parse those markers back out of the PTY stream.
 //!
+//! The OSC 777 prefix is koshell's whole in-band control channel, not only the shell
+//! hooks' boundary reports: `koshell new` and `koshell clear` (design 0023) address the
+//! wrapper from inside the wrap with the same sequences ([`MarkerKind::is_control`]).
+//! Anything on that channel is stripped from the byte stream before the user's terminal
+//! and the mirror see it, so a control request never renders as garbage.
+//!
 //! Ported from `coshell/src/shell-integration.ts` (renamed to koshell). The rc hooks
 //! source the user's own rc files first, then install `preexec`/`precmd` (zsh) or a
 //! `DEBUG` trap plus `PROMPT_COMMAND` (bash). A `command_start` marker carries the full
@@ -53,6 +59,23 @@ pub enum MarkerKind {
     /// foreground wrapper can mirror it onto its own process (see the working-directory
     /// mirroring handling in `session.rs`). Carries `cwd`, never `command`/`exit_code`.
     Cwd,
+    /// `koshell new`: discard the AI conversation, leaving the screen and the terminal
+    /// evidence in place. Emitted by [`crate::control_cli`], not by the shell hooks, and
+    /// carries no fields. See design 0023.
+    NewConversation,
+    /// `koshell clear`: drop the terminal evidence the AI can read (screen, timeline,
+    /// completed-command index) *and* the conversation. Emitted by
+    /// [`crate::control_cli`]; carries no fields. See design 0023.
+    ClearContext,
+}
+
+impl MarkerKind {
+    /// Whether this marker is a control request from a `koshell` subcommand rather than a
+    /// command-boundary report from the shell hooks. Control markers carry no payload
+    /// fields and never open, close, or annotate a command span.
+    pub fn is_control(self) -> bool {
+        matches!(self, MarkerKind::NewConversation | MarkerKind::ClearContext)
+    }
 }
 
 /// A parsed command-boundary marker.
@@ -122,6 +145,8 @@ pub fn parse_marker_payload(payload: &[u8]) -> Option<ShellIntegrationMarker> {
         "command_start" => MarkerKind::CommandStart,
         "command_end" => MarkerKind::CommandEnd,
         "cwd" => MarkerKind::Cwd,
+        "new_conversation" => MarkerKind::NewConversation,
+        "clear_context" => MarkerKind::ClearContext,
         _ => return None,
     };
     let command = value
@@ -153,12 +178,15 @@ pub fn parse_marker_payload(payload: &[u8]) -> Option<ShellIntegrationMarker> {
     })
 }
 
-/// Formats a marker as the on-wire OSC sequence (used by tests).
+/// Formats a marker as the on-wire OSC sequence: how the shell hooks' output is spelled
+/// (used by tests), and how [`crate::control_cli`] addresses the wrapper for real.
 pub fn format_marker(marker: &ShellIntegrationMarker) -> Vec<u8> {
     let type_str = match marker.kind {
         MarkerKind::CommandStart => "command_start",
         MarkerKind::CommandEnd => "command_end",
         MarkerKind::Cwd => "cwd",
+        MarkerKind::NewConversation => "new_conversation",
+        MarkerKind::ClearContext => "clear_context",
     };
     let mut json = serde_json::json!({ "type": type_str });
     if let Some(command) = &marker.command {
@@ -658,6 +686,33 @@ mod tests {
         let bytes = format_marker(&marker);
         let payload = &bytes[MARKER_PREFIX.len()..bytes.len() - 1];
         assert_eq!(parse_marker_payload(payload), Some(marker));
+    }
+
+    // The control channel `koshell new` / `koshell clear` write to (design 0023): the two
+    // kinds must survive the wire distinctly and carry no span payload, since the wrapper
+    // routes them away from the command-boundary path entirely.
+    #[test]
+    fn round_trips_the_control_markers_without_span_fields() {
+        for kind in [MarkerKind::NewConversation, MarkerKind::ClearContext] {
+            let marker = ShellIntegrationMarker {
+                kind,
+                command: None,
+                exit_code: None,
+                cwd: None,
+                executed: true,
+            };
+            let bytes = format_marker(&marker);
+            let payload = &bytes[MARKER_PREFIX.len()..bytes.len() - 1];
+            assert_eq!(parse_marker_payload(payload), Some(marker));
+            assert!(kind.is_control(), "{kind:?} is a control marker");
+        }
+        for kind in [
+            MarkerKind::CommandStart,
+            MarkerKind::CommandEnd,
+            MarkerKind::Cwd,
+        ] {
+            assert!(!kind.is_control(), "{kind:?} is a shell-hook marker");
+        }
     }
 
     // The synthetic pair a comment-only `#?` line produces: it must survive the wire

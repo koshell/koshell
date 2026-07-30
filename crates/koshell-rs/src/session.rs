@@ -335,6 +335,19 @@ pub fn run_interactive_shell(command: &[String]) -> Result<i32> {
                                     state.note_cwd(dir.clone());
                                 }
                             }
+                            // `koshell new` / `koshell clear` (design 0023): a request from
+                            // a child process, not a command boundary. It is applied here
+                            // rather than in `handle_marker` because it touches the screen
+                            // and the daemon connection, which are the session loop's, not
+                            // `SessionState`'s.
+                            Segment::Marker(marker) if marker.kind.is_control() => {
+                                apply_control_marker(
+                                    marker.kind,
+                                    &mut stdout,
+                                    &mut state,
+                                    &mut ipc_client,
+                                );
+                            }
                             Segment::Marker(marker) => {
                                 actions.extend(state.handle_marker(marker, now));
                             }
@@ -621,6 +634,60 @@ fn reap_child(child: &mut (dyn portable_pty::Child + Send + Sync), child_pid: Op
 /// prompt under the cursor stays the last line (the notice is inserted above it).
 fn present_notice(stdout: &mut std::io::Stdout, state: &mut SessionState, text: &str) {
     crate::presentation::notice_before_prompt(text, stdout, state);
+}
+
+/// Home the cursor, erase the screen, then erase the scrollback — what `clear` sends on a
+/// terminal that supports `E3`. The scrollback erase matters most here: leaving it would
+/// keep the output the user just asked to forget one scroll away.
+const CLEAR_SCREEN_AND_SCROLLBACK: &[u8] = b"\x1b[H\x1b[2J\x1b[3J";
+
+/// Applies a `koshell new` / `koshell clear` control marker (design 0023).
+///
+/// Both discard the conversation; `clear` additionally erases the screen and every piece
+/// of terminal evidence the AI can read. The order inside `clear` is load-bearing: the
+/// evidence reset runs first, so the screen-clear bytes fed back into the mirror leave one
+/// honest snapshot of the empty screen as the only surviving evidence rather than being
+/// swept away with the rest.
+///
+/// The conversation half is best-effort by design. With no live daemon connection there is
+/// no conversation to discard, and the notice says so instead of pretending; a send that
+/// fails drops the connection the same way every other send does.
+fn apply_control_marker(
+    kind: MarkerKind,
+    stdout: &mut std::io::Stdout,
+    state: &mut SessionState,
+    ipc_client: &mut Option<IpcClient>,
+) {
+    let clearing = kind == MarkerKind::ClearContext;
+    if clearing {
+        state.clear_context();
+        let _ = stdout.write_all(CLEAR_SCREEN_AND_SCROLLBACK);
+        let _ = stdout.flush();
+        state.record_presentation_output(CLEAR_SCREEN_AND_SCROLLBACK);
+    }
+
+    let conversation = reset_conversation(ipc_client);
+    let notice = match (clearing, conversation) {
+        (true, true) => "screen, terminal context, and AI conversation cleared",
+        (true, false) => "screen and terminal context cleared; no AI conversation to reset",
+        (false, true) => "new AI conversation; the previous one is discarded",
+        (false, false) => "no AI conversation to reset",
+    };
+    log::info!("control marker {kind:?}: {notice}");
+    present_notice(stdout, state, notice);
+}
+
+/// Asks the daemon to drop this connection's conversation. Returns whether the request
+/// went out — with no connection, nothing was ever built to reset.
+fn reset_conversation(ipc_client: &mut Option<IpcClient>) -> bool {
+    let Some(client) = ipc_client.as_mut() else {
+        return false;
+    };
+    if client.send(&ClientMessage::ConversationReset {}).is_err() {
+        *ipc_client = None;
+        return false;
+    }
+    true
 }
 
 /// Executes one daemon-initiated tool call against the terminal's own session state

@@ -422,6 +422,17 @@ impl CommandHistory {
         Some(command_id)
     }
 
+    /// Drops every completed row (`koshell clear`, design 0023), so the pull tools can no
+    /// longer reach output the user has just erased from the screen.
+    ///
+    /// The *active* span survives on purpose: `koshell clear` is itself a running command,
+    /// and discarding its span would leave the `command_end` marker closing nothing and
+    /// warning about it. Ids keep advancing, so a stale id the model still holds reads as
+    /// "not found" rather than resolving to a different command.
+    pub fn clear_completed(&mut self) {
+        self.completed.clear();
+    }
+
     /// Discards an unfinished capture (shell exit). The command never completed, so it
     /// never becomes a history row.
     pub fn abandon_active(&mut self) {
@@ -532,6 +543,32 @@ mod tests {
 
     fn history() -> CommandHistory {
         clocked().0
+    }
+
+    #[test]
+    fn clear_completed_drops_rows_but_keeps_the_running_span() {
+        let mut store = history();
+        store.begin("ls", None);
+        store.record_output(b"file-a\r\n");
+        store.end(Some(0));
+        let active = store.begin("koshell clear", None);
+
+        store.clear_completed();
+
+        assert!(store.recent().is_empty(), "completed rows are gone");
+        assert_eq!(store.completed_count(), 0);
+        assert_eq!(
+            store.active_command_id(),
+            Some(active.as_str()),
+            "the clear command's own span still closes cleanly"
+        );
+        assert!(
+            store.take_warnings().is_empty(),
+            "keeping the active span means no abandoned-capture warning"
+        );
+        // Ids keep advancing, so a stale id never resolves to a different command.
+        store.end(Some(0));
+        assert_ne!(store.recent()[0].command_id, "command-1");
     }
 
     #[test]

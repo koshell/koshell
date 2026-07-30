@@ -1,4 +1,4 @@
-.TH KOSHELL 1 "2026-07-12" "koshell 0.1.0" "Koshell Manual"
+.TH KOSHELL 1 "2026-07-30" "koshell 0.1.0" "Koshell Manual"
 .SH NAME
 koshell \- human-centric shared terminal: AI beside your terminal, not above it
 .SH SYNOPSIS
@@ -40,6 +40,10 @@ koshell \- human-centric shared terminal: AI beside your terminal, not above it
 .br
 .B koshell reload
 .RB [ \-\-all ]
+.br
+.B koshell new
+.br
+.B koshell clear
 .SH DESCRIPTION
 .B koshell
 is a transparent PTY wrapper that keeps the human as the primary terminal
@@ -218,6 +222,30 @@ and explicitly report that its in-memory transcript was discarded. The new
 config is validated first: if it is invalid, nothing changes and every session
 keeps its previous configuration. Does not start the daemon.
 .TP
+.B new
+Discard this terminal's AI conversation, so the next
+.B #?
+starts a fresh one. The screen and the terminal context the AI can read are
+left untouched, and
+.I koshell.toml
+is not re-read. Must be run inside a koshell-wrapped shell. Prints a one-line
+notice; with no conversation to discard, it says so instead.
+.TP
+.B clear
+Clear the screen
+.RB ( scrollback " included)"
+and the terminal context the AI can read \(em the recent-output window, the
+screen snapshots, and the completed-command index behind the read-only tools
+\(em and discard the AI conversation as well.
+This is the plain
+.BR clear (1)
+gesture extended to everything koshell retained about that screen: after it,
+the next
+.B #?
+knows nothing about the stretch of terminal you just finished with.
+It cannot be undone \(em nothing is archived. Must be run inside a
+koshell-wrapped shell.
+.TP
 .I program \fR[\fIargs\fR...]
 Any other leading positional launches that program in the PTY instead of
 the default shell, with
@@ -233,11 +261,19 @@ The names
 .BR auth ,
 .BR model ,
 .BR status ,
+.BR reload ,
+.BR new ,
 and
-.B reload
+.B clear
 are reserved for the subcommands above; to launch a program literally named
 that, use a path form (for example
 .BR "koshell ./daemon" ).
+.B clear
+is the one with a namesake on every system: run it in the PTY as
+.BR "koshell /usr/bin/clear" .
+Plain
+.BR clear (1)
+inside koshell is unaffected \(em koshell reserves names only after its own.
 .SH OPTIONS
 .TP
 .BI \-\-log-level " LEVEL"
@@ -357,9 +393,17 @@ inside koshell" signal; koshell uses the fields to refuse a same-terminal nested
 launch and to let
 .BR "koshell status" ,
 .BR "koshell reload" ,
+.BR "koshell model" ,
+.BR "koshell new" ,
 and
-.B koshell model
-address the current instance's daemon connection. Not meant to be set by hand.
+.B koshell clear
+address the current instance. Not meant to be set by hand.
+.IP
+A refused nested launch exits non-zero and leaves the shell that ran it exactly
+where it was; it does not start a shell of its own. (Only an
+.B exec koshell
+\(em which left no shell behind \(em still falls open to a bare shell, since
+exiting there would close the terminal.)
 .TP
 .BR XDG_CONFIG_HOME ", " XDG_STATE_HOME ", " XDG_DATA_HOME ", " XDG_RUNTIME_DIR ", " XDG_CACHE_HOME
 Standard XDG base directories; see

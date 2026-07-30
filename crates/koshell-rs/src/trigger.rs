@@ -305,6 +305,28 @@ impl SessionState {
         self.command_history.abandon_active();
     }
 
+    /// Drops the terminal evidence the AI can read: the timeline (recent text, PTY
+    /// output, screen snapshots) and the completed-command index behind the pull tools.
+    /// Backs `koshell clear` (design 0023).
+    ///
+    /// Deliberately *not* the mirror: the caller owns the screen, so it writes the clear
+    /// sequence to the terminal and feeds those same bytes back through
+    /// [`Self::record_presentation_output`], keeping the mirror-feed invariant intact and
+    /// leaving one honest snapshot of the now-empty screen as the only surviving evidence.
+    /// Calling this first is what keeps that snapshot out of the reset. The diff base goes
+    /// with the timeline — a retained one would make the next snapshot cite a
+    /// `previous_snapshot_id` that no longer exists.
+    ///
+    /// Pending `#?` questions are left alone: they belong to lines the user submitted, and
+    /// a question already in flight still fires (with whatever evidence exists after the
+    /// clear, which is little — an accepted corner, since asking and clearing in the same
+    /// breath is contradictory).
+    pub fn clear_context(&mut self) {
+        self.timeline.reset();
+        self.command_history.clear_completed();
+        self.previous_snapshot = None;
+    }
+
     /// Whether the alternate screen is active (a full-screen program owns the
     /// keys, so koshell must not claim interrupts or cancels).
     pub fn alt_screen(&self) -> bool {
@@ -687,6 +709,10 @@ impl SessionState {
             // loop intercepts them and mirrors the directory onto koshell's own process
             // before ever reaching here, so this arm is only for match exhaustiveness.
             MarkerKind::Cwd => Vec::new(),
+            // Control markers (`koshell new` / `koshell clear`) are likewise intercepted by
+            // the session loop, which owns the screen and the daemon connection they need;
+            // the evidence half lands in `clear_context`. Never a command boundary.
+            MarkerKind::NewConversation | MarkerKind::ClearContext => Vec::new(),
         }
     }
 
@@ -1264,6 +1290,53 @@ mod tests {
         state.poll(overdue);
         let rescheduled = state.next_maintenance_delay(overdue).expect("still armed");
         assert!(rescheduled >= TIMELINE_MAINTENANCE_INTERVAL - Duration::from_secs(1));
+    }
+
+    // `koshell clear` (design 0023): every piece of AI-readable evidence goes, and the
+    // one snapshot the caller feeds back afterwards is a clean root with no dangling diff
+    // base into the discarded timeline.
+    #[test]
+    fn clear_context_drops_the_timeline_and_the_command_index() {
+        let t0 = Instant::now();
+        let mut state = SessionState::new(80, 24, true);
+        state.handle_marker(start_marker("ls"), t0);
+        state.record_output(b"file-a\r\nfile-b\r\n", t0);
+        state.handle_marker(end_marker("ls", 0), t0);
+        assert!(!state.timeline.list_entries().is_empty());
+        assert_eq!(state.command_history().completed_count(), 1);
+        assert!(!state.timeline.get_recent_text(4096).is_empty());
+
+        state.clear_context();
+
+        assert!(state.timeline.list_entries().is_empty(), "timeline dropped");
+        assert!(state.timeline.get_recent_text(4096).is_empty());
+        assert_eq!(
+            state.command_history().completed_count(),
+            0,
+            "the pull tools can no longer reach erased output"
+        );
+
+        // The caller's screen-clear write is the first post-clear evidence, and it roots a
+        // fresh diff chain instead of citing a snapshot the reset removed.
+        state.record_presentation_output(b"\x1b[H\x1b[2J");
+        let snapshots = state.timeline.list_screen_snapshots();
+        assert_eq!(snapshots.len(), 1);
+        match &snapshots[0].event {
+            TerminalEvent::ScreenSnapshot {
+                previous_snapshot_id,
+                diff,
+                screen,
+                ..
+            } => {
+                assert!(previous_snapshot_id.is_none(), "no dangling diff base");
+                assert!(diff.is_none());
+                assert!(
+                    screen.as_deref().unwrap_or_default().trim().is_empty(),
+                    "the surviving snapshot shows the cleared screen"
+                );
+            }
+            other => panic!("unexpected timeline event: {other:?}"),
+        }
     }
 
     #[test]

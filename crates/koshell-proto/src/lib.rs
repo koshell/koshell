@@ -93,6 +93,18 @@ pub enum ClientMessage {
     /// the request with its usual single end/error marker; a daemon that does not
     /// know this message type ignores it, per the additive-evolution rule.
     AiCancel { request_id: String },
+    /// Discards this connection's conversation so the next `#?` starts a fresh one
+    /// (`koshell new`, and the conversation half of `koshell clear` — design 0023).
+    ///
+    /// Per-connection by construction: it carries no session id because it arrives on
+    /// the terminal's own live connection, unlike the daemon-global `reload_request`.
+    /// Fire-and-forget like [`ClientMessage::AiCancel`]: the terminal has already told
+    /// the user what happened, so a reply would only duplicate a decision the user
+    /// asked for. The daemon defers the teardown behind an in-flight answer, so a
+    /// streaming response finishes on the old conversation before it is dropped.
+    /// A daemon that does not know this type ignores it, per the additive-evolution
+    /// rule — the terminal-side clear still happens.
+    ConversationReset {},
     /// Settles exactly one daemon-initiated [`ServerMessage::AiToolCall`].
     ///
     /// A success carries `ok: true` and exactly one `result`; a failure carries
@@ -730,6 +742,14 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn conversation_reset_is_a_bare_tagged_object() {
+        let encoded = serde_json::to_string(&ClientMessage::ConversationReset {}).unwrap();
+        assert_eq!(encoded, r#"{"type":"conversation_reset"}"#);
+        let back: ClientMessage = serde_json::from_str(&encoded).unwrap();
+        assert!(matches!(back, ClientMessage::ConversationReset {}));
     }
 
     #[test]

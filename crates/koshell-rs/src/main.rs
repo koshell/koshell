@@ -7,6 +7,8 @@
 use clap::Parser;
 
 use koshell_rs::cli::Command;
+use koshell_rs::control_cli::Control;
+use koshell_rs::shell::NestedLaunch;
 
 fn main() {
     let cli = koshell_rs::cli::Cli::parse();
@@ -37,6 +39,12 @@ fn main() {
         Some(Command::Reload { all }) => {
             std::process::exit(koshell_rs::reload_cli::run(all));
         }
+        Some(Command::New) => {
+            std::process::exit(koshell_rs::control_cli::run(Control::NewConversation));
+        }
+        Some(Command::Clear) => {
+            std::process::exit(koshell_rs::control_cli::run(Control::ClearContext));
+        }
         Some(Command::Launch(command)) => command,
         None => Vec::new(),
     };
@@ -48,16 +56,27 @@ fn main() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         koshell_rs::session::run_interactive_shell(&command)
     }));
+    // A refused nested launch is not the failure the fail-open exists for (fix 0011). When
+    // the shell that ran us is still waiting for us to exit, replacing this process with a
+    // bare shell would hand the user an unwanted extra shell layer inside the koshell they
+    // were already in. Only an `exec koshell` — which left no shell behind — still needs
+    // the recovery, and `NestedLaunch` says which of the two happened.
+    let mut fail_open = true;
     match result {
         Ok(Ok(code)) => std::process::exit(code),
-        Ok(Err(error)) => eprintln!("koshell failed: {error}"),
+        Ok(Err(error)) => {
+            eprintln!("koshell failed: {error}");
+            if let Some(nested) = error.downcast_ref::<NestedLaunch>() {
+                fail_open = nested.replaced_the_shell;
+            }
+        }
         // The default panic hook has already printed the panic location and message.
         Err(_) => eprintln!("koshell panicked during startup"),
     }
     // Only the auto-wrap (bare `exec koshell`, no explicit program) risks locking the user
     // out; an explicit `koshell <command>` still has its parent shell to fall back to, so
     // exiting non-zero is the faithful outcome there.
-    if launching_shell {
+    if launching_shell && fail_open {
         koshell_rs::session::exec_fallback_shell();
     }
     std::process::exit(1);

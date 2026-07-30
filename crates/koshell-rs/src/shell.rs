@@ -184,26 +184,35 @@ pub fn tty_marker_path(tty: &str) -> PathBuf {
 /// Returns true when the liveness marker for `tty` names a process that is still alive.
 /// Convenience over [`tty_marker_is_live`] that resolves the conventional path first.
 pub fn tty_is_live(tty: &str) -> bool {
-    tty_marker_is_live(Some(&tty_marker_path(tty).to_string_lossy()))
+    tty_owner_pid(tty).is_some()
+}
+
+/// The pid of the *live* koshell that wrapped `tty`, from its conventional marker file.
+/// `None` when no koshell owns the tty any more, by any of the routes
+/// [`tty_marker_is_live`] treats as not-live.
+pub fn tty_owner_pid(tty: &str) -> Option<libc::pid_t> {
+    tty_marker_owner_pid(&tty_marker_path(tty).to_string_lossy())
 }
 
 /// Returns true when the liveness marker at `marker_path` names a process that is still
 /// alive (`kill(pid, 0)`). Missing path, unreadable/garbage contents, or a dead/foreign
 /// pid all read as not-live, which is the safe default (treat the brand as stale → wrap).
 pub fn tty_marker_is_live(marker_path: Option<&str>) -> bool {
-    let Some(path) = marker_path else {
-        return false;
-    };
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(pid) = contents.trim().parse::<libc::pid_t>() else {
-        return false;
-    };
+    marker_path.and_then(tty_marker_owner_pid).is_some()
+}
+
+/// The live pid recorded in the marker file at `marker_path`, or `None` when the file is
+/// missing, unreadable, not a pid, or names a process that is gone.
+pub fn tty_marker_owner_pid(marker_path: &str) -> Option<libc::pid_t> {
+    let pid = std::fs::read_to_string(marker_path)
+        .ok()?
+        .trim()
+        .parse::<libc::pid_t>()
+        .ok()?;
     // Safety: `kill` with signal 0 performs an existence/permission check and delivers no
     // signal. A reused pid owned by another user returns EPERM (non-zero) and reads as
     // not-live, the safe direction.
-    unsafe { libc::kill(pid, 0) == 0 }
+    (unsafe { libc::kill(pid, 0) == 0 }).then_some(pid)
 }
 
 /// Returns true when this process is a genuine same-terminal nested koshell launch.
@@ -234,22 +243,85 @@ pub fn is_nested_koshell(
     }
 }
 
+/// A refused nested launch: koshell was started from inside a live koshell on the same
+/// terminal (fix 0011).
+///
+/// A typed error rather than a string because the recovery differs from every other
+/// startup failure. The generic fail-open (`exec` a bare shell so an `exec koshell` that
+/// died cannot close the terminal) is *wrong* here whenever the shell that ran us is still
+/// waiting for us to exit: it would replace this process with an extra nested shell the
+/// user never asked for — no shell integration, one more `exit` to get out, and the
+/// wrapping koshell left holding a command span that never ends. Refusing and exiting
+/// leaves the caller's shell exactly where it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NestedLaunch {
+    /// The live koshell that owns this terminal, when the brand named a tty whose marker
+    /// could be read. `None` on the coarse-fallback path, where nothing can be proven
+    /// about who is above us.
+    pub owner_pid: Option<libc::pid_t>,
+    /// Whether this process took the place of the shell that would otherwise be running
+    /// here — an `exec koshell` (the auto-wrap snippet, or a hand-typed one) rather than a
+    /// plain `koshell`. Then there is no shell left to return to and the fail-open is the
+    /// only thing keeping the terminal alive.
+    pub replaced_the_shell: bool,
+}
+
+impl NestedLaunch {
+    /// Decides `replaced_the_shell` from the owning koshell's pid and this process's
+    /// parent pid.
+    ///
+    /// The discriminator is exact rather than heuristic: the wrapping koshell spawns the
+    /// inner shell as its direct child, so a plain `koshell` typed at that shell's prompt
+    /// has the *shell* as its parent, while an `exec koshell` replaced the shell's process
+    /// image and therefore inherits its parent — the wrapping koshell named by the tty
+    /// marker. Without an owner pid (the coarse fallback, where koshell could not brand
+    /// the child pts) nothing is provable, so this reports `true` and keeps the
+    /// terminal-preserving behavior.
+    pub fn detect(owner_pid: Option<libc::pid_t>, parent_pid: libc::pid_t) -> Self {
+        Self {
+            owner_pid,
+            replaced_the_shell: owner_pid.is_none_or(|owner| owner == parent_pid),
+        }
+    }
+}
+
+impl std::fmt::Display for NestedLaunch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.owner_pid {
+            Some(pid) => write!(
+                f,
+                "koshell already wraps this terminal (pid {pid}), so this shell is \
+                 already inside it — `#?` works here, and `koshell status` reports the \
+                 session. Open a new terminal for a separate koshell."
+            ),
+            None => write!(
+                f,
+                "koshell is already running in this shell. Start a new regular terminal \
+                 session before launching koshell again."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NestedLaunch {}
+
 /// Fails when koshell is being launched from inside a *live* koshell on the same terminal.
 /// `current_tty` is this process's controlling tty (see [`controlling_tty`]); the liveness
-/// gate is derived from the tty branded into the inherited `KOSHELL`.
+/// gate is derived from the tty branded into the inherited `KOSHELL`. The error is a typed
+/// [`NestedLaunch`] so the caller can tell this refusal apart from a real startup failure —
+/// see its docs for why the fail-open must not fire here.
 pub fn assert_not_nested_koshell(
     env: &HashMap<String, String>,
     current_tty: Option<&str>,
 ) -> anyhow::Result<()> {
-    let marker_live = env
+    let owner_pid = env
         .get(KOSHELL_ENV_KEY)
         .and_then(|value| koshell_tty(value))
-        .map(tty_is_live)
-        .unwrap_or(false);
-    if is_nested_koshell(env, current_tty, marker_live) {
-        anyhow::bail!(
-            "koshell is already running in this shell. Start a new regular terminal session before launching koshell again."
-        );
+        .and_then(tty_owner_pid);
+    if is_nested_koshell(env, current_tty, owner_pid.is_some()) {
+        // Safety: `getppid` reads this process's parent pid and cannot fail.
+        let parent_pid = unsafe { libc::getppid() };
+        return Err(NestedLaunch::detect(owner_pid, parent_pid).into());
     }
     Ok(())
 }
@@ -440,6 +512,58 @@ mod tests {
         // The same-tty live/dead liveness branch is covered by `nested_detection` (which
         // takes the liveness bool directly) and by the end-to-end `shell_init_pty` tests
         // that write a real marker at the conventional path.
+    }
+
+    // fix 0011: the refusal is a typed error carrying the fail-open decision, so a nested
+    // launch is never mistaken for the startup failure the fail-open exists for.
+    #[test]
+    fn nested_refusal_is_typed_and_carries_the_fail_open_decision() {
+        let error = assert_not_nested_koshell(&env_of(&[("KOSHELL", "koshell-1")]), None)
+            .expect_err("the coarse fallback refuses");
+        let nested = error
+            .downcast_ref::<NestedLaunch>()
+            .expect("a typed NestedLaunch, not an opaque message");
+        // Nothing provable without an owner pid: keep the terminal-preserving fail-open.
+        assert_eq!(nested.owner_pid, None);
+        assert!(nested.replaced_the_shell);
+    }
+
+    #[test]
+    fn detect_reads_exec_from_the_parent_being_the_owning_koshell() {
+        // Plain `koshell` at the inner shell's prompt: the shell is our parent, so it is
+        // still there to return to — refuse and exit, never fail open into a nested shell.
+        let typed = NestedLaunch::detect(Some(4100), 4242);
+        assert!(!typed.replaced_the_shell);
+        assert!(typed.to_string().contains("4100"), "names the owner");
+
+        // `exec koshell` (the auto-wrap snippet, or hand-typed): the shell's process image
+        // is gone and we inherited its parent, the wrapping koshell. Exiting would close
+        // the terminal, so the fail-open must fire.
+        assert!(NestedLaunch::detect(Some(4100), 4100).replaced_the_shell);
+
+        // No owner pid: unprovable, so keep the safe direction.
+        assert!(NestedLaunch::detect(None, 4242).replaced_the_shell);
+    }
+
+    // The owner pid is what makes the exec discrimination above possible, so the marker
+    // read has to yield the pid itself and not only the liveness bool it used to.
+    #[test]
+    fn tty_marker_owner_pid_reads_the_pid_not_just_liveness() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("marker");
+        let path = path.to_str().unwrap();
+        assert_eq!(tty_marker_owner_pid(path), None, "no marker, no owner");
+
+        std::fs::write(path, format!("{}\n", std::process::id())).expect("write live marker");
+        assert_eq!(
+            tty_marker_owner_pid(path),
+            Some(std::process::id() as libc::pid_t)
+        );
+        assert!(tty_marker_is_live(Some(path)));
+
+        std::fs::write(path, "2147483646").expect("write dead marker");
+        assert_eq!(tty_marker_owner_pid(path), None, "a dead pid owns nothing");
+        assert!(!tty_marker_is_live(Some(path)));
     }
 
     #[test]

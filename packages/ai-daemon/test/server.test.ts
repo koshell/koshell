@@ -846,6 +846,59 @@ describe("TerminalConnection reload and status", () => {
     expect(lines.some((line) => line.includes('"delta":"a1"'))).toBe(true);
   });
 
+  // `koshell new` / `koshell clear` (design 0023): the terminal asks on its own live
+  // connection, gets no reply, and the next `#?` runs on a fresh conversation.
+  it("a conversation_reset line discards the conversation without replying", async () => {
+    const { sink, lines } = collectingSink();
+    let builds = 0;
+    const factory: AgentFactory = () => {
+      const n = (builds += 1);
+      return Promise.resolve<KoshellAgent>({
+        modelId: `model-${String(n)}`,
+        ask({ onDelta }: AskOptions): Promise<void> {
+          onDelta(`a${String(n)}`);
+          return Promise.resolve();
+        },
+        abort: noop,
+        dispose: noop,
+      });
+    };
+    const connection = new TerminalConnection(sink, {
+      createAgent: factory,
+      log: NOOP_LOGGER,
+    });
+
+    connection.handleLine(HELLO_LINE);
+    connection.handleLine(aiRequestLine("r1"));
+    await settle();
+    expect(connection.instanceSnapshot().conversation).toBe(true);
+
+    const before = lines.length;
+    connection.handleLine(JSON.stringify({ type: "conversation_reset" }));
+    await settle();
+    expect(lines).toHaveLength(before);
+    expect(connection.instanceSnapshot().conversation).toBe(false);
+
+    // The next question rebuilds rather than continuing the discarded transcript.
+    connection.handleLine(aiRequestLine("r2"));
+    await settle();
+    expect(builds).toBe(2);
+    expect(lines.some((line) => line.includes('"delta":"a2"'))).toBe(true);
+  });
+
+  it("a conversation_reset before any question is a harmless no-op", async () => {
+    const { sink, lines } = collectingSink();
+    const connection = new TerminalConnection(sink, {
+      createAgent: () => Promise.reject(new Error("never built")),
+      log: NOOP_LOGGER,
+    });
+    connection.handleLine(HELLO_LINE);
+    connection.handleLine(JSON.stringify({ type: "conversation_reset" }));
+    await settle();
+    expect(lines).toEqual([]);
+    expect(connection.instanceSnapshot().conversation).toBe(false);
+  });
+
   it("resetAgent returns false when no agent has been built", () => {
     const { sink } = collectingSink();
     const connection = new TerminalConnection(sink, {

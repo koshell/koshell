@@ -9,9 +9,12 @@
 //! `--` allows a program whose name starts with a dash. Unknown dashed arguments before
 //! the program are rejected so the option namespace stays reserved for future flags.
 //!
-//! `shell-init`, `daemon`, `auth`, `model`, `preflight`, `status`, and `reload` shadow
-//! programs literally named that; launching such a program requires a path form (for example
-//! `koshell ./shell-init` or `koshell ./daemon`). Accepted residual of reserving the names.
+//! `shell-init`, `daemon`, `auth`, `model`, `preflight`, `status`, `reload`, `new`, and
+//! `clear` shadow programs literally named that; launching such a program requires a path
+//! form (for example `koshell ./shell-init` or `koshell ./clear`). Accepted residual of
+//! reserving the names — `clear` is the one with a real namesake on every system, so
+//! `koshell clear` is koshell's own clear and `koshell ./clear`, `koshell /usr/bin/clear`
+//! run the binary.
 
 use clap::{Parser, Subcommand};
 
@@ -94,6 +97,16 @@ pub enum Command {
         #[arg(long)]
         all: bool,
     },
+
+    /// Start a new AI conversation in this terminal, discarding the current one.
+    /// The screen and the terminal context the AI can read are left untouched. Run
+    /// inside a koshell shell.
+    New,
+
+    /// Clear the screen and the terminal context the AI can read (recent output,
+    /// screen snapshots, the completed-command index), and start a new AI
+    /// conversation — a clean slate for both of you. Run inside a koshell shell.
+    Clear,
 
     /// Program to launch instead of the default shell, with its arguments.
     #[command(external_subcommand)]
@@ -285,6 +298,20 @@ mod tests {
         // A path spelling still launches a real program of that name.
         let cli = parse(&["./reload", "--now"]).unwrap();
         assert_eq!(launch(&cli), ["./reload", "--now"]);
+    }
+
+    #[test]
+    fn new_and_clear_parse_and_shadow_their_namesakes() {
+        assert_eq!(parse(&["new"]).unwrap().command, Some(Command::New));
+        assert_eq!(parse(&["clear"]).unwrap().command, Some(Command::Clear));
+        // Neither takes arguments: a stray one is a parse error, not a silent launch.
+        assert!(parse(&["new", "extra"]).is_err());
+        assert!(parse(&["clear", "extra"]).is_err());
+        // A path spelling still launches the real `clear` binary in the PTY.
+        let cli = parse(&["./clear"]).unwrap();
+        assert_eq!(launch(&cli), ["./clear"]);
+        let cli = parse(&["/usr/bin/clear"]).unwrap();
+        assert_eq!(launch(&cli), ["/usr/bin/clear"]);
     }
 
     #[test]

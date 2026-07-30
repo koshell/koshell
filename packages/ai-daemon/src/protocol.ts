@@ -38,6 +38,17 @@ export interface AiCancelMessage {
   request_id: string;
 }
 
+// Discard this connection's conversation so the next `#?` starts a fresh one
+// (`koshell new`, and the conversation half of `koshell clear` — design 0023).
+// Per-connection by construction: no session id, because it arrives on the
+// terminal's own live connection, unlike the daemon-global `reload_request`.
+// Fire-and-forget, like `ai_cancel`: the terminal has already told the user what
+// happened. The teardown is deferred behind an in-flight answer, so a streaming
+// response finishes on the old conversation before it is dropped.
+export interface ConversationResetMessage {
+  type: "conversation_reset";
+}
+
 // Structured tool failure, safe to hand to the model as a normal tool result.
 export interface ToolErrorPayload {
   code: string;
@@ -151,6 +162,7 @@ export type ClientMessage =
   | HelloMessage
   | AiRequestMessage
   | AiCancelMessage
+  | ConversationResetMessage
   | ToolResponseMessage
   | ByeMessage
   | StatusRequestMessage
@@ -479,6 +491,8 @@ export function parseClientMessage(line: string): ClientMessage | null {
         };
       }
       return null;
+    case "conversation_reset":
+      return { type: "conversation_reset" };
     case "tool_response": {
       if (
         typeof value.request_id !== "string" ||

@@ -6,6 +6,7 @@ pub mod cli;
 pub mod command_history;
 pub mod command_tools;
 pub mod context;
+pub mod control_cli;
 pub mod daemon_cli;
 pub mod daemon_spawn;
 pub mod event_log;
