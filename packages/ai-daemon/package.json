@@ -13,7 +13,7 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "build:binary": "bun build --compile src/index.ts --outfile dist/koshell-ai-daemon",
+    "build:binary": "bun scripts/build-binary.ts",
     "smoke": "bun scripts/smoke.ts bun src/index.ts",
     "smoke:binary": "bun run build:binary && bun scripts/smoke.ts ./dist/koshell-ai-daemon",
     "search:live": "bun scripts/search-live-check.ts"

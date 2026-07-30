@@ -18,6 +18,11 @@ make                   # cargo release build + Bun-compiled daemon binary
 sudo make install      # /usr/local/bin/{koshell,koshell-ai-daemon} + man pages
 ```
 
+Both binaries are stamped with a build version: `make KOSHELL_VERSION=1.2.0` for an
+explicit one, otherwise the tag on `HEAD`, otherwise the build's UTC timestamp
+(`20260730.074058`). `koshell version` compares what is installed with what is actually
+running.
+
 Run `make` and `make install` as two steps: installing does not rebuild, so
 nothing runs under sudo except the file copies. For a user install without sudo:
 
@@ -172,6 +177,27 @@ koshell kept about that screen. Both act on the current terminal and must run in
 koshell. Since `koshell clear` is koshell's own, the system `clear` binary needs a path form
 to run in the PTY (`koshell /usr/bin/clear`) — plain `clear` is untouched. See
 `docs/design-0023-new-and-clear-commands.md`.
+
+### Which build is actually running
+
+A terminal keeps the koshell it was started with, and the daemon is a separate long-lived
+process, so after an upgrade three different builds can be live at once. `koshell version`
+reports all three side by side:
+
+```
+koshell:            20260730.074058  (this binary, protocol v1)
+this tty:           20260729.183304  (/dev/ttys003, pid 4821)
+  (a different build than this binary — a new terminal runs 20260730.074058)
+koshell-ai-daemon:  20260730.074101  (pid 5120, protocol v1)
+```
+
+`koshell --version` prints this binary's version alone. The terminal rows work with no
+daemon, and nothing is started to answer: a stopped daemon is reported as stopped, with the
+command that would start one.
+
+Versions are stamped when the binaries are built — an explicit `KOSHELL_VERSION`, else the
+tag on `HEAD`, else the build's UTC timestamp as `YYYYMMDD.HHMMSS`. See
+`docs/design-0024-version-command-and-build-stamping.md`.
 
 Terminal context is no longer push-only. Alongside the current screen and a bounded
 recent window, koshell keeps an index of your recent completed commands and their full
@@ -347,3 +373,9 @@ bun run check          # format check, lint, typecheck, and tests across package
 
 `make check` runs the full validation for both runtimes with the same commands
 as CI.
+
+A `cargo build` or `bun run build:binary` stamps its own build version the same way `make`
+does (`KOSHELL_VERSION`, else the tag on `HEAD`, else a UTC timestamp), so a locally built
+binary always identifies itself. Running the daemon from source
+(`KOSHELL_DAEMON_CMD="bun $PWD/packages/ai-daemon/src/index.ts"`) reports `0.1.0+source`:
+nothing stamped that run.

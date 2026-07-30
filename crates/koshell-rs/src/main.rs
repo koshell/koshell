@@ -45,6 +45,9 @@ fn main() {
         Some(Command::Clear) => {
             std::process::exit(koshell_rs::control_cli::run(Control::ClearContext));
         }
+        Some(Command::Version) => {
+            std::process::exit(koshell_rs::version_cli::run());
+        }
         Some(Command::Launch(command)) => command,
         None => Vec::new(),
     };

@@ -41,7 +41,8 @@ pub(crate) fn probe(path: &Path) -> Probe {
 
 /// Asks the running daemon for its status, returning the `status` message or
 /// `None` if it does not reply in time (an older daemon that ignores the request).
-fn query_status(path: &Path) -> Option<ServerMessage> {
+/// Shared with `version_cli`, which reports the same daemon identity from another angle.
+pub(crate) fn query_status(path: &Path) -> Option<ServerMessage> {
     let mut stream = UnixStream::connect(path).ok()?;
     stream.set_read_timeout(Some(STATUS_TIMEOUT)).ok()?;
     let request = serde_json::to_string(&ClientMessage::StatusRequest {}).ok()?;

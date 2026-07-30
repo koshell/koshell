@@ -27,11 +27,37 @@ import { resolveSocketPath } from "./socket-path.ts";
 // stale daemon drains itself; the next `#?` respawns one in ~200ms.
 const IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 
+// This build's version (design 0024), substituted for the identifier below by
+// `scripts/build-binary.ts` (`bun build --define`) while compiling, so the binary carries
+// the build it came from instead of reading its runtime environment.
+//
+// A declared global rather than a `process.env` read: `--define` substitutes bare
+// identifiers, and `process` is an explicit `node:process` import here, so a
+// `process.env.X` form would silently never be replaced. `typeof` is what keeps the
+// unsubstituted case safe — in a source run (`bun src/index.ts`) the identifier does not
+// exist at all. That case reports the package version marked `+source`: nothing stamped
+// the run, and saying so beats a bare `0.1.0` that reads like a stale binary in
+// `koshell version`'s three-way comparison.
+declare const KOSHELL_BUILD_VERSION: string | undefined;
+const VERSION =
+  typeof KOSHELL_BUILD_VERSION === "string"
+    ? KOSHELL_BUILD_VERSION
+    : `${pkg.version}+source`;
+
 async function main(): Promise<void> {
+  const argv = process.argv.slice(2);
+
+  // Answered before anything else touches the socket: `koshell-ai-daemon --version` must
+  // never start, adopt, or contend for a daemon just to print a string.
+  if (argv.includes("--version")) {
+    process.stdout.write(`koshell-ai-daemon ${VERSION}\n`);
+    return;
+  }
+
   const socketPath = resolveSocketPath();
 
   // Level: --log-level argument, then KOSHELL_LOG, then "info".
-  const level = resolveLogLevel(process.argv.slice(2), process.env);
+  const level = resolveLogLevel(argv, process.env);
   const log = createLogger(level, (line) => {
     process.stdout.write(`[koshell-ai-daemon] ${line}\n`);
   });
@@ -57,7 +83,7 @@ async function main(): Promise<void> {
   const server = startDaemon(socketPath, {
     createAgent: createPiAgentFactory(),
     log,
-    version: pkg.version,
+    version: VERSION,
     idleTimeoutMs: IDLE_TIMEOUT_MS,
     onIdle: () => {
       log.info("no terminals connected within the idle window; exiting");

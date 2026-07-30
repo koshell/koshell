@@ -181,6 +181,39 @@ pub fn tty_marker_path(tty: &str) -> PathBuf {
         .join(tty.replace('/', "_"))
 }
 
+/// The version file that sits beside a wrapped tty's liveness marker, holding the version
+/// of the koshell that owns that terminal (design 0024). Same conventional derivation as
+/// [`tty_marker_path`], plus a `.version` suffix; tty device names contain no `.`, so the
+/// suffix cannot collide with another terminal's marker.
+///
+/// A second file rather than a second line in the marker itself: the marker's body is read
+/// as `kill -0 "$(cat ...)"` by the auto-wrap snippet (and parsed as a bare integer by
+/// [`tty_marker_owner_pid`]), so anything else in it would make an older shell snippet — or
+/// an older koshell — read a live wrap as dead and wrap again, nesting koshell inside
+/// koshell. The version is decoration; the marker is load-bearing, and it does not change.
+pub fn tty_version_path(tty: &str) -> PathBuf {
+    let mut path = tty_marker_path(tty).into_os_string();
+    path.push(".version");
+    PathBuf::from(path)
+}
+
+/// The version of the koshell that wrapped `tty`, from the file beside its liveness marker.
+/// `None` when there is no such file (a koshell predating design 0024, or one whose marker
+/// could not be written), it is unreadable, or it is empty — all of which read as "unknown
+/// version", never as "no koshell here".
+pub fn tty_owner_version(tty: &str) -> Option<String> {
+    read_version_file(&tty_version_path(tty))
+}
+
+/// The version recorded in the file at `path`: its first line, trimmed. Split out from
+/// [`tty_owner_version`] for the same reason [`tty_marker_owner_pid`] is split out of
+/// [`tty_owner_pid`] — it is testable without a runtime directory.
+fn read_version_file(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let first = text.lines().next()?.trim();
+    (!first.is_empty()).then(|| first.to_string())
+}
+
 /// Returns true when the liveness marker for `tty` names a process that is still alive.
 /// Convenience over [`tty_marker_is_live`] that resolves the conventional path first.
 pub fn tty_is_live(tty: &str) -> bool {
@@ -327,27 +360,44 @@ pub fn assert_not_nested_koshell(
 }
 
 /// A live-koshell liveness marker: a file named by the wrapped tty holding this koshell's
-/// PID. Removed on drop (normal exit and unwind); a hard crash (`SIGKILL`) leaks the file,
-/// but the pid it names is then dead, so [`tty_marker_is_live`] still reports not-live.
+/// PID, plus the [`tty_version_path`] file beside it. Both are removed on drop (normal exit
+/// and unwind); a hard crash (`SIGKILL`) leaks them, but the pid the marker names is then
+/// dead, so [`tty_marker_is_live`] still reports not-live.
 pub struct TtyMarker {
     path: PathBuf,
+    version_path: PathBuf,
 }
 
 impl Drop for TtyMarker {
     fn drop(&mut self) {
+        // The pid marker first: while it exists, readers are entitled to find the version
+        // beside it, and removing it first closes that window rather than widening it.
         let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(&self.version_path);
     }
 }
 
 /// Writes the liveness marker for the wrapped `tty` (this koshell's PID) at its
-/// conventional [`tty_marker_path`] and returns a guard that removes it on drop.
-/// Best-effort: returns `None` when no runtime directory is usable or the write fails —
-/// its absence only reopens the rare recycled-pts residual, it never breaks correctness.
+/// conventional [`tty_marker_path`], records this build's version beside it, and returns a
+/// guard that removes both on drop. Best-effort: returns `None` when no runtime directory
+/// is usable or the marker write fails — its absence only reopens the rare recycled-pts
+/// residual, it never breaks correctness.
+///
+/// The version is written first and is not allowed to fail the registration: a reader that
+/// sees a live marker then always finds the version beside it, and a version that could not
+/// be written costs `koshell version` one line rather than costing the nesting guard its
+/// marker.
 pub fn register_tty_marker(tty: &str) -> Option<TtyMarker> {
     let path = tty_marker_path(tty);
     std::fs::create_dir_all(path.parent()?).ok()?;
-    std::fs::write(&path, std::process::id().to_string()).ok()?;
-    Some(TtyMarker { path })
+    let version_path = tty_version_path(tty);
+    let _ = std::fs::write(&version_path, format!("{}\n", crate::VERSION));
+    if std::fs::write(&path, std::process::id().to_string()).is_err() {
+        // Never leave a version claiming a wrap that was not registered.
+        let _ = std::fs::remove_file(&version_path);
+        return None;
+    }
+    Some(TtyMarker { path, version_path })
 }
 
 #[cfg(test)]
@@ -467,6 +517,35 @@ mod tests {
             tty_marker_path("/dev/pts/3").ends_with("tty/_dev_pts_3"),
             "the marker path escapes slashes so it is a single path component"
         );
+    }
+
+    // The version lives beside the marker, never inside it: the marker's body is read as
+    // `kill -0 "$(cat ...)"` by the auto-wrap snippet, so a second line there would make a
+    // live wrap look dead and nest koshell inside koshell.
+    #[test]
+    fn tty_version_path_sits_beside_the_marker() {
+        let marker = tty_marker_path("/dev/pts/3");
+        let version = tty_version_path("/dev/pts/3");
+        assert_eq!(version.parent(), marker.parent());
+        assert!(version.ends_with("tty/_dev_pts_3.version"));
+        assert_ne!(version, marker);
+    }
+
+    #[test]
+    fn a_recorded_version_reads_back_and_a_missing_one_is_unknown() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("marker.version");
+        assert_eq!(read_version_file(&path), None, "no file, no version");
+
+        // Written with a trailing newline, like `register_tty_marker` writes it.
+        std::fs::write(&path, "20260730.074058\n").expect("write version");
+        assert_eq!(read_version_file(&path).as_deref(), Some("20260730.074058"));
+
+        // An empty or blank file is "unknown", not an empty version string.
+        std::fs::write(&path, "\n").expect("write blank version");
+        assert_eq!(read_version_file(&path), None);
+        std::fs::write(&path, "   ").expect("write whitespace version");
+        assert_eq!(read_version_file(&path), None);
     }
 
     #[test]

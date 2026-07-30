@@ -1,4 +1,4 @@
-.TH KOSHELL 1 "2026-07-30" "koshell 0.1.0" "Koshell Manual"
+.TH KOSHELL 1 "2026-07-30" "koshell" "Koshell Manual"
 .SH NAME
 koshell \- human-centric shared terminal: AI beside your terminal, not above it
 .SH SYNOPSIS
@@ -44,6 +44,8 @@ koshell \- human-centric shared terminal: AI beside your terminal, not above it
 .B koshell new
 .br
 .B koshell clear
+.br
+.B koshell version
 .SH DESCRIPTION
 .B koshell
 is a transparent PTY wrapper that keeps the human as the primary terminal
@@ -246,6 +248,24 @@ knows nothing about the stretch of terminal you just finished with.
 It cannot be undone \(em nothing is archived. Must be run inside a
 koshell-wrapped shell.
 .TP
+.B version
+Report the three koshell versions that can differ on one machine at once: this
+binary, the koshell actually wrapping the current terminal, and the running AI
+daemon (with the IPC protocol version each speaks).
+A terminal keeps the koshell it was started with, so an upgrade does not reach
+it until a new terminal is opened; this is what says so.
+The wrapping koshell is read from the version recorded beside its liveness
+marker, so the terminal rows work with no daemon; outside a koshell-wrapped
+terminal the row says so instead.
+The daemon row reports a
+.I running
+daemon \(em nothing is started to be interrogated. When none is running, the
+command that would start one is named instead.
+It always exits 0: every state it can find is a state it reports.
+Plain
+.B \-\-version
+prints this binary's version alone.
+.TP
 .I program \fR[\fIargs\fR...]
 Any other leading positional launches that program in the PTY instead of
 the default shell, with
@@ -263,8 +283,9 @@ The names
 .BR status ,
 .BR reload ,
 .BR new ,
+.BR clear ,
 and
-.B clear
+.B version
 are reserved for the subcommands above; to launch a program literally named
 that, use a path form (for example
 .BR "koshell ./daemon" ).
@@ -292,7 +313,11 @@ launched program.
 Print help and exit.
 .TP
 .B \-\-version
-Print the version and exit.
+Print this binary's version and exit.
+See
+.B koshell version
+for the versions of the koshell wrapping the current terminal and of the running
+daemon, which can differ from it.
 .SH THE #? INTERACTION
 Type
 .B #? question
@@ -451,6 +476,11 @@ the PID of the koshell wrapping that terminal, written on startup and removed on
 exit. The nested-launch guard checks the marker for the tty named in
 .B KOSHELL
 to tell a live wrap from a stale brand on a recycled pts.
+Beside each marker, a
+.I .version
+file records that koshell's version;
+.B koshell version
+reads it to report the koshell actually wrapping the terminal.
 .TP
 .I $XDG_DATA_HOME/koshell/auth.json
 Credential store written by

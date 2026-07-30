@@ -9,12 +9,12 @@
 //! `--` allows a program whose name starts with a dash. Unknown dashed arguments before
 //! the program are rejected so the option namespace stays reserved for future flags.
 //!
-//! `shell-init`, `daemon`, `auth`, `model`, `preflight`, `status`, `reload`, `new`, and
-//! `clear` shadow programs literally named that; launching such a program requires a path
-//! form (for example `koshell ./shell-init` or `koshell ./clear`). Accepted residual of
-//! reserving the names — `clear` is the one with a real namesake on every system, so
-//! `koshell clear` is koshell's own clear and `koshell ./clear`, `koshell /usr/bin/clear`
-//! run the binary.
+//! `shell-init`, `daemon`, `auth`, `model`, `preflight`, `status`, `reload`, `new`,
+//! `clear`, and `version` shadow programs literally named that; launching such a program
+//! requires a path form (for example `koshell ./shell-init` or `koshell ./clear`).
+//! Accepted residual of reserving the names — `clear` is the one with a real namesake on
+//! every system, so `koshell clear` is koshell's own clear and `koshell ./clear`,
+//! `koshell /usr/bin/clear` run the binary.
 
 use clap::{Parser, Subcommand};
 
@@ -24,7 +24,7 @@ use crate::shell_init::InitShell;
 #[derive(Debug, Parser)]
 #[command(
     name = "koshell",
-    version,
+    version = crate::VERSION,
     about,
     max_term_width = 100,
     after_help = "Run `koshell <command> [args...]` to launch a program directly \
@@ -107,6 +107,11 @@ pub enum Command {
     /// screen snapshots, the completed-command index), and start a new AI
     /// conversation — a clean slate for both of you. Run inside a koshell shell.
     Clear,
+
+    /// Report the three versions that can differ on one machine: this binary, the
+    /// koshell actually wrapping this terminal, and the running AI daemon. Plain
+    /// `--version` prints this binary's alone.
+    Version,
 
     /// Program to launch instead of the default shell, with its arguments.
     #[command(external_subcommand)]
@@ -228,6 +233,20 @@ mod tests {
         assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
         let error = parse(&["--version"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+        // `--version` prints the build stamp rather than the Cargo.toml constant
+        // (design 0024), which is what makes it comparable with what a wrapped terminal
+        // and the daemon report.
+        assert!(error.to_string().contains(crate::VERSION));
+    }
+
+    #[test]
+    fn version_parses_and_a_program_named_version_needs_a_path_form() {
+        assert_eq!(parse(&["version"]).unwrap().command, Some(Command::Version));
+        // It takes no arguments: a stray one is a parse error, not a silent launch.
+        assert!(parse(&["version", "extra"]).is_err());
+        // A path spelling still launches a real program of that name.
+        let cli = parse(&["./version", "--short"]).unwrap();
+        assert_eq!(launch(&cli), ["./version", "--short"]);
     }
 
     #[test]

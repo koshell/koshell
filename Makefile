@@ -11,8 +11,9 @@
 #   clean      remove release build artifacts
 #
 # Variables (override on the command line):
-#   PREFIX    install root, default /usr/local   e.g. make install PREFIX=$$HOME/.local
-#   DESTDIR   staging root for packaging         e.g. make install DESTDIR=/tmp/stage
+#   PREFIX           install root, default /usr/local   e.g. make install PREFIX=$$HOME/.local
+#   DESTDIR          staging root for packaging         e.g. make install DESTDIR=/tmp/stage
+#   KOSHELL_VERSION  version stamped into both binaries e.g. make KOSHELL_VERSION=1.2.0
 #
 # The terminal finds the daemon by looking for a koshell-ai-daemon executable next
 # to the koshell binary (then on PATH), so installing both into $(BINDIR) makes
@@ -26,6 +27,17 @@ MAN5DIR  = $(MANDIR)/man5
 
 CARGO ?= cargo
 BUN   ?= bun
+
+# The version stamped into both binaries (design 0024): an explicit KOSHELL_VERSION, else
+# the tag on HEAD, else this build's UTC timestamp. Both builds implement the same chain on
+# their own (crates/koshell-rs/build.rs, packages/ai-daemon/scripts/version.ts) for direct
+# `cargo build` / `bun run build:binary` invocations; resolving it once here and exporting
+# it is what keeps a single `make` from stamping two different build times into koshell and
+# the daemon. The cost is that every `make` with no tag on HEAD changes the variable and so
+# rebuilds koshell-rs; a plain `cargo test` inherits nothing and is unaffected.
+KOSHELL_VERSION ?= $(shell git describe --tags --exact-match 2>/dev/null | sed 's/^v//')
+KOSHELL_VERSION := $(or $(strip $(KOSHELL_VERSION)),$(shell date -u +%Y%m%d.%H%M%S))
+export KOSHELL_VERSION
 
 KOSHELL_BIN = target/release/koshell
 DAEMON_BIN  = packages/ai-daemon/dist/koshell-ai-daemon
