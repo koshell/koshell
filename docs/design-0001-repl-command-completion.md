@@ -4,7 +4,9 @@ Date: 2026-07-01 16:55:37 CST (original) / 2026-07-02 11:04 CST (revised) /
 2026-07-02 12:28 CST (pending-trigger interaction and line-semantics corners added) /
 2026-07-02 12:48 CST (Esc cancel added) / 2026-07-02 13:18 CST (implemented) /
 2026-07-02 14:32 CST (prompt-layer capture moved to marker ownership after an fzf false
-positive) / 2026-07-04 (bare-Esc cancel removed; Ctrl+C is the only cancel key — design 0006)
+positive) / 2026-07-04 (bare-Esc cancel removed; Ctrl+C is the only cancel key — design 0006) /
+2026-07-30 (the `#? /` session-command namespace reservation withdrawn — see the
+line-semantics corners)
 
 Status: implemented. The revision replaces the original "S1 + S3 completion detector"
 decision: bracketed-paste (S1) is dropped as a load-bearing signal, "command completion"
@@ -232,9 +234,24 @@ A deferred `#?` (submitted, not yet fired) is a visible interaction state:
   layer, so continuation lines (PS2, trailing backslashes, quotes spanning lines) are
   covered there. Inside REPLs, mirror-read captures the cursor's logical line only —
   multi-line constructs are an accepted miss.
-- **`#? /` is a reserved command namespace** for session commands, parsed consistently
-  with pi's slash-command conventions; genuine questions starting with a literal `/` are
-  not supported.
+- **A leading `/` is not special** (revised 2026-07-30; this line originally reserved
+  `#? /` as a session-command namespace parsed like pi's slash commands, and declared
+  questions starting with a literal `/` unsupported). Everything after `#?` is question
+  text, so `#? /etc/hosts is not being honored, why` is an ordinary question — which in a
+  terminal is a common shape, and was the reservation's real cost.
+
+  The reservation was never implemented, and the reason it should not be is structural
+  rather than a matter of scheduling. pi's `/` is backed by a completion menu in a TUI it
+  owns; koshell's `#?` is typed into the _user's own_ shell line editor. koshell forwards
+  stdin byte-for-byte (the first transparency obligation) and arms `#?` by observing echo,
+  reading the rendered line only at the submit instant — so it never sees a keystroke in
+  time to complete anything. A `/` namespace here could only ever be: no completion, no
+  listing, and no error until after Enter. Buying that with "questions may not start with
+  a slash" is a bad trade.
+
+  The commands the namespace was reserved for landed as ordinary `koshell <verb>`
+  subcommands instead (`status`, and `new`/`clear` in design 0023), which inherit the
+  shell's own completion and history for free — the affordance pi spends `/` to get.
 
 ## Known limitations
 
@@ -286,8 +303,9 @@ assert on `[koshell] #?` feedback and its position relative to output sentinels.
   0006, also interrupts a streaming/in-flight response), FIFO serialization through one
   conversation.
 - Accepted corners: background commands fire immediately with an empty span; REPL
-  multi-line input is a miss (the shell layer is covered by shell integration); `#? /` is
-  reserved for session commands.
+  multi-line input is a miss (the shell layer is covered by shell integration). A leading
+  `/` carries no meaning — session commands are `koshell <verb>` subcommands (revised
+  2026-07-30; this originally reserved `#? /`).
 
 ## Implementation status
 

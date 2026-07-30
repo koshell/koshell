@@ -32,8 +32,9 @@ daemon already use for the socket, cache, and event log.
 The config selects **exactly one** model — the single-active-model rule. There is
 no runtime `/model` switching. The daemon reads the config when a conversation is
 created, so switching a model is "edit the config, then start a new conversation":
-a new terminal (or `#? /new`, once it exists) picks up the change; an in-flight
-conversation does not.
+a new terminal picks up the change; an in-flight conversation does not. (Point-in-time:
+design 0018 later added runtime switching, and design 0023 added `koshell new` — the
+`#? /new` this line originally anticipated never existed under that spelling.)
 
 ### Shape
 
