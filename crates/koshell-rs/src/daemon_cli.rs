@@ -95,10 +95,7 @@ fn print_running_details(socket_path: &Path) {
         _ => println!("  (no status reply — an older daemon?)"),
     }
     println!("  socket:       {}", socket_path.display());
-    println!(
-        "  log:          {}",
-        daemon_spawn::daemon_log_path().display()
-    );
+    println!("  log:          {}", daemon_spawn::daemon_log_description());
 }
 
 /// Polls until the daemon is reachable, or the transition timeout elapses.
@@ -175,7 +172,7 @@ fn start(socket_path: &Path) -> i32 {
         eprintln!("started the AI daemon, but it did not become reachable in time.");
         eprintln!(
             "  check the log: {}",
-            daemon_spawn::daemon_log_path().display()
+            daemon_spawn::daemon_log_description()
         );
         1
     }

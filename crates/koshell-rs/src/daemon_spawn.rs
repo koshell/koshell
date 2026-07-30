@@ -121,9 +121,26 @@ fn kill_switch_set() -> bool {
         .unwrap_or(false)
 }
 
-/// The auto-spawned daemon's log file: `$XDG_STATE_HOME/koshell/daemon.log`.
-pub fn daemon_log_path() -> PathBuf {
-    logging::state_dir().join("daemon.log")
+/// The auto-spawned daemon's log file: `$XDG_STATE_HOME/koshell/daemon.log`. `None` when
+/// there is no usable state directory (see [`logging::state_dir`]); the daemon still
+/// spawns, with its output discarded.
+pub fn daemon_log_path() -> Option<PathBuf> {
+    Some(logging::state_dir()?.join("daemon.log"))
+}
+
+/// Where the spawned daemon's output goes, for the `sh` redirection and for telling the
+/// user where to look. `/dev/null` stands in when no log file is resolvable — a missing log
+/// must never keep the daemon from starting.
+fn daemon_log_target() -> PathBuf {
+    daemon_log_path().unwrap_or_else(|| PathBuf::from("/dev/null"))
+}
+
+/// How to describe the daemon's log to the user: the path, or why there is none.
+pub fn daemon_log_description() -> String {
+    match daemon_log_path() {
+        Some(path) => path.display().to_string(),
+        None => "(disabled: no usable state directory — set HOME or XDG_STATE_HOME)".to_string(),
+    }
 }
 
 /// Spawns the daemon fully detached, so it outlives this terminal and never
@@ -131,7 +148,7 @@ pub fn daemon_log_path() -> PathBuf {
 /// backgrounds the daemon and exits immediately; waiting on the short-lived `sh`
 /// reaps the only direct child, and the daemon reparents to init/launchd.
 pub fn spawn(plan: &SpawnPlan) -> anyhow::Result<()> {
-    let log_path = daemon_log_path();
+    let log_path = daemon_log_target();
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }

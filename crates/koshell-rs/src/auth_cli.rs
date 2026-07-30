@@ -76,7 +76,7 @@ fn ensure_daemon(socket_path: &Path) -> bool {
         eprintln!("started the AI daemon, but it did not become reachable in time.");
         eprintln!(
             "  check the log: {}",
-            daemon_spawn::daemon_log_path().display()
+            daemon_spawn::daemon_log_description()
         );
         false
     }

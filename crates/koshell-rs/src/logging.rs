@@ -26,27 +26,45 @@ pub fn resolve_filter(cli_level: Option<&str>) -> String {
 /// The koshell state directory: `$XDG_STATE_HOME/koshell`, falling back to
 /// `~/.local/state/koshell`. Shared by the terminal log and the auto-spawned
 /// daemon log.
-pub fn state_dir() -> PathBuf {
-    let base = match std::env::var("XDG_STATE_HOME") {
-        Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
-        _ => {
-            let home = std::env::var("HOME").unwrap_or_default();
-            PathBuf::from(home).join(".local").join("state")
-        }
+///
+/// `None` when neither variable yields an **absolute** base — no `HOME`, or either one set
+/// to a relative path. A relative state directory would resolve against the current
+/// working directory, and koshell's cwd is not its own: it follows the inner shell's `cd`
+/// (design 0005 working-directory mirroring), so the log would be created in whatever
+/// project directory the user happened to be in when it was opened. Losing the log is the
+/// better failure, and every caller already treats it as best-effort.
+pub fn state_dir() -> Option<PathBuf> {
+    resolve_state_dir(
+        std::env::var("XDG_STATE_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// The pure resolution behind [`state_dir`], taking the two variables so the absent and
+/// relative cases are testable without mutating process-global environment.
+fn resolve_state_dir(xdg_state_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    let base = match xdg_state_home {
+        Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(home.filter(|home| !home.trim().is_empty())?)
+            .join(".local")
+            .join("state"),
     };
-    base.join("koshell")
+    base.is_absolute().then(|| base.join("koshell"))
 }
 
-/// The log file path under the XDG state directory.
-pub fn log_file_path() -> PathBuf {
-    state_dir().join("koshell.log")
+/// The log file path under the XDG state directory, or `None` when there is no usable
+/// state directory (see [`state_dir`]).
+pub fn log_file_path() -> Option<PathBuf> {
+    Some(state_dir()?.join("koshell.log"))
 }
 
-/// Initializes the global logger. Failing to open the log file disables logging
-/// rather than failing startup or writing into the terminal.
+/// Initializes the global logger. Failing to open the log file — or having nowhere to put
+/// one — disables logging rather than failing startup or writing into the terminal.
 pub fn init(cli_level: Option<&str>) {
     let filter = resolve_filter(cli_level);
-    let path = log_file_path();
+    let Some(path) = log_file_path() else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -73,7 +91,42 @@ mod tests {
 
     #[test]
     fn log_path_is_under_a_koshell_state_directory() {
-        let path = log_file_path();
+        // Tests always run with a HOME, so a path is resolvable here.
+        let path = log_file_path().expect("a state directory under the test HOME");
         assert!(path.ends_with("koshell/koshell.log"));
+    }
+
+    #[test]
+    fn xdg_state_home_wins_and_home_is_the_fallback() {
+        assert_eq!(
+            resolve_state_dir(Some("/xdg/state"), Some("/home/user")),
+            Some(PathBuf::from("/xdg/state/koshell"))
+        );
+        // Unset and blank both fall through to HOME, matching the other XDG readers.
+        for blank in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                resolve_state_dir(blank, Some("/home/user")),
+                Some(PathBuf::from("/home/user/.local/state/koshell")),
+                "XDG_STATE_HOME={blank:?} should fall back to HOME"
+            );
+        }
+    }
+
+    // A relative base would resolve against the current working directory, and koshell's
+    // cwd follows the inner shell's `cd` — so the log would land in whatever project
+    // directory the user was in. No path is the correct answer, not a relative one.
+    #[test]
+    fn a_relative_or_absent_base_yields_no_state_directory() {
+        assert_eq!(resolve_state_dir(None, None), None);
+        for blank in [Some(""), Some("   ")] {
+            assert_eq!(resolve_state_dir(None, blank), None, "HOME={blank:?}");
+        }
+        assert_eq!(resolve_state_dir(Some("relative/state"), None), None);
+        assert_eq!(
+            resolve_state_dir(Some(".local/state"), Some("/home/user")),
+            None,
+            "a relative XDG_STATE_HOME is not rescued by an absolute HOME: it was chosen"
+        );
+        assert_eq!(resolve_state_dir(None, Some("relative/home")), None);
     }
 }

@@ -77,18 +77,33 @@ impl IpcReader {
 /// The per-user koshell runtime directory, following XDG conventions and deliberately
 /// avoiding a world-writable `/tmp`: `$XDG_RUNTIME_DIR/koshell`, then
 /// `$XDG_CACHE_HOME/koshell`, falling back to `~/.cache/koshell`.
+///
+/// Always absolute. An empty `HOME` used to make the fallback *relative* (`.cache/koshell`),
+/// which resolves against the current working directory — and koshell's cwd is not its own:
+/// it follows the inner shell's `cd` (design 0005 working-directory mirroring). The socket
+/// and the per-tty liveness markers would then be looked for in whatever directory the
+/// reader happened to be in, so two processes that must agree on those paths would not. An
+/// empty `HOME` now behaves exactly as the shell auto-wrap snippet's literal `$HOME/.cache`
+/// already did — rooted at `/` — which is the sync the snippet's duplicated precedence
+/// requires (design 0017). `/.cache/koshell` is normally unwritable, so the daemon simply
+/// stays unreachable and the terminal degrades to a transparent wrapper; that is the
+/// designed failure, unlike a path that silently moves.
 pub fn runtime_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR")
-        && !dir.is_empty()
-    {
-        return PathBuf::from(dir).join("koshell");
+    resolve_runtime_dir(|key| std::env::var(key).ok())
+}
+
+/// The pure resolution behind [`runtime_dir`], taking an environment reader so the
+/// fallback chain is testable without mutating process-global environment (the same shape
+/// [`crate::daemon_spawn::resolve_plan`] uses).
+fn resolve_runtime_dir(var: impl Fn(&str) -> Option<String>) -> PathBuf {
+    for key in ["XDG_RUNTIME_DIR", "XDG_CACHE_HOME"] {
+        if let Some(dir) = var(key).filter(|dir| !dir.is_empty()) {
+            return PathBuf::from(dir).join("koshell");
+        }
     }
-    if let Ok(dir) = std::env::var("XDG_CACHE_HOME")
-        && !dir.is_empty()
-    {
-        return PathBuf::from(dir).join("koshell");
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = var("HOME")
+        .filter(|home| !home.trim().is_empty())
+        .unwrap_or_else(|| "/".to_string());
     PathBuf::from(home).join(".cache").join("koshell")
 }
 
@@ -138,6 +153,63 @@ mod tests {
         drop(writer);
         IpcReader {
             reader: BufReader::new(reader),
+        }
+    }
+
+    /// An environment reader over explicit pairs; anything unlisted reads as unset.
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| (*value).to_string())
+        }
+    }
+
+    #[test]
+    fn the_runtime_directory_follows_the_xdg_precedence() {
+        assert_eq!(
+            resolve_runtime_dir(env_of(&[
+                ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                ("XDG_CACHE_HOME", "/cache"),
+                ("HOME", "/home/user"),
+            ])),
+            PathBuf::from("/run/user/1000/koshell")
+        );
+        // Empty is treated as unset at every step, so the chain keeps falling through.
+        assert_eq!(
+            resolve_runtime_dir(env_of(&[
+                ("XDG_RUNTIME_DIR", ""),
+                ("XDG_CACHE_HOME", "/cache"),
+                ("HOME", "/home/user"),
+            ])),
+            PathBuf::from("/cache/koshell")
+        );
+        assert_eq!(
+            resolve_runtime_dir(env_of(&[("HOME", "/home/user")])),
+            PathBuf::from("/home/user/.cache/koshell")
+        );
+    }
+
+    // The socket and the per-tty liveness markers hang off this directory and must mean the
+    // same thing in two processes whose cwd moves independently, so a relative path is never
+    // an acceptable answer — see `runtime_dir`.
+    #[test]
+    fn the_runtime_directory_is_always_absolute() {
+        assert!(
+            runtime_dir().is_absolute(),
+            "absolute under the ambient environment too"
+        );
+        // A missing or blank HOME with no XDG override is the case that used to go relative;
+        // it now matches the shell snippet's literal `$HOME/.cache`, rooted at `/`.
+        for env in [
+            env_of(&[]),
+            env_of(&[("HOME", "")]),
+            env_of(&[("HOME", "   ")]),
+        ] {
+            let path = resolve_runtime_dir(env);
+            assert!(path.is_absolute(), "{path:?} must be absolute");
+            assert_eq!(path, PathBuf::from("/.cache/koshell"));
         }
     }
 
