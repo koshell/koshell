@@ -291,16 +291,18 @@ answers is whether search stays affordable under daily `#?` use.
 
 ## Bounds and trust
 
-- 10-second per-call timeout, well inside the terminal's 30-second stall notice
-  (design 0010). The caller's `AbortSignal` (Ctrl+C, agent abort) is combined with it.
+- 10-second per-call timeout, well inside the terminal's 30-second no-progress stall
+  window (design 0010). The visible tool-start event resets that window. The caller's
+  `AbortSignal` (Ctrl+C, agent abort) is combined with the timeout.
 - 1,200-character snippet cap per result; whitespace collapsed. Applied locally even
   though the backend was asked for the same bound, so a backend that ignores it cannot
   flood the model's context.
 - The prompt bounds the agent to at most two searches per question. This is a sentence
   in the system prompt, not an enforced cap: nothing counts `web_search` calls, and the
-  32-call bridge budget covers only terminal-served tools. The number was chosen so two
-  sequential 10-second calls stay inside the 30-second stall notice; it has not been
-  validated against how many searches a question actually needs.
+  32-call bridge budget covers only terminal-served tools. The number bounds latency and
+  vendor cost; visible tool starts separately keep design 0010's inactivity deadline
+  aligned with actual progress. It has not been validated against how many searches a
+  question actually needs.
 - Failures return as ordinary tool results carrying a stable code
   (`search_unauthorized`, `search_payment_required`, `search_rate_limited`, `timeout`,
   `search_unreachable`, `cancelled`, `invalid_arguments`, `search_failed`), so the agent answers from the

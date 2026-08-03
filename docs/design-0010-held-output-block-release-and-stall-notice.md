@@ -11,6 +11,12 @@ stops a streaming answer, so it announced nothing new. It is removed. The held-o
 wording is unchanged and still fires, because it is what carries the invariant below.
 See "Conditional stall notice".
 
+Revised 2026-08-01: the 30-second deadline is now measured from the most recent
+meaningful AI progress — dispatch, an `ai_delta`, or visible tool activity — rather than
+from dispatch unconditionally. The fixed dispatch-age deadline mislabeled every
+non-anchored response longer than 30 seconds as `still no answer`, even while text was
+visibly streaming. See "Progress-based stall deadline".
+
 ## Why
 
 Design 0002's buffered-stream prototype held the bounded side (the returning prompt)
@@ -32,12 +38,13 @@ everything blurred together.
 **The answer and command output are always kept in separate, labeled blocks — never
 line-interleaved.** The two bounds are reshaped around that invariant:
 
-- **Stall deadline (30s, `STALL_NOTICE_DELAY`).** If the answer is still absent, print
-  one dim notice that the command output is held and that Ctrl+C releases it — and
-  **do not flush**. The held output stays buffered until the answer finishes, the fuse
-  fires, or the user presses Ctrl+C. The user decides when the answer and command
-  output meet; koshell never mixes them on its own. Wording adapts to whether anything
-  is actually held.
+- **Stall deadline (30s, `STALL_NOTICE_DELAY`).** After 30 seconds without meaningful
+  AI progress, print one dim notice that the command output is held and that Ctrl+C
+  releases it — and **do not flush**. Dispatch, every `ai_delta`, and visible tool
+  activity count as progress. The held output stays buffered until the answer finishes,
+  the fuse fires, or the user presses Ctrl+C. The user decides when the answer and
+  command output meet; koshell never mixes them on its own. The notice is conditional
+  on something actually being held.
 - **Size fuse (256 KiB, `PTY_BUFFER_FUSE_BYTES`).** When the held output reaches the
   fuse, release it as **one labeled block** behind a dim boundary notice, then keep
   buffering. If the block was released mid-answer, the next delta reprints the
@@ -69,8 +76,10 @@ held output reaches the fuse — always with a visible, actionable recovery path
 - `release_held_block()` takes the held bytes, prints the boundary notice, writes the
   block, records it to the mirror, and arms `resume_header_pending` when mid-answer.
   `pty_output` calls it at the fuse and keeps buffering; `poll` calls only the stall
-  notice at `STALL_NOTICE_DELAY` (no flush); `next_deadline` stops scheduling the hold
-  once the stall notice has fired (the fuse is event-driven).
+  notice after `STALL_NOTICE_DELAY` without progress (no flush). `last_progress_at`
+  starts at dispatch and is refreshed by `on_delta` and visible `on_tool_activity`
+  events; `next_deadline` schedules from it and stops scheduling an already-expired
+  instant to avoid a zero-length receive spin.
 - `user_interrupt` folds the boundary into the interrupt notice when output is held.
   `finish` is unchanged.
 
@@ -99,19 +108,45 @@ waiting notice) and that Ctrl+C stops it (already true and already documented by
 interrupt path). It made a working-but-slow provider look like a fault.
 
 The invariant is unchanged — **a hung daemon can never hold command output silently** —
-because it was only ever carried by the held-output branch. That branch now fires from
-two places instead of one:
+because it was only ever carried by the held-output branch. That branch fires from two
+places:
 
-- `poll` at `STALL_NOTICE_DELAY`, when output is already held (the common case: the
-  returning prompt arrives right after `command_end`);
-- `pty_output`, when the deadline has already passed and this write is the first thing
-  actually held. `ActiveResponse::stall_deadline_passed` is the shared predicate.
+- `poll` at the current progress deadline, when output is already held (the common case:
+  the returning prompt arrives right after `command_end`);
+- `pty_output`, when the current progress deadline has already passed and this write is
+  the first thing actually held. `ActiveResponse::stall_deadline_passed` is the shared
+  predicate.
 
-`next_deadline` stops scheduling the stall deadline once it is in the past rather than
-once the notice has fired. Without that guard the notice's new precondition would leave
-`stall_notice_shown` false past the deadline, and `saturating_duration_since` would hand
-the processor a zero-length channel wait — a spin. From the deadline onward the hold is
-event-driven: both the fuse and the notice are reached through `pty_output`.
+`next_deadline` stops scheduling the current stall deadline once it is in the past rather
+than once the notice has fired. Without that guard the notice's held-output precondition
+would leave `stall_notice_shown` false past the deadline, and
+`saturating_duration_since` would hand the processor a zero-length channel wait — a
+spin. A later AI delta or visible tool event moves the progress deadline into the future
+and re-arms the clock; otherwise the fuse and the first late held output remain
+event-driven through `pty_output`.
+
+## Progress-based stall deadline
+
+Revised 2026-08-01 12:24:10 CST (+0800).
+
+The dispatch-age deadline confused response duration with response inactivity. On the
+integrated-shell path, `command_end` dispatches before the returning prompt, so that
+prompt is normally held for the complete answer. Any answer that lasted more than 30
+seconds therefore met the old predicate, regardless of whether deltas were arriving.
+The message said `still no answer` while the answer was visibly streaming.
+
+`ActiveResponse::last_progress_at` now starts at dispatch and advances on every delta
+for the active request and every visible tool-activity event. The stall notice fires
+only when held output exists and 30 seconds have passed without either kind of progress.
+Its wording is correspondingly factual:
+
+```text
+no AI progress for 30 seconds — press Ctrl+C to stop the AI and release the held command output
+```
+
+The held-output invariant and recovery behavior are unchanged. A genuinely silent
+provider still produces the notice after 30 seconds; an answer that pauses for 30 seconds
+mid-stream does too. A long answer that keeps producing deltas does not.
 
 ## Verification
 
@@ -124,6 +159,11 @@ event-driven: both the fuse and the notice are reached through `pty_output`.
   notice fires, the stall deadline passes silently with nothing held, `next_deadline`
   goes quiet rather than returning zero, then the first late PTY write reports the hold
   without flushing it, once).
+- 2026-08-01 revision: `streamed_delta_resets_the_stall_deadline` and
+  `visible_tool_activity_resets_the_stall_deadline` cross the original dispatch-based
+  threshold without a notice, then verify that 30 seconds of genuine inactivity still
+  reports the hold. `max_hold_holds_and_prompts_ctrl_c` covers silence from dispatch and
+  asserts the new progress-based wording.
 - `cargo test`, `cargo clippy --all-targets`, `cargo fmt --check` pass.
 - Manual real-PTY smoke: a stalled answer holds the prompt and offers Ctrl+C; flooding
   over 256 KiB of typed-ahead output yields an emergency notice, one command-output

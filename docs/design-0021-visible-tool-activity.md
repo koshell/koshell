@@ -2,7 +2,8 @@
 
 Date: 2026-07-28 17:20 CST +0800
 
-Status: implemented.
+Status: implemented. Revised 2026-08-01: visible tool activity also counts as AI
+progress for design 0010's inactivity-based stall deadline.
 
 ## Why
 
@@ -17,8 +18,8 @@ Designs 0019 and 0020 gave the agent tools, and both made the work invisible:
 The result was a `#?` that could sit silent for several seconds and several round trips.
 From the user's chair a slow search, a paging loop, and a hung daemon look identical, and
 the only recovery gesture — Ctrl+C — has to be decided blind. The stall notice would
-eventually fire at 30 seconds, but that is a fault report, not an account of what is
-happening.
+eventually fire after 30 seconds without other progress, but that is a fault report, not
+an account of what is happening.
 
 The product owner's correction: this boundary should not exist. Tool calls should print
 as dim text so the user knows what is happening and can decide whether to interrupt.
@@ -90,9 +91,9 @@ rule applies unchanged — the answer and everything else stay in separate label
 - **Block mode** (command still running): print the notice, matching the existing
   receipt notice's behavior in that mode.
 
-Showing the work counts as the receipt: the line sets `receipt_shown`, so the delayed
-"waiting for the AI answer…" notice does not also fire and repeat what the tool line
-already said.
+Showing the work counts as both receipt and AI progress: the line sets `receipt_shown`,
+so the delayed "waiting for the AI answer…" notice does not also fire and repeat what
+the tool line already said, and advances design 0010's 30-second inactivity deadline.
 
 A withdrawn request (local Ctrl+C) renders no further tool lines, and a line naming an
 unknown or stale request id renders nothing — the same suppression deltas get.

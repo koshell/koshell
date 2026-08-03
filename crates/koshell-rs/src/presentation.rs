@@ -12,9 +12,10 @@
 //!   when the held output nears the fuse, it is released as one labeled block behind a
 //!   dim boundary notice and the answer resumes under a fresh `[koshell ai]` header,
 //!   with subsequent command output buffered again. A stall deadline bounds waiting:
-//!   if the answer is still absent then, one dim notice tells the user the command
-//!   output is held and Ctrl+C releases it — the hold is not force-flushed, so the
-//!   answer and the held output never mix without the user's say-so. If nothing has
+//!   after 30 seconds without an AI delta or visible tool activity, one dim notice
+//!   tells the user the command output is held and Ctrl+C releases it — the hold is
+//!   not force-flushed, so the answer and the held output never mix without the
+//!   user's say-so. If nothing has
 //!   rendered shortly after dispatch, one dim waiting notice tells the user the answer
 //!   is coming.
 //! - **Command still running**: program output keeps flowing in real time; deltas
@@ -63,8 +64,9 @@ const PTY_BUFFER_FUSE_BYTES: usize = 256 * 1024;
 /// Tunable during dogfooding.
 const RECEIPT_NOTICE_DELAY: Duration = Duration::from_secs(1);
 
-/// How long stream-mode buffering holds PTY output before telling the user the answer
-/// is stalled. Past this, one dim notice reports that command output is held and that
+/// How long a stream-mode response may make no progress while holding PTY output before
+/// telling the user it is stalled. Every AI delta and visible tool-activity event resets
+/// the deadline. Past it, one dim notice reports that command output is held and that
 /// Ctrl+C releases it; the hold is not force-flushed (design 0010), so the answer and
 /// the held output never mix without the user's say-so — memory is bounded instead by
 /// the fuse above. Tunable during dogfooding.
@@ -105,6 +107,10 @@ struct ActiveResponse {
     request_id: String,
     mode: Mode,
     dispatched_at: Instant,
+    /// Most recent meaningful AI progress: dispatch, a streamed delta, or visible
+    /// tool activity. The stall deadline is measured from this point rather than
+    /// total response age, so a healthy long answer is not mislabeled as stalled.
+    last_progress_at: Instant,
     /// Whether the delayed waiting notice was printed.
     receipt_shown: bool,
     /// Stream mode: whether the header was written (deferred to the first delta).
@@ -152,6 +158,7 @@ impl ActiveResponse {
             request_id,
             mode,
             dispatched_at,
+            last_progress_at: dispatched_at,
             receipt_shown: false,
             started: false,
             last_was_cr: false,
@@ -205,12 +212,22 @@ impl ActiveResponse {
         self.mode == Mode::Stream && !self.anchored
     }
 
-    /// True once the response is late enough that held command output must be
-    /// reported. The notice itself is conditional on output actually being held: a
-    /// slow answer that holds nothing says nothing.
+    /// True once the response has made no progress long enough that held command
+    /// output must be reported. The notice itself is conditional on output actually
+    /// being held: a quiet response that holds nothing says nothing.
     fn stall_deadline_passed(&self, now: Instant) -> bool {
-        !self.stall_notice_shown && now >= self.dispatched_at + STALL_NOTICE_DELAY
+        !self.stall_notice_shown && now >= self.last_progress_at + STALL_NOTICE_DELAY
     }
+}
+
+/// Borrowed tool-activity payload used inside the presentation layer. Grouping the
+/// protocol fields keeps the activity handler focused on one domain event rather than
+/// a growing list of parallel string arguments.
+struct ToolActivity<'a> {
+    request_id: &'a str,
+    tool_name: &'a str,
+    phase: &'a str,
+    message: &'a str,
 }
 
 /// Renders daemon server messages into the terminal and decides when PTY output is
@@ -307,7 +324,7 @@ fn stall_notice<W: Write>(active: &mut ActiveResponse, out: &mut W, state: &mut 
     active.stall_notice_shown = true;
     active.receipt_shown = true;
     notice(
-        "still no answer — press Ctrl+C to stop the AI and release the held command output",
+        "no AI progress for 30 seconds — press Ctrl+C to stop the AI and release the held command output",
         out,
         state,
     );
@@ -614,12 +631,13 @@ impl Presentation {
         if !active.receipt_shown && active.nothing_rendered() {
             next = Some(active.dispatched_at + RECEIPT_NOTICE_DELAY);
         }
-        // Once the stall deadline is reached the hold no longer runs on a clock — the
-        // fuse and the stall notice are both event-driven from there, so a PTY message
-        // is what wakes the loop next. Scheduling a deadline already in the past would
-        // spin the processor on a zero-length wait.
+        // Do not schedule a progress deadline already in the past: `poll` handles it
+        // immediately when output is held, and a later PTY write handles the nothing-held
+        // case. A later AI delta or visible tool event moves `last_progress_at` forward
+        // and re-arms the clock. Rescheduling the expired instant would spin the processor
+        // on a zero-length wait.
         if active.holding_pty() && !active.stall_notice_shown {
-            let stall = active.dispatched_at + STALL_NOTICE_DELAY;
+            let stall = active.last_progress_at + STALL_NOTICE_DELAY;
             if stall > now {
                 next = Some(next.map_or(stall, |n| n.min(stall)));
             }
@@ -645,12 +663,12 @@ impl Presentation {
                 notice("waiting for the AI answer…", out, state);
             }
         }
-        // Stall notice (design 0010): the answer is late but the held output is not
-        // force-flushed — the user decides when to release it with Ctrl+C, so the
-        // answer and command output never mix on their own. It fires only when output
-        // is actually held; a slow answer that holds nothing needs no notice, because
-        // the waiting notice above already said the answer is pending and Ctrl+C
-        // already stops it.
+        // Stall notice (design 0010): the answer has made no progress, but the held
+        // output is not force-flushed — the user decides when to release it with Ctrl+C,
+        // so the answer and command output never mix on their own. It fires only when
+        // output is actually held; a quiet answer that holds nothing needs no notice,
+        // because the waiting notice above already said the answer is pending and
+        // Ctrl+C already stops it.
         if active.holding_pty()
             && active.stall_deadline_passed(now)
             && !active.buffered_pty.is_empty()
@@ -688,7 +706,17 @@ impl Presentation {
                 phase,
                 message,
             } => {
-                self.on_tool_activity(request_id, tool_name, phase, message, out, state);
+                self.on_tool_activity(
+                    ToolActivity {
+                        request_id,
+                        tool_name,
+                        phase,
+                        message,
+                    },
+                    out,
+                    state,
+                    now,
+                );
             }
             // The interactive session never sends a status_request or an auth
             // request, so their replies are not expected here; ignore them (and
@@ -710,35 +738,35 @@ impl Presentation {
     /// that render nothing.
     fn on_tool_activity<W: Write>(
         &mut self,
-        request_id: &str,
-        tool_name: &str,
-        phase: &str,
-        message: &str,
+        activity: ToolActivity<'_>,
         out: &mut W,
         state: &mut SessionState,
+        now: Instant,
     ) {
         // A locally aborted request keeps rendering nothing, exactly like its deltas;
         // an unknown id is a stale reply. Both are still recorded: an announcement the
         // user never saw because they had just interrupted is precisely the case the
         // dogfooding question is about.
         let mut rendered = false;
-        if !self.aborted.contains(request_id)
+        if !self.aborted.contains(activity.request_id)
             && let Some(active) = self.active.as_mut()
-            && active.request_id == request_id
+            && active.request_id == activity.request_id
         {
             // An unrecognized future phase counts as neither, so a later `progress`
             // phase cannot silently inflate the call count.
-            match phase {
+            match activity.phase {
                 "started" => active.tool_calls += 1,
                 "failed" => active.tool_failures += 1,
                 _ => {}
             }
-            // Showing the work *is* the receipt: the delayed "waiting for the AI answer"
-            // notice would only repeat what this line already says.
+            // Showing the work *is* both receipt and progress: the delayed "waiting
+            // for the AI answer" notice would only repeat what this line already says,
+            // and a visible tool step proves the response is not stalled.
             active.receipt_shown = true;
+            active.last_progress_at = now;
 
             if active.anchored {
-                notice_above_live(message, out, state);
+                notice_above_live(activity.message, out, state);
                 // The row above the live region is now this notice, not the AI tail, so
                 // the resume point is gone. Dropping it makes the next delta reprint the
                 // `[koshell ai]` header and start a fresh block below the notice, instead
@@ -746,7 +774,7 @@ impl Presentation {
                 // block at the end.
                 active.ai_end = None;
             } else {
-                notice(message, out, state);
+                notice(activity.message, out, state);
                 if active.started {
                     active.resume_header_pending = true;
                 }
@@ -754,9 +782,9 @@ impl Presentation {
             rendered = true;
         }
         self.event_log.emit(Event::ToolActivity {
-            request_id: request_id.to_string(),
-            tool_name: crate::event_log::identifier(tool_name),
-            phase: crate::event_log::identifier(phase),
+            request_id: activity.request_id.to_string(),
+            tool_name: crate::event_log::identifier(activity.tool_name),
+            phase: crate::event_log::identifier(activity.phase),
             rendered,
         });
     }
@@ -787,6 +815,7 @@ impl Presentation {
             self.begin_response(request_id, mode, state, now);
         }
         let active = self.active.as_mut().expect("active response just ensured");
+        active.last_progress_at = now;
         active.delta_count += 1;
         if active.first_delta_at.is_none() {
             active.first_delta_at = Some(now);
@@ -1172,6 +1201,91 @@ mod tests {
     }
 
     #[test]
+    fn streamed_delta_resets_the_stall_deadline() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.pty_output(b"$ ", &mut out, &mut state, now);
+        let progress = now + Duration::from_secs(20);
+        presentation.handle_server_message(
+            &delta("r1", "A long answer is still streaming."),
+            &mut out,
+            &mut state,
+            progress,
+        );
+
+        // Crossing the original dispatch-based deadline is harmless because the
+        // delta moved the inactivity deadline forward.
+        presentation.poll(
+            now + STALL_NOTICE_DELAY + Duration::from_millis(10),
+            &mut out,
+            &mut state,
+        );
+        assert!(
+            !String::from_utf8_lossy(&out).contains("no AI progress"),
+            "healthy streaming must not be labeled as stalled"
+        );
+        assert!(
+            presentation
+                .next_deadline(now + STALL_NOTICE_DELAY)
+                .is_some(),
+            "the progress-based deadline remains scheduled"
+        );
+
+        // The same response is genuinely stalled after 30 seconds without another
+        // delta, so the held prompt and Ctrl+C recovery are reported then.
+        presentation.poll(
+            progress + STALL_NOTICE_DELAY + Duration::from_millis(10),
+            &mut out,
+            &mut state,
+        );
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("no AI progress for 30 seconds"));
+        assert!(text.contains("press Ctrl+C"));
+        assert!(!text.contains("$ "), "the held prompt remains buffered");
+    }
+
+    #[test]
+    fn visible_tool_activity_resets_the_stall_deadline() {
+        let mut presentation = Presentation::new();
+        let mut state = state();
+        let mut out: Vec<u8> = Vec::new();
+        let now = Instant::now();
+
+        presentation.note_dispatch("r1", false, &state, now);
+        presentation.pty_output(b"$ ", &mut out, &mut state, now);
+        let progress = now + Duration::from_secs(20);
+        presentation.handle_server_message(
+            &tool_activity("r1", "searching the web"),
+            &mut out,
+            &mut state,
+            progress,
+        );
+
+        presentation.poll(
+            now + STALL_NOTICE_DELAY + Duration::from_millis(10),
+            &mut out,
+            &mut state,
+        );
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("searching the web"));
+        assert!(
+            !text.contains("no AI progress"),
+            "visible tool work is meaningful response progress"
+        );
+
+        presentation.poll(
+            progress + STALL_NOTICE_DELAY + Duration::from_millis(10),
+            &mut out,
+            &mut state,
+        );
+        assert!(String::from_utf8_lossy(&out).contains("no AI progress for 30 seconds"));
+    }
+
+    #[test]
     fn max_hold_holds_and_prompts_ctrl_c() {
         let mut presentation = Presentation::new();
         let mut state = state();
@@ -1187,8 +1301,8 @@ mod tests {
         presentation.poll(stalled, &mut out, &mut state);
         let text = String::from_utf8_lossy(&out).to_string();
         assert!(
-            text.contains("press Ctrl+C"),
-            "the stall notice offers Ctrl+C: {text:?}"
+            text.contains("no AI progress for 30 seconds") && text.contains("press Ctrl+C"),
+            "the stall notice reports inactivity and offers Ctrl+C: {text:?}"
         );
         assert!(
             !text.contains("$ "),
